@@ -207,7 +207,7 @@ public class StashCommand extends Command {
                     embed.title("Stash Export")
                         .description("Exported " + index.size() + " containers to CSV")
                         .successColor()
-                        .fileAttachment("stash_export.csv", csv);
+                        .fileAttachment(new com.zenith.discord.Embed.FileAttachment("stash_export.csv", csv));
                     return OK;
                 })
             )

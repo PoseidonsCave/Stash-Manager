@@ -20,7 +20,7 @@ public class ShulkerIntrospector {
         if (shulkerStack == null) return null;
 
         try {
-            var nbt = shulkerStack.getDataComponentsPatch();
+            var nbt = shulkerStack.getDataComponents();
             if (nbt == null) return null;
 
             String color = extractShulkerColor(shulkerStack);
