@@ -45,12 +45,7 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
         sharedModule = new StashManagerModule(config, sharedIndex);
         sharedModule.setDatabase(sharedDatabase);
 
-        pluginAPI.registerModule(sharedModule);
-        pluginAPI.registerCommand(new StashCommand(config, sharedModule, sharedIndex, sharedDatabase));
-        pluginAPI.registerCommand(new StashSearchCommand(sharedIndex, sharedDatabase));
-        pluginAPI.registerCommand(new StashSupplyCommand(config));
-
-        // API Server
+        // API Server (created before commands so it can be passed to StashCommand)
         sharedApiServer = new ApiServer(config, sharedModule, sharedIndex, sharedDatabase);
         if (config.apiEnabled) {
             try {
@@ -59,6 +54,11 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
                 System.err.println("[StashManager] API server failed to start: " + e.getMessage());
             }
         }
+
+        pluginAPI.registerModule(sharedModule);
+        pluginAPI.registerCommand(new StashCommand(config, sharedModule, sharedIndex, sharedDatabase, sharedApiServer));
+        pluginAPI.registerCommand(new StashSearchCommand(sharedIndex, sharedDatabase));
+        pluginAPI.registerCommand(new StashSupplyCommand(config));
     }
 
     public static ContainerIndex getIndex() {
