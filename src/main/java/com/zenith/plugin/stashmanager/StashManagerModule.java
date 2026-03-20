@@ -7,6 +7,7 @@ import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
+import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner;
@@ -16,6 +17,11 @@ import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
 import org.jspecify.annotations.Nullable;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -23,7 +29,7 @@ import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
 
 // Tick-driven container scanning state machine.
-// IDLE -> ZONE_SCANNING -> WALKING -> OPENING -> READING -> CLOSING -> DONE
+// IDLE -> ZONE_SCANNING -> WALKING -> OPENING -> READING -> CLOSING -> RETURNING -> DONE
 public class StashManagerModule extends Module {
 
     public enum ScanState {
@@ -34,6 +40,7 @@ public class StashManagerModule extends Module {
         READING,
         CLOSING,
         WALKING_TO_ZONE,
+        RETURNING,
         DONE
     }
 
@@ -49,16 +56,28 @@ public class StashManagerModule extends Module {
     private int openTimeoutCounter = 0;
     private boolean containerDataReceived = false;
 
+    // Starting position — recorded when scan begins, used to return the bot
+    private double startX, startY, startZ;
+    private boolean hasStartPosition = false;
+
     // Statistics
     private int containersFound = 0;
     private int containersIndexed = 0;
     private int containersFailed = 0;
+
+    // Database integration
+    private DatabaseManager database;
+    private long currentScanId = -1;
 
     public StashManagerModule(StashManagerConfig config, ContainerIndex index) {
         this.config = config;
         this.index = index;
         this.regionScanner = new RegionScanner();
         this.containerReader = new ContainerReader(index);
+    }
+
+    public void setDatabase(DatabaseManager database) {
+        this.database = database;
     }
 
     @Override
@@ -139,6 +158,25 @@ public class StashManagerModule extends Module {
         }
 
         resetScanState();
+
+        // Record starting position for return-to-start
+        var playerCache = CACHE.getPlayerCache();
+        startX = playerCache.getX();
+        startY = playerCache.getY();
+        startZ = playerCache.getZ();
+        hasStartPosition = true;
+        info("Recorded starting position: {}, {}, {}",
+            String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+
+        // Record scan in DB
+        if (database != null && database.isInitialized()) {
+            try {
+                currentScanId = database.recordScanStart(config.pos1, config.pos2);
+            } catch (Exception e) {
+                warn("Failed to record scan start in database: {}", e.getMessage());
+            }
+        }
+
         state = ScanState.ZONE_SCANNING;
         info("Starting container scan in region ({}) to ({})",
             formatPos(config.pos1), formatPos(config.pos2));
@@ -187,6 +225,7 @@ public class StashManagerModule extends Module {
             case READING -> tickReading();
             case CLOSING -> tickClosing();
             case WALKING_TO_ZONE -> tickWalkingToZone();
+            case RETURNING -> tickReturning();
             default -> {}
         }
     }
@@ -310,6 +349,26 @@ public class StashManagerModule extends Module {
         }
     }
 
+    private void tickReturning() {
+        if (!BARITONE.isActive()) {
+            double dist = Math.sqrt(
+                Math.pow(CACHE.getPlayerCache().getX() - startX, 2)
+                + Math.pow(CACHE.getPlayerCache().getY() - startY, 2)
+                + Math.pow(CACHE.getPlayerCache().getZ() - startZ, 2)
+            );
+
+            if (dist <= 3.0) {
+                info("Returned to starting position: {}, {}, {}",
+                    String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+            } else {
+                warn("Could not reach starting position (dist={}). Finishing scan.",
+                    String.format("%.1f", dist));
+            }
+
+            finishScan();
+        }
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────
 
     private void advanceToNextContainer() {
@@ -329,9 +388,19 @@ public class StashManagerModule extends Module {
                 return;
             }
 
-            state = ScanState.DONE;
-            info("Scan complete. Found={}, Indexed={}, Failed={}",
+            info("All containers processed. Found={}, Indexed={}, Failed={}",
                 containersFound, containersIndexed, containersFailed);
+
+            // Return to starting position if enabled and we have one
+            if (config.returnToStart && hasStartPosition) {
+                info("Returning to starting position: {}, {}, {}",
+                    String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+                BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
+                state = ScanState.RETURNING;
+                return;
+            }
+
+            finishScan();
             return;
         }
 
@@ -458,6 +527,58 @@ public class StashManagerModule extends Module {
         return false;
     }
 
+    private void finishScan() {
+        // Record scan completion in DB
+        if (database != null && database.isInitialized() && currentScanId >= 0) {
+            try {
+                database.recordScanComplete(currentScanId, containersFound, containersIndexed, containersFailed);
+            } catch (Exception e) {
+                warn("Failed to record scan completion in database: {}", e.getMessage());
+            }
+        }
+
+        // Fire webhook notification
+        fireWebhook();
+
+        state = ScanState.DONE;
+        info("Scan complete. Found={}, Indexed={}, Failed={}",
+            containersFound, containersIndexed, containersFailed);
+    }
+
+    private void fireWebhook() {
+        if (config.webhookUrl == null || config.webhookUrl.isBlank()) return;
+
+        try {
+            String json = "{" +
+                "\"event\": \"scan_complete\"," +
+                "\"containers_found\": " + containersFound + "," +
+                "\"containers_indexed\": " + containersIndexed + "," +
+                "\"containers_failed\": " + containersFailed + "," +
+                "\"timestamp\": " + System.currentTimeMillis() +
+                "}";
+
+            HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(5))
+                .build();
+
+            HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(config.webhookUrl))
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(10))
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+
+            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenAccept(resp -> debug("Webhook response: {} {}", resp.statusCode(), resp.body()))
+                .exceptionally(e -> {
+                    warn("Webhook failed: {}", e.getMessage());
+                    return null;
+                });
+        } catch (Exception e) {
+            warn("Failed to fire webhook: {}", e.getMessage());
+        }
+    }
+
     private void resetScanState() {
         regionScanner.reset();
         pendingContainers.clear();
@@ -468,6 +589,8 @@ public class StashManagerModule extends Module {
         containersFound = 0;
         containersIndexed = 0;
         containersFailed = 0;
+        currentScanId = -1;
+        hasStartPosition = false;
     }
 
     private String formatPos(int[] pos) {

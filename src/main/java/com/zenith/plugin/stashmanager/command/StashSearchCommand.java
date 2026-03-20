@@ -6,22 +6,25 @@ import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandContext;
 import com.zenith.command.api.CommandUsage;
 import com.zenith.command.api.CommandCategory;
+import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
 
 import java.util.List;
 
-// Search the container index by item name.
+// Search the container index by item name (prefers database when connected).
 public class StashSearchCommand extends Command {
 
     private static final int MAX_RESULTS = 20;
     private static final int MAX_FIELDS = 25;
 
     private final ContainerIndex index;
+    private final DatabaseManager database;
 
-    public StashSearchCommand(ContainerIndex index) {
+    public StashSearchCommand(ContainerIndex index, DatabaseManager database) {
         this.index = index;
+        this.database = database;
     }
 
     @Override
@@ -50,8 +53,25 @@ public class StashSearchCommand extends Command {
     private void performSearch(CommandContext context, String search) {
         var embed = context.getEmbed();
 
-        List<ContainerEntry> results = index.search(search);
+        // Prefer database when connected
+        List<ContainerEntry> results;
+        int totalCount;
+        boolean useDb = database != null && database.isInitialized();
 
+        if (useDb) {
+            try {
+                results = database.searchContainers(search);
+                totalCount = database.getTotalItemCount(search);
+            } catch (Exception e) {
+                embed.title("Search Failed")
+                    .description("Database query failed: " + e.getMessage())
+                    .errorColor();
+                return;
+            }
+        } else {
+            results = index.search(search);
+            totalCount = index.totalItemCount(search);
+        }
         if (results.isEmpty()) {
             embed.title("Search: " + search)
                 .description("No containers found matching \"" + search + "\"")
@@ -59,7 +79,6 @@ public class StashSearchCommand extends Command {
             return;
         }
 
-        int totalCount = index.totalItemCount(search);
         String readableSearch = IndexExporter.toReadableName(search);
 
         embed.title("Search: " + readableSearch)
@@ -121,7 +140,7 @@ public class StashSearchCommand extends Command {
             embed.addField("...", (results.size() - MAX_RESULTS) + " more containers not shown", false);
         }
 
-        embed.footer("Index contains " + index.size() + " containers | Last scan: "
+        embed.footer((useDb ? "Database" : "Index") + " contains " + results.size() + " matching containers | Last scan: "
             + index.timeSinceLastScan(), null);
     }
 }
