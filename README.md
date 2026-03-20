@@ -1,6 +1,6 @@
 # Stash Management
 
-A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, indexes, and provides Discord-queryable access to container inventories in a Minecraft world.
+A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, indexes, and provides cross-platform access to container inventories in a Minecraft world.
 
 ![Build](https://github.com/PoseidonsCave/Stash-Management/actions/workflows/build.yml/badge.svg)
 
@@ -8,7 +8,7 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 
 - Region-based container scanning with tick-driven state machine
 - Indexes chests, barrels, shulker boxes, hoppers, dispensers, droppers
-- Shulker box introspection — reads nested inventory contents via NBT
+- Shulker box introspection, reads nested inventory contents via NBT
 - Double chest detection and deduplication
 - Full-text item search across all indexed containers
 - Paginated container listing
