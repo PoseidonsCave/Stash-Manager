@@ -1,6 +1,7 @@
 package com.zenith.plugin.stashmanager.command;
 
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandContext;
@@ -8,6 +9,7 @@ import com.zenith.command.api.CommandUsage;
 import com.zenith.command.api.CommandCategory;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.StashManagerModule;
+import com.zenith.plugin.stashmanager.api.ApiServer;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
@@ -16,9 +18,11 @@ import com.zenith.plugin.stashmanager.index.IndexExporter;
 import java.util.List;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
+import static com.mojang.brigadier.arguments.StringArgumentType.greedyString;
+import static com.mojang.brigadier.arguments.StringArgumentType.string;
 import static com.zenith.Globals.CACHE;
 
-// Main /stash command tree: pos1, pos2, scan, stop, status, list, export, clear, db.
+// Main /stash command tree: pos1, pos2, scan, stop, status, list, export, clear, db, config.
 public class StashCommand extends Command {
 
     private static final int PAGE_SIZE = 10;
@@ -27,13 +31,15 @@ public class StashCommand extends Command {
     private final StashManagerModule module;
     private final ContainerIndex index;
     private final DatabaseManager database;
+    private final ApiServer apiServer;
 
     public StashCommand(StashManagerConfig config, StashManagerModule module,
-                        ContainerIndex index, DatabaseManager database) {
+                        ContainerIndex index, DatabaseManager database, ApiServer apiServer) {
         this.config = config;
         this.module = module;
         this.index = index;
         this.database = database;
+        this.apiServer = apiServer;
     }
 
     @Override
@@ -52,7 +58,24 @@ public class StashCommand extends Command {
                 "export",
                 "clear",
                 "db status",
-                "db clear"
+                "db clear",
+                "config",
+                "config scanDelay <ticks>",
+                "config openTimeout <ticks>",
+                "config maxContainers <count>",
+                "config returnToStart <on|off>",
+                "config db enable/disable",
+                "config db url <jdbc-url>",
+                "config db user <username>",
+                "config db password <password>",
+                "config db poolSize <size>",
+                "config db connect",
+                "config api enable/disable",
+                "config api port <port>",
+                "config api bind <address>",
+                "config api key <key>",
+                "config api start/stop",
+                "config webhook <url>"
             )
             .aliases("sm")
             .build();
@@ -302,7 +325,8 @@ public class StashCommand extends Command {
                         return OK;
                     })
                 )
-            );
+            )
+            .then(buildConfigSubtree());
     }
 
     private void renderListPage(CommandContext context, int page) {
@@ -384,5 +408,352 @@ public class StashCommand extends Command {
 
     private String formatPos(int[] pos) {
         return pos[0] + ", " + pos[1] + ", " + pos[2];
+    }
+
+    // ── Config Subtree ──────────────────────────────────────────────────
+
+    private LiteralArgumentBuilder<CommandContext> buildConfigSubtree() {
+        return literal("config")
+            // Show all config
+            .executes(c -> {
+                var embed = c.getSource().getEmbed()
+                    .title("Stash Manager Configuration")
+                    .primaryColor();
+
+                // Scanner
+                embed.addField("Scan Delay", config.scanDelayTicks + " ticks", true);
+                embed.addField("Open Timeout", config.openTimeoutTicks + " ticks", true);
+                embed.addField("Max Containers", String.valueOf(config.maxContainers), true);
+                embed.addField("Waypoint Distance", String.valueOf(config.waypointDistance), true);
+                embed.addField("Return to Start", config.returnToStart ? "Enabled" : "Disabled", true);
+
+                // Database
+                embed.addField("Database Enabled", String.valueOf(config.databaseEnabled), true);
+                embed.addField("Database URL", config.databaseUrl, false);
+                embed.addField("Database User", config.databaseUser, true);
+                embed.addField("Database Pool Size", String.valueOf(config.databasePoolSize), true);
+                embed.addField("Database Connected", String.valueOf(database != null && database.isInitialized()), true);
+
+                // API
+                embed.addField("API Enabled", String.valueOf(config.apiEnabled), true);
+                embed.addField("API Bind", config.apiBindAddress + ":" + config.apiPort, true);
+                embed.addField("API Threads", String.valueOf(config.apiThreads), true);
+                embed.addField("API Key", config.apiKey.isBlank() ? "(none)" : "****" + config.apiKey.substring(Math.max(0, config.apiKey.length() - 4)), true);
+                embed.addField("API Running", String.valueOf(apiServer != null && apiServer.isRunning()), true);
+
+                // Webhook
+                embed.addField("Webhook URL", config.webhookUrl.isBlank() ? "(none)" : config.webhookUrl, false);
+
+                return OK;
+            })
+            // ── Scanner settings ─────────────────────────────────────
+            .then(literal("scanDelay")
+                .then(argument("ticks", integer(1, 200))
+                    .executes(c -> {
+                        config.scanDelayTicks = IntegerArgumentType.getInteger(c, "ticks");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("scanDelayTicks = " + config.scanDelayTicks)
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("openTimeout")
+                .then(argument("ticks", integer(1, 600))
+                    .executes(c -> {
+                        config.openTimeoutTicks = IntegerArgumentType.getInteger(c, "ticks");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("openTimeoutTicks = " + config.openTimeoutTicks)
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("maxContainers")
+                .then(argument("count", integer(1, 100000))
+                    .executes(c -> {
+                        config.maxContainers = IntegerArgumentType.getInteger(c, "count");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("maxContainers = " + config.maxContainers)
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("waypointDistance")
+                .then(argument("blocks", integer(1, 256))
+                    .executes(c -> {
+                        config.waypointDistance = IntegerArgumentType.getInteger(c, "blocks");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("waypointDistance = " + config.waypointDistance)
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("returnToStart")
+                .then(literal("on")
+                    .executes(c -> {
+                        config.returnToStart = true;
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("Return to start: **enabled**")
+                            .successColor();
+                        return OK;
+                    })
+                )
+                .then(literal("off")
+                    .executes(c -> {
+                        config.returnToStart = false;
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("Return to start: **disabled**")
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            // ── Database settings ────────────────────────────────────
+            .then(literal("db")
+                .then(literal("enable")
+                    .executes(c -> {
+                        config.databaseEnabled = true;
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("Database enabled. Use `stash config db connect` to connect.")
+                            .successColor();
+                        return OK;
+                    })
+                )
+                .then(literal("disable")
+                    .executes(c -> {
+                        config.databaseEnabled = false;
+                        if (database != null) {
+                            database.close();
+                        }
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("Database disabled and disconnected.")
+                            .successColor();
+                        return OK;
+                    })
+                )
+                .then(literal("url")
+                    .then(argument("jdbc_url", greedyString())
+                        .executes(c -> {
+                            config.databaseUrl = StringArgumentType.getString(c, "jdbc_url");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Database URL = " + config.databaseUrl)
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("user")
+                    .then(argument("username", string())
+                        .executes(c -> {
+                            config.databaseUser = StringArgumentType.getString(c, "username");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Database user = " + config.databaseUser)
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("password")
+                    .then(argument("password", string())
+                        .executes(c -> {
+                            config.databasePassword = StringArgumentType.getString(c, "password");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Database password updated.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("poolSize")
+                    .then(argument("size", integer(1, 20))
+                        .executes(c -> {
+                            config.databasePoolSize = IntegerArgumentType.getInteger(c, "size");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Database pool size = " + config.databasePoolSize)
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("connect")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed();
+                        if (!config.databaseEnabled) {
+                            embed.title("Database Connect Failed")
+                                .description("Database is not enabled. Run `stash config db enable` first.")
+                                .errorColor();
+                            return OK;
+                        }
+                        try {
+                            if (database != null) {
+                                database.close();
+                            }
+                            database.initialize(config);
+                            embed.title("Database Connected")
+                                .description("Successfully connected to: " + config.databaseUrl)
+                                .successColor();
+                        } catch (Exception e) {
+                            embed.title("Database Connect Failed")
+                                .description("Error: " + e.getMessage())
+                                .errorColor();
+                        }
+                        return OK;
+                    })
+                )
+            )
+            // ── API settings ─────────────────────────────────────────
+            .then(literal("api")
+                .then(literal("enable")
+                    .executes(c -> {
+                        config.apiEnabled = true;
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("API enabled. Use `stash config api start` to start the server.")
+                            .successColor();
+                        return OK;
+                    })
+                )
+                .then(literal("disable")
+                    .executes(c -> {
+                        config.apiEnabled = false;
+                        if (apiServer != null) {
+                            apiServer.close();
+                        }
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("API disabled and server stopped.")
+                            .successColor();
+                        return OK;
+                    })
+                )
+                .then(literal("port")
+                    .then(argument("port", integer(1, 65535))
+                        .executes(c -> {
+                            config.apiPort = IntegerArgumentType.getInteger(c, "port");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("API port = " + config.apiPort + ". Restart the API server to apply.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("bind")
+                    .then(argument("address", string())
+                        .executes(c -> {
+                            config.apiBindAddress = StringArgumentType.getString(c, "address");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("API bind address = " + config.apiBindAddress + ". Restart the API server to apply.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("key")
+                    .then(argument("api_key", string())
+                        .executes(c -> {
+                            config.apiKey = StringArgumentType.getString(c, "api_key");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("API key updated.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("threads")
+                    .then(argument("count", integer(1, 16))
+                        .executes(c -> {
+                            config.apiThreads = IntegerArgumentType.getInteger(c, "count");
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("API threads = " + config.apiThreads + ". Restart the API server to apply.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("start")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed();
+                        if (apiServer != null && apiServer.isRunning()) {
+                            embed.title("API Server")
+                                .description("Server is already running on port " + config.apiPort)
+                                .primaryColor();
+                            return OK;
+                        }
+                        try {
+                            config.apiEnabled = true;
+                            if (apiServer != null) {
+                                apiServer.start();
+                            }
+                            embed.title("API Server Started")
+                                .description("Listening on " + config.apiBindAddress + ":" + config.apiPort)
+                                .successColor();
+                        } catch (Exception e) {
+                            embed.title("API Server Failed")
+                                .description("Error: " + e.getMessage())
+                                .errorColor();
+                        }
+                        return OK;
+                    })
+                )
+                .then(literal("stop")
+                    .executes(c -> {
+                        if (apiServer != null) {
+                            apiServer.close();
+                        }
+                        c.getSource().getEmbed()
+                            .title("API Server Stopped")
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            // ── Webhook ──────────────────────────────────────────────
+            .then(literal("webhook")
+                .executes(c -> {
+                    c.getSource().getEmbed()
+                        .title("Webhook Configuration")
+                        .addField("URL", config.webhookUrl.isBlank() ? "(none)" : config.webhookUrl, false)
+                        .primaryColor();
+                    return OK;
+                })
+                .then(argument("url", greedyString())
+                    .executes(c -> {
+                        String url = StringArgumentType.getString(c, "url");
+                        if (url.equalsIgnoreCase("off") || url.equalsIgnoreCase("none") || url.equalsIgnoreCase("clear")) {
+                            config.webhookUrl = "";
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Webhook URL cleared.")
+                                .successColor();
+                        } else {
+                            config.webhookUrl = url;
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Webhook URL = " + config.webhookUrl)
+                                .successColor();
+                        }
+                        return OK;
+                    })
+                )
+            );
     }
 }
