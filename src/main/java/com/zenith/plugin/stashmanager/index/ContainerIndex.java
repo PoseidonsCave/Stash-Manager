@@ -1,19 +1,35 @@
 package com.zenith.plugin.stashmanager.index;
 
+import com.zenith.plugin.stashmanager.database.DatabaseManager;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
-// Thread-safe in-memory container inventory index.
+// Thread-safe in-memory container inventory index with optional DB persistence.
 public class ContainerIndex {
 
     private final ConcurrentHashMap<Long, ContainerEntry> entries = new ConcurrentHashMap<>();
     private volatile long lastScanTimestamp = 0;
+    private DatabaseManager database;
+
+    public void setDatabase(DatabaseManager database) {
+        this.database = database;
+    }
 
     public void put(ContainerEntry entry) {
         entries.put(entry.posKey(), entry);
         lastScanTimestamp = System.currentTimeMillis();
+
+        // Persist to database asynchronously
+        if (database != null && database.isInitialized()) {
+            try {
+                database.upsertContainer(entry);
+            } catch (Exception e) {
+                // Log but don't fail the in-memory operation
+            }
+        }
     }
 
     public ContainerEntry get(int x, int y, int z) {
