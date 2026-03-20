@@ -1,28 +1,35 @@
 plugins {
-    java
+    id("zenithproxy.plugin.dev") version "1.0.0-SNAPSHOT"
 }
 
-group = "com.zenith.plugin"
-version = "1.0.0"
+group = properties["maven_group"] as String
+version = properties["plugin_version"] as String
+val mc = properties["mc"] as String
+val pluginId = properties["plugin_id"] as String
 
 java {
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+    toolchain { languageVersion = JavaLanguageVersion.of(25) }
+}
+
+zenithProxyPlugin {
+    templateProperties = mapOf(
+        "version" to project.version,
+        "mc_version" to mc,
+        "plugin_id" to pluginId,
+        "maven_group" to group as String,
+    )
+    javaReleaseVersion = JavaLanguageVersion.of(21)
 }
 
 repositories {
-    mavenCentral()
-    maven("https://repo.opencollab.dev/maven-releases")
-    maven("https://repo.opencollab.dev/maven-snapshots")
-    maven("https://libraries.minecraft.net")
-    maven("https://jitpack.io")
+    maven("https://maven.2b2t.vc/releases") {
+        description = "ZenithProxy Releases"
+    }
+    maven("https://maven.2b2t.vc/remote") {
+        description = "Dependencies used by ZenithProxy"
+    }
 }
 
 dependencies {
-    compileOnly("com.github.rfresh2:ZenithProxy:1.0.0")
-}
-
-tasks.jar {
-    archiveBaseName.set("stash-manager")
-    destinationDirectory.set(file("build/libs"))
+    zenithProxy("com.zenith:ZenithProxy:$mc-SNAPSHOT")
 }

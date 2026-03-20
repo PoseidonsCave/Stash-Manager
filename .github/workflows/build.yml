@@ -1,11 +1,12 @@
-name: Build & Release
+name: Plugin Build
 
 on:
-  push:
-    branches: [ main ]
-    tags: [ 'v*' ]
   pull_request:
-    branches: [ main ]
+  push:
+    branches:
+      - "*"
+    tags:
+      - "v*"
 
 permissions:
   contents: write
@@ -14,49 +15,59 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Check out repository
+        uses: actions/checkout@v6
         with:
-          java-version: '21'
+          persist-credentials: false
+
+      - name: Setup JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: '25'
           distribution: 'temurin'
 
+      - name: Elevate wrapper permissions
+        run: chmod +x ./gradlew
+
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
 
-      - name: Build
-        run: gradle build
+      - name: Build Plugin
+        run: ./gradlew build
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload Plugin Artifact
+        uses: actions/upload-artifact@v7
         with:
           name: stash-manager
-          path: build/libs/stash-manager-*.jar
+          path: build/libs/*.jar
+          archive: false
+          if-no-files-found: error
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v6
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+      - name: Setup JDK
+        uses: actions/setup-java@v5
         with:
-          java-version: '21'
+          java-version: '25'
           distribution: 'temurin'
 
+      - name: Elevate wrapper permissions
+        run: chmod +x ./gradlew
+
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
 
       - name: Build release JAR
-        run: gradle build
+        run: ./gradlew build
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: build/libs/stash-manager-*.jar
+          files: build/libs/*.jar
           generate_release_notes: true
