@@ -14,6 +14,7 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 - **PostgreSQL persistence** — all scanned containers stored in a database for long-term querying
 - **REST API** — embedded HTTP server with JSON endpoints and Prometheus-format metrics
 - **Webhook notifications** — POST JSON payloads to external services (n8n, etc.) on scan completion
+- **Safe staged updates** — checks GitHub releases, optionally downloads the next plugin JAR, and loads it on the next restart
 - **Full Discord configuration** — every setting is viewable and changeable via Discord commands
 - **CSV export** — export the full index as a CSV file attachment in Discord
 
@@ -23,7 +24,7 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 
 1. Build the plugin JAR (or download from [Releases](https://github.com/PoseidonsCave/Stash-Management/releases))
 2. Place `stash-manager-1.1.0.jar` in ZenithProxy's `plugins/` directory
-3. Restart or reload ZenithProxy
+3. Restart ZenithProxy
 
 ## Building
 
@@ -49,6 +50,8 @@ All commands work via **Discord**, **terminal**, and **in-game chat**.
 | `stash pos2 [x y z]` | Set scan region corner 2 (defaults to player position) |
 | `stash scan` | Start scanning containers in the defined region |
 | `stash stop` | Abort an in-progress scan |
+| `stash update` | Check GitHub releases and stage the latest JAR for the next restart |
+| `stash update check` | Check whether a newer release exists without downloading it |
 | `stash status` | Show scan state, region, container counts, DB/API status |
 
 ### Index
@@ -107,6 +110,10 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config api stop` | Stop the API server |
 | **Webhook** | |
 | `stash config webhook <url>` | Set webhook URL (use `off` to clear) |
+| **Updates** | |
+| `stash config updates` | Show updater settings and the last check result |
+| `stash config updates checkOnLoad <on\|off>` | Enable/disable startup update checks |
+| `stash config updates autoDownload <on\|off>` | Automatically stage new releases during startup checks |
 
 ---
 
@@ -150,6 +157,13 @@ Saved automatically via ZenithProxy's plugin config system.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `webhookUrl` | *(empty)* | URL to POST scan-completion payloads to |
+
+### Plugin Updates
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `updateCheckOnLoad` | `true` | Check GitHub for a newer plugin release during startup |
+| `updateAutoDownload` | `false` | Download and stage a newer plugin JAR automatically during startup checks |
 
 ---
 

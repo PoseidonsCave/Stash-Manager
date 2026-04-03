@@ -33,4 +33,8 @@ public class StashManagerConfig {
 
     // Webhook (n8n, etc.) — POST JSON on scan completion
     public String webhookUrl = "";
+
+    // Plugin updates
+    public boolean updateCheckOnLoad = true;
+    public boolean updateAutoDownload = false;
 }

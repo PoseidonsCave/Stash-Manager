@@ -14,7 +14,10 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
+import com.zenith.plugin.stashmanager.update.PluginUpdateService;
 
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
@@ -26,20 +29,25 @@ import static com.zenith.Globals.CACHE;
 public class StashCommand extends Command {
 
     private static final int PAGE_SIZE = 10;
+    private static final DateTimeFormatter UPDATE_TIME_FORMAT =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(ZoneId.systemDefault());
 
     private final StashManagerConfig config;
     private final StashManagerModule module;
     private final ContainerIndex index;
     private final DatabaseManager database;
     private final ApiServer apiServer;
+    private final PluginUpdateService updateService;
 
     public StashCommand(StashManagerConfig config, StashManagerModule module,
-                        ContainerIndex index, DatabaseManager database, ApiServer apiServer) {
+                        ContainerIndex index, DatabaseManager database, ApiServer apiServer,
+                        PluginUpdateService updateService) {
         this.config = config;
         this.module = module;
         this.index = index;
         this.database = database;
         this.apiServer = apiServer;
+        this.updateService = updateService;
     }
 
     @Override
@@ -55,6 +63,8 @@ public class StashCommand extends Command {
                 "stop",
                 "return",
                 "status",
+                "update",
+                "update check",
                 "list [page]",
                 "export",
                 "clear",
@@ -76,7 +86,10 @@ public class StashCommand extends Command {
                 "config api bind <address>",
                 "config api key <key>",
                 "config api start/stop",
-                "config webhook <url>"
+                "config webhook <url>",
+                "config updates",
+                "config updates checkOnLoad <on|off>",
+                "config updates autoDownload <on|off>"
             )
             .aliases("sm")
             .build();
@@ -199,6 +212,7 @@ public class StashCommand extends Command {
             )
             .then(literal("status")
                 .executes(c -> {
+                    var updateSnapshot = updateService.getSnapshot();
                     var embed = c.getSource().getEmbed()
                         .title("Stash Status")
                         .addField("State", module.getState().name(), true)
@@ -225,12 +239,32 @@ public class StashCommand extends Command {
                     embed.addField("Return to Start", config.returnToStart ? "Enabled" : "Disabled", true);
                     embed.addField("Database", database != null && database.isInitialized() ? "Connected" : "Disabled", true);
                     embed.addField("API Server", config.apiEnabled ? "Port " + config.apiPort : "Disabled", true);
+                    embed.addField("Plugin Version", updateSnapshot.currentVersion(), true);
+                    embed.addField("Updater", formatUpdaterState(updateSnapshot), true);
+                    if (updateSnapshot.latestVersion() != null) {
+                        embed.addField("Latest Release", updateSnapshot.latestVersion(), true);
+                    }
+                    if (updateSnapshot.stagedVersion() != null) {
+                        embed.addField("Staged Update", updateSnapshot.stagedVersion(), true);
+                    }
 
                     if (index.getLastScanTimestamp() > 0) {
                         embed.footer("Last scan: " + index.timeSinceLastScan(), null);
                     }
                     return OK;
                 })
+            )
+            .then(literal("update")
+                .executes(c -> {
+                    renderUpdateResult(c.getSource(), updateService.checkAndStageUpdate(), "Update");
+                    return OK;
+                })
+                .then(literal("check")
+                    .executes(c -> {
+                        renderUpdateResult(c.getSource(), updateService.checkForUpdates(), "Update Check");
+                        return OK;
+                    })
+                )
             )
             .then(literal("list")
                 .executes(c -> {
@@ -462,6 +496,23 @@ public class StashCommand extends Command {
 
                 // Webhook
                 embed.addField("Webhook URL", config.webhookUrl.isBlank() ? "(none)" : config.webhookUrl, false);
+
+                // Updates
+                embed.addField("Update Check On Load", String.valueOf(config.updateCheckOnLoad), true);
+                embed.addField("Update Auto Download", String.valueOf(config.updateAutoDownload), true);
+                embed.addField("Update Status", formatUpdaterState(updateService.getSnapshot()), true);
+                if (updateService.getSnapshot().latestVersion() != null) {
+                    embed.addField("Latest Release", updateService.getSnapshot().latestVersion(), true);
+                }
+                if (updateService.getSnapshot().stagedVersion() != null) {
+                    embed.addField("Staged Update", updateService.getSnapshot().stagedVersion(), true);
+                }
+                if (updateService.getSnapshot().lastCheckedAt() != null) {
+                    embed.addField("Last Update Check", UPDATE_TIME_FORMAT.format(updateService.getSnapshot().lastCheckedAt()), false);
+                }
+                if (updateService.getSnapshot().lastError() != null) {
+                    embed.addField("Update Error", updateService.getSnapshot().lastError(), false);
+                }
 
                 return OK;
             })
@@ -773,6 +824,118 @@ public class StashCommand extends Command {
                         return OK;
                     })
                 )
+            )
+            // ── Updates ──────────────────────────────────────────────
+            .then(literal("updates")
+                .executes(c -> {
+                    var snapshot = updateService.getSnapshot();
+                    var embed = c.getSource().getEmbed()
+                        .title("Update Configuration")
+                        .addField("Check On Load", String.valueOf(config.updateCheckOnLoad), true)
+                        .addField("Auto Download", String.valueOf(config.updateAutoDownload), true)
+                        .addField("Status", formatUpdaterState(snapshot), true)
+                        .addField("Current Version", snapshot.currentVersion(), true)
+                        .primaryColor();
+                    if (snapshot.latestVersion() != null) {
+                        embed.addField("Latest Release", snapshot.latestVersion(), true);
+                    }
+                    if (snapshot.stagedVersion() != null) {
+                        embed.addField("Staged Update", snapshot.stagedVersion(), true);
+                    }
+                    if (snapshot.stagedJarName() != null) {
+                        embed.addField("Staged Jar", snapshot.stagedJarName(), false);
+                    }
+                    if (snapshot.lastCheckedAt() != null) {
+                        embed.addField("Last Checked", UPDATE_TIME_FORMAT.format(snapshot.lastCheckedAt()), false);
+                    }
+                    if (snapshot.lastError() != null) {
+                        embed.addField("Last Error", snapshot.lastError(), false);
+                    }
+                    return OK;
+                })
+                .then(literal("checkOnLoad")
+                    .then(literal("on")
+                        .executes(c -> {
+                            config.updateCheckOnLoad = true;
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Plugin update checks on load are enabled.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                    .then(literal("off")
+                        .executes(c -> {
+                            config.updateCheckOnLoad = false;
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Plugin update checks on load are disabled.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("autoDownload")
+                    .then(literal("on")
+                        .executes(c -> {
+                            config.updateAutoDownload = true;
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("New plugin releases will be staged automatically on startup checks.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                    .then(literal("off")
+                        .executes(c -> {
+                            config.updateAutoDownload = false;
+                            c.getSource().getEmbed()
+                                .title("Config Updated")
+                                .description("Startup checks will notify only and will not stage downloads automatically.")
+                                .successColor();
+                            return OK;
+                        })
+                    )
+                )
             );
+    }
+
+    private void renderUpdateResult(final CommandContext context,
+                                    final PluginUpdateService.UpdateResult result,
+                                    final String title) {
+        var embed = context.getEmbed()
+            .title(title)
+            .description(result.message())
+            .addField("Current Version", result.currentVersion(), true);
+
+        if (result.latestVersion() != null) {
+            embed.addField("Latest Release", result.latestVersion(), true);
+        }
+        if (result.stagedPath() != null) {
+            embed.addField("Staged Jar", result.stagedPath().getFileName().toString(), false);
+        }
+
+        switch (result.outcome()) {
+            case UP_TO_DATE -> embed.successColor();
+            case UPDATE_AVAILABLE -> embed.primaryColor();
+            case STAGED, ALREADY_STAGED -> embed.successColor();
+            case FAILED -> embed.errorColor();
+        }
+    }
+
+    private String formatUpdaterState(final PluginUpdateService.StatusSnapshot snapshot) {
+        return switch (snapshot.state()) {
+            case NOT_CHECKED -> "Not checked yet";
+            case CHECKING -> "Checking for updates";
+            case UPDATE_AVAILABLE -> "Update available";
+            case UP_TO_DATE -> "Up to date";
+            case STAGING -> "Downloading update";
+            case STAGED -> snapshot.stagedVersion() == null
+                ? "Update staged"
+                : "Staged " + snapshot.stagedVersion();
+            case FAILED -> snapshot.lastError() == null
+                ? "Check failed"
+                : "Check failed";
+        };
     }
 }
