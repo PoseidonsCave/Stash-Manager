@@ -16,7 +16,7 @@ import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
     id = BuildConstants.PLUGIN_ID,
     version = BuildConstants.VERSION,
     description = "Container scanning, indexing, and multi-platform friendly inventory management",
-    url = "https://github.com/PoseidonsCave/Stash-Management",
+    url = "https://github.com/PoseidonsCave/Stash-Manager",
     authors = {"Flagships"},
     mcVersions = {BuildConstants.MC_VERSION}
 )
