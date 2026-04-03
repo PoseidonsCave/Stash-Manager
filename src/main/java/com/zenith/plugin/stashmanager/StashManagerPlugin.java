@@ -9,6 +9,8 @@ import com.zenith.plugin.stashmanager.command.StashSearchCommand;
 import com.zenith.plugin.stashmanager.command.StashSupplyCommand;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.update.PluginUpdateService;
+import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 
 @Plugin(
     id = BuildConstants.PLUGIN_ID,
@@ -24,10 +26,14 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
     private static StashManagerModule sharedModule;
     private static DatabaseManager sharedDatabase;
     private static ApiServer sharedApiServer;
+    private static PluginUpdateService sharedUpdateService;
+    private static ComponentLogger sharedLogger;
 
     @Override
     public void onLoad(PluginAPI pluginAPI) {
+        sharedLogger = pluginAPI.getLogger();
         var config = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, StashManagerConfig.class);
+        sharedUpdateService = new PluginUpdateService(config, sharedLogger);
 
         // Database
         sharedDatabase = new DatabaseManager();
@@ -56,9 +62,10 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
         }
 
         pluginAPI.registerModule(sharedModule);
-        pluginAPI.registerCommand(new StashCommand(config, sharedModule, sharedIndex, sharedDatabase, sharedApiServer));
+        pluginAPI.registerCommand(new StashCommand(config, sharedModule, sharedIndex, sharedDatabase, sharedApiServer, sharedUpdateService));
         pluginAPI.registerCommand(new StashSearchCommand(sharedIndex, sharedDatabase));
         pluginAPI.registerCommand(new StashSupplyCommand(config));
+        sharedUpdateService.scheduleStartupCheck();
     }
 
     public static ContainerIndex getIndex() {
@@ -75,5 +82,13 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
 
     public static ApiServer getApiServer() {
         return sharedApiServer;
+    }
+
+    public static PluginUpdateService getUpdateService() {
+        return sharedUpdateService;
+    }
+
+    public static ComponentLogger getLogger() {
+        return sharedLogger;
     }
 }
