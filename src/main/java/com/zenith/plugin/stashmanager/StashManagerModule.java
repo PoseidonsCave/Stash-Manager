@@ -60,6 +60,10 @@ public class StashManagerModule extends Module {
     private double startX, startY, startZ;
     private boolean hasStartPosition = false;
 
+    // Baritone config — saved before scan, restored after
+    private boolean savedAllowBreak = true;
+    private boolean baritoneConfigSaved = false;
+
     // Statistics
     private int containersFound = 0;
     private int containersIndexed = 0;
@@ -168,6 +172,9 @@ public class StashManagerModule extends Module {
         info("Recorded starting position: {}, {}, {}",
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
 
+        // Protect storage blocks: disable Baritone block breaking during scan
+        saveAndDisableBaritoneBreaking();
+
         // Record scan in DB
         if (database != null && database.isInitialized()) {
             try {
@@ -190,10 +197,40 @@ public class StashManagerModule extends Module {
         // Close any open container
         closeCurrentContainer();
 
+        // Restore Baritone config
+        restoreBaritoneBreaking();
+
         state = ScanState.IDLE;
         info("Scan aborted. Found={}, Indexed={}, Failed={}",
             containersFound, containersIndexed, containersFailed);
     }
+
+    // Return to the recorded starting position (can be called independently of scanning).
+    // Returns true if navigation started, false if no position recorded or already navigating.
+    public boolean returnToStart() {
+        if (!hasStartPosition) {
+            warn("No starting position recorded");
+            return false;
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            warn("Cannot return while scan is active (state={})", state);
+            return false;
+        }
+        info("Returning to starting position: {}, {}, {}",
+            String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+        BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
+        state = ScanState.RETURNING;
+        return true;
+    }
+
+    // Check if a starting position has been recorded.
+    public boolean hasStartPosition() {
+        return hasStartPosition;
+    }
+
+    public double getStartX() { return startX; }
+    public double getStartY() { return startY; }
+    public double getStartZ() { return startZ; }
 
     // Get region dimensions in blocks.
     public int[] getRegionDimensions() {
@@ -528,6 +565,9 @@ public class StashManagerModule extends Module {
     }
 
     private void finishScan() {
+        // Restore Baritone config
+        restoreBaritoneBreaking();
+
         // Record scan completion in DB
         if (database != null && database.isInitialized() && currentScanId >= 0) {
             try {
@@ -591,6 +631,23 @@ public class StashManagerModule extends Module {
         containersFailed = 0;
         currentScanId = -1;
         hasStartPosition = false;
+    }
+
+    // Save current Baritone allowBreak setting and disable it to protect storage blocks.
+    private void saveAndDisableBaritoneBreaking() {
+        var pathfinderConfig = CONFIG.client.extra.pathfinder;
+        savedAllowBreak = pathfinderConfig.allowBreak;
+        pathfinderConfig.allowBreak = false;
+        baritoneConfigSaved = true;
+        info("Baritone block breaking disabled for scan (was={})", savedAllowBreak);
+    }
+
+    // Restore Baritone allowBreak to its pre-scan value.
+    private void restoreBaritoneBreaking() {
+        if (!baritoneConfigSaved) return;
+        CONFIG.client.extra.pathfinder.allowBreak = savedAllowBreak;
+        baritoneConfigSaved = false;
+        info("Baritone block breaking restored (allowBreak={})", savedAllowBreak);
     }
 
     private String formatPos(int[] pos) {

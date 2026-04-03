@@ -15,7 +15,7 @@ import com.zenith.plugin.stashmanager.index.ContainerIndex;
     version = BuildConstants.VERSION,
     description = "Container scanning, indexing, and multi-platform friendly inventory management",
     url = "https://github.com/PoseidonsCave/Stash-Manager",
-    authors = {"MOAR"},
+    authors = {"Flagships"},
     mcVersions = {BuildConstants.MC_VERSION}
 )
 public class StashManagerPlugin implements ZenithProxyPlugin {

@@ -53,6 +53,7 @@ public class StashCommand extends Command {
                 "pos2 [x y z]",
                 "scan",
                 "stop",
+                "return",
                 "status",
                 "list [page]",
                 "export",
@@ -175,6 +176,24 @@ public class StashCommand extends Command {
                         .addField("Indexed", String.valueOf(module.getContainersIndexed()), true)
                         .addField("Failed", String.valueOf(module.getContainersFailed()), true)
                         .primaryColor();
+                    return OK;
+                })
+            )
+            .then(literal("return")
+                .executes(c -> {
+                    var embed = c.getSource().getEmbed();
+                    if (module.returnToStart()) {
+                        embed.title("Returning to Start")
+                            .description(String.format("Navigating to %.1f, %.1f, %.1f",
+                                module.getStartX(), module.getStartY(), module.getStartZ()))
+                            .successColor();
+                    } else {
+                        embed.title("Return Failed")
+                            .description(module.hasStartPosition()
+                                ? "Cannot return while a scan is active. Stop the scan first."
+                                : "No starting position recorded. Run a scan first.")
+                            .errorColor();
+                    }
                     return OK;
                 })
             )
