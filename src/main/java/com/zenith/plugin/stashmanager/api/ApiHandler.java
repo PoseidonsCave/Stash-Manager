@@ -254,6 +254,22 @@ public class ApiHandler {
             }
         }
 
+        // Organizer metrics
+        var organizer = module.getOrganizer();
+        if (organizer != null) {
+            sb.append("# HELP stash_organizer_active Whether the organizer is running (1=yes, 0=no)\n");
+            sb.append("# TYPE stash_organizer_active gauge\n");
+            sb.append("stash_organizer_active ").append(organizer.isActive() ? 1 : 0).append('\n');
+
+            sb.append("# HELP stash_organizer_tasks_completed Organizer tasks completed in current run\n");
+            sb.append("# TYPE stash_organizer_tasks_completed gauge\n");
+            sb.append("stash_organizer_tasks_completed ").append(organizer.getCompletedTasks()).append('\n');
+
+            sb.append("# HELP stash_organizer_tasks_total Organizer tasks planned in current run\n");
+            sb.append("# TYPE stash_organizer_tasks_total gauge\n");
+            sb.append("stash_organizer_tasks_total ").append(organizer.getTotalTasks()).append('\n');
+        }
+
         sendText(exchange, 200, sb.toString());
     }
 
@@ -271,7 +287,57 @@ public class ApiHandler {
 
         sendJson(exchange, 200, body);
     }
+    // ── GET /api/v1/organizer ──────────────────────────────────────────
 
+    public void handleOrganizer(HttpExchange exchange) throws IOException {
+        if (!checkMethod(exchange, "GET")) return;
+        if (!checkApiKey(exchange)) return;
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        var organizer = module.getOrganizer();
+        if (organizer == null) {
+            body.put("available", false);
+        } else {
+            body.put("available", true);
+            body.put("state", organizer.getState().name());
+            body.put("active", organizer.isActive());
+            body.put("completed_tasks", organizer.getCompletedTasks());
+            body.put("total_tasks", organizer.getTotalTasks());
+            body.put("status", organizer.getStatus());
+        }
+        sendJson(exchange, 200, body);
+    }
+
+    // ── GET /api/v1/regions ──────────────────────────────────────────────
+
+    public void handleRegions(HttpExchange exchange) throws IOException {
+        if (!checkMethod(exchange, "GET")) return;
+        if (!checkApiKey(exchange)) return;
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (database != null && database.isInitialized()) {
+            try {
+                var regions = database.listRegions();
+                List<Map<String, Object>> list = new ArrayList<>();
+                for (var region : regions) {
+                    Map<String, Object> r = new LinkedHashMap<>();
+                    r.put("name", region.name());
+                    r.put("pos1", Map.of("x", region.pos1()[0], "y", region.pos1()[1], "z", region.pos1()[2]));
+                    r.put("pos2", Map.of("x", region.pos2()[0], "y", region.pos2()[1], "z", region.pos2()[2]));
+                    list.add(r);
+                }
+                body.put("regions", list);
+                body.put("count", regions.size());
+            } catch (Exception e) {
+                sendError(exchange, 500, "Database query failed: " + e.getMessage());
+                return;
+            }
+        } else {
+            body.put("regions", List.of());
+            body.put("count", 0);
+        }
+        sendJson(exchange, 200, body);
+    }
     // ── Utility ─────────────────────────────────────────────────────────
 
     private Map<String, Object> containerToMap(ContainerEntry entry) {
@@ -285,6 +351,9 @@ public class ApiHandler {
         map.put("total_items", entry.totalItems());
         map.put("shulker_count", entry.shulkerCount());
         map.put("timestamp", entry.timestamp());
+        if (entry.label() != null) {
+            map.put("label", entry.label());
+        }
 
         // Items summary
         List<Map<String, Object>> itemsList = new ArrayList<>();
@@ -336,10 +405,6 @@ public class ApiHandler {
             String token = authHeader.substring("Bearer ".length());
             if (config.apiKey.equals(token)) return true;
         }
-
-        // Also check query parameter
-        Map<String, String> params = parseQueryParams(exchange.getRequestURI());
-        if (config.apiKey.equals(params.get("key"))) return true;
 
         sendError(exchange, 401, "Unauthorized: invalid or missing API key");
         return false;

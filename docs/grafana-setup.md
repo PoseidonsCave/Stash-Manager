@@ -170,6 +170,8 @@ Repeat for more panels. Here are useful queries:
 | Containers Found vs Indexed | `stash_scan_containers_found` and `stash_scan_containers_indexed` | Time series |
 | Failed Reads | `stash_scan_containers_failed` | Time series |
 | Pending Containers | `stash_scan_containers_pending` | Time series |
+| Organizer Active | `stash_organizer_active` | Stat |
+| Organizer Progress | `stash_organizer_tasks_completed` / `stash_organizer_tasks_total` | Gauge / Bar gauge |
 
 > **Tip:** For the scanner state panel, you can use **Value mappings** in Grafana to show human-readable names: 0=Idle, 1=Scanning, 2=Walking, 3=Opening, 4=Reading, 5=Closing, 6=Walking to Zone, 7=Returning, 8=Done.
 
@@ -190,6 +192,9 @@ Repeat for more panels. Here are useful queries:
 | `stash_items_total` | Total item count across all containers | Yes |
 | `stash_unique_item_types` | Number of distinct item types | Yes |
 | `stash_shulkers_total` | Total shulker boxes found | Yes |
+| `stash_organizer_active` | 1 if the organizer is running, 0 if not | No |
+| `stash_organizer_tasks_completed` | Move tasks completed in the current organizer run | No |
+| `stash_organizer_tasks_total` | Total move tasks planned for the current run | No |
 
 ---
 
@@ -205,6 +210,12 @@ Alert if scan is stalled for 10 minutes:
 
 ```promql
 stash_scanner_state > 0 and changes(stash_scan_containers_indexed[10m]) == 0
+```
+
+Organizer progress percentage:
+
+```promql
+stash_organizer_tasks_completed / stash_organizer_tasks_total
 ```
 
 ---

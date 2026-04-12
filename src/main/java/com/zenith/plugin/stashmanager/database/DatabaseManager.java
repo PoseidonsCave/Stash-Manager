@@ -34,6 +34,7 @@ public class DatabaseManager implements AutoCloseable {
 
             dataSource = new HikariDataSource(hikariConfig);
             createSchema();
+            migrateSchema();
             initialized = true;
             return true;
         } catch (Exception e) {
@@ -95,10 +96,67 @@ public class DatabaseManager implements AutoCloseable {
                 )
                 """);
 
+            // Named regions
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS regions (
+                    name VARCHAR(128) PRIMARY KEY,
+                    pos1_x INTEGER NOT NULL,
+                    pos1_y INTEGER NOT NULL,
+                    pos1_z INTEGER NOT NULL,
+                    pos2_x INTEGER NOT NULL,
+                    pos2_y INTEGER NOT NULL,
+                    pos2_z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+
+            // Key-value config storage
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS config (
+                    key VARCHAR(128) PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """);
+
+            // Storage chest sorting configuration
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS storage_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    item_type VARCHAR(128),
+                    is_overflow BOOLEAN NOT NULL DEFAULT FALSE,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+
+            // Keep-items set (items the organizer should not move)
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS keep_items (
+                    item_id VARCHAR(128) PRIMARY KEY
+                )
+                """);
+
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_items_item_id ON container_items(item_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_position ON containers(x, y, z)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_block_type ON containers(block_type)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_scan_ts ON containers(scan_timestamp)");
+        }
+    }
+
+    private void migrateSchema() throws SQLException {
+        try (Connection conn = dataSource.getConnection()) {
+            // Add label column to containers if missing
+            boolean hasLabel = false;
+            try (ResultSet rs = conn.getMetaData().getColumns(null, null, "containers", "label")) {
+                hasLabel = rs.next();
+            }
+            if (!hasLabel) {
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.execute("ALTER TABLE containers ADD COLUMN label VARCHAR(128)");
+                }
+            }
         }
     }
 
@@ -126,14 +184,15 @@ public class DatabaseManager implements AutoCloseable {
 
     private long upsertContainerRow(Connection conn, ContainerEntry entry) throws SQLException {
         String sql = """
-            INSERT INTO containers (x, y, z, block_type, is_double, shulker_count, total_items, scan_timestamp, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO containers (x, y, z, block_type, is_double, shulker_count, total_items, scan_timestamp, label, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (x, y, z) DO UPDATE SET
                 block_type = EXCLUDED.block_type,
                 is_double = EXCLUDED.is_double,
                 shulker_count = EXCLUDED.shulker_count,
                 total_items = EXCLUDED.total_items,
                 scan_timestamp = EXCLUDED.scan_timestamp,
+                label = EXCLUDED.label,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """;
@@ -147,6 +206,7 @@ public class DatabaseManager implements AutoCloseable {
             ps.setInt(6, entry.shulkerCount());
             ps.setInt(7, entry.totalItems());
             ps.setLong(8, entry.timestamp());
+            ps.setString(9, entry.label());
 
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
@@ -195,7 +255,7 @@ public class DatabaseManager implements AutoCloseable {
     public List<ContainerEntry> getAllContainers() throws SQLException {
         if (!initialized) return Collections.emptyList();
 
-        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp FROM containers ORDER BY scan_timestamp DESC";
+        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label FROM containers ORDER BY scan_timestamp DESC";
         List<ContainerEntry> results = new ArrayList<>();
 
         try (Connection conn = dataSource.getConnection();
@@ -213,7 +273,7 @@ public class DatabaseManager implements AutoCloseable {
     public List<ContainerEntry> getContainersPage(int page, int pageSize) throws SQLException {
         if (!initialized) return Collections.emptyList();
 
-        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
+        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
         List<ContainerEntry> results = new ArrayList<>();
 
         try (Connection conn = dataSource.getConnection();
@@ -235,7 +295,7 @@ public class DatabaseManager implements AutoCloseable {
         if (!initialized) return Collections.emptyList();
 
         String sql = """
-            SELECT DISTINCT c.id, c.x, c.y, c.z, c.block_type, c.is_double, c.shulker_count, c.scan_timestamp
+            SELECT DISTINCT c.id, c.x, c.y, c.z, c.block_type, c.is_double, c.shulker_count, c.scan_timestamp, c.label
             FROM containers c
             JOIN container_items ci ON c.id = ci.container_id
             WHERE LOWER(ci.item_id) LIKE ?
@@ -350,6 +410,254 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
+    // ── Named Regions ───────────────────────────────────────────────────
+
+    public void saveRegion(String name, int[] pos1, int[] pos2) throws SQLException {
+        if (!initialized) return;
+
+        String sql = """
+            INSERT INTO regions (name, pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (name) DO UPDATE SET
+                pos1_x = EXCLUDED.pos1_x, pos1_y = EXCLUDED.pos1_y, pos1_z = EXCLUDED.pos1_z,
+                pos2_x = EXCLUDED.pos2_x, pos2_y = EXCLUDED.pos2_y, pos2_z = EXCLUDED.pos2_z
+            """;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, name);
+            ps.setInt(2, pos1[0]);
+            ps.setInt(3, pos1[1]);
+            ps.setInt(4, pos1[2]);
+            ps.setInt(5, pos2[0]);
+            ps.setInt(6, pos2[1]);
+            ps.setInt(7, pos2[2]);
+            ps.executeUpdate();
+        }
+    }
+
+    public record SavedRegion(String name, int[] pos1, int[] pos2) {}
+
+    public SavedRegion loadRegion(String name) throws SQLException {
+        if (!initialized) return null;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z FROM regions WHERE name = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return null;
+                return new SavedRegion(name,
+                    new int[]{rs.getInt("pos1_x"), rs.getInt("pos1_y"), rs.getInt("pos1_z")},
+                    new int[]{rs.getInt("pos2_x"), rs.getInt("pos2_y"), rs.getInt("pos2_z")});
+            }
+        }
+    }
+
+    public List<SavedRegion> listRegions() throws SQLException {
+        if (!initialized) return Collections.emptyList();
+
+        List<SavedRegion> regions = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT name, pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z FROM regions ORDER BY name")) {
+            while (rs.next()) {
+                regions.add(new SavedRegion(rs.getString("name"),
+                    new int[]{rs.getInt("pos1_x"), rs.getInt("pos1_y"), rs.getInt("pos1_z")},
+                    new int[]{rs.getInt("pos2_x"), rs.getInt("pos2_y"), rs.getInt("pos2_z")}));
+            }
+        }
+        return regions;
+    }
+
+    public boolean deleteRegion(String name) throws SQLException {
+        if (!initialized) return false;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM regions WHERE name = ?")) {
+            ps.setString(1, name);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    // ── Container Labels ────────────────────────────────────────────────
+
+    public void updateLabel(int x, int y, int z, String label) throws SQLException {
+        if (!initialized) return;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "UPDATE containers SET label = ? WHERE x = ? AND y = ? AND z = ?")) {
+            ps.setString(1, label);
+            ps.setInt(2, x);
+            ps.setInt(3, y);
+            ps.setInt(4, z);
+            ps.executeUpdate();
+        }
+    }
+
+    public String getLabel(int x, int y, int z) throws SQLException {
+        if (!initialized) return null;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT label FROM containers WHERE x = ? AND y = ? AND z = ?")) {
+            ps.setInt(1, x);
+            ps.setInt(2, y);
+            ps.setInt(3, z);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString("label") : null;
+            }
+        }
+    }
+
+    public Map<String, String> getAllLabels() throws SQLException {
+        if (!initialized) return Collections.emptyMap();
+
+        Map<String, String> labels = new LinkedHashMap<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT x, y, z, label FROM containers WHERE label IS NOT NULL ORDER BY label")) {
+            while (rs.next()) {
+                String key = rs.getInt("x") + "," + rs.getInt("y") + "," + rs.getInt("z");
+                labels.put(key, rs.getString("label"));
+            }
+        }
+        return labels;
+    }
+
+    // ── Config Key-Value Store ──────────────────────────────────────────
+
+    public void setConfig(String key, String value) throws SQLException {
+        if (!initialized) return;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")) {
+            ps.setString(1, key);
+            ps.setString(2, value);
+            ps.executeUpdate();
+        }
+    }
+
+    public String getConfig(String key) throws SQLException {
+        if (!initialized) return null;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("SELECT value FROM config WHERE key = ?")) {
+            ps.setString(1, key);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getString("value") : null;
+            }
+        }
+    }
+
+    public void deleteConfig(String key) throws SQLException {
+        if (!initialized) return;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM config WHERE key = ?")) {
+            ps.setString(1, key);
+            ps.executeUpdate();
+        }
+    }
+
+    // ── Storage Chests (Sorting Config) ─────────────────────────────────
+
+    public record StorageChestConfig(
+        List<int[]> chests,
+        Map<String, String> chestTypes,
+        int[] overflowChest
+    ) {}
+
+    public void saveStorageChests(List<int[]> chests, Map<String, String> chestTypes, int[] overflowChest) throws SQLException {
+        if (!initialized) return;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (Statement del = conn.createStatement()) {
+                del.executeUpdate("DELETE FROM storage_chests");
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO storage_chests (x, y, z, sort_order, item_type, is_overflow) VALUES (?, ?, ?, ?, ?, ?)")) {
+                int order = 0;
+                for (int[] pos : chests) {
+                    ps.setInt(1, pos[0]);
+                    ps.setInt(2, pos[1]);
+                    ps.setInt(3, pos[2]);
+                    ps.setInt(4, order++);
+                    String key = pos[0] + "," + pos[1] + "," + pos[2];
+                    ps.setString(5, chestTypes.get(key));
+                    ps.setBoolean(6, overflowChest != null && pos[0] == overflowChest[0]
+                        && pos[1] == overflowChest[1] && pos[2] == overflowChest[2]);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    public StorageChestConfig loadStorageChests() throws SQLException {
+        if (!initialized) return new StorageChestConfig(Collections.emptyList(), Collections.emptyMap(), null);
+
+        List<int[]> chests = new ArrayList<>();
+        Map<String, String> types = new LinkedHashMap<>();
+        int[] overflow = null;
+
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT x, y, z, item_type, is_overflow FROM storage_chests ORDER BY sort_order")) {
+            while (rs.next()) {
+                int[] pos = {rs.getInt("x"), rs.getInt("y"), rs.getInt("z")};
+                chests.add(pos);
+                String itemType = rs.getString("item_type");
+                if (itemType != null) {
+                    types.put(pos[0] + "," + pos[1] + "," + pos[2], itemType);
+                }
+                if (rs.getBoolean("is_overflow")) {
+                    overflow = pos;
+                }
+            }
+        }
+        return new StorageChestConfig(chests, types, overflow);
+    }
+
+    // ── Keep Items ──────────────────────────────────────────────────────
+
+    public void saveKeepItems(Collection<String> itemIds) throws SQLException {
+        if (!initialized) return;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (Statement del = conn.createStatement()) {
+                del.executeUpdate("DELETE FROM keep_items");
+            }
+            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO keep_items (item_id) VALUES (?)")) {
+                for (String id : itemIds) {
+                    ps.setString(1, id);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    public Set<String> loadKeepItems() throws SQLException {
+        if (!initialized) return Collections.emptySet();
+
+        Set<String> result = new LinkedHashSet<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT item_id FROM keep_items")) {
+            while (rs.next()) {
+                result.add(rs.getString("item_id"));
+            }
+        }
+        return result;
+    }
+
     // ── Scan History ────────────────────────────────────────────────────
 
     public long recordScanStart(int[] pos1, int[] pos2) throws SQLException {
@@ -405,6 +713,8 @@ public class DatabaseManager implements AutoCloseable {
         boolean isDouble = rs.getBoolean("is_double");
         int shulkerCount = rs.getInt("shulker_count");
         long scanTimestamp = rs.getLong("scan_timestamp");
+        String label = null;
+        try { label = rs.getString("label"); } catch (SQLException ignored) {}
 
         // Load items
         Map<String, Integer> items = new LinkedHashMap<>();
@@ -436,7 +746,7 @@ public class DatabaseManager implements AutoCloseable {
             shulkerDetails.add(new ContainerEntry.ShulkerDetail(entry.getKey(), entry.getValue()));
         }
 
-        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, scanTimestamp);
+        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, scanTimestamp, label);
     }
 
     @Override

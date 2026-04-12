@@ -9,6 +9,7 @@ import com.zenith.plugin.stashmanager.command.StashSearchCommand;
 import com.zenith.plugin.stashmanager.command.StashSupplyCommand;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 
@@ -50,6 +51,13 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
         sharedIndex.setDatabase(sharedDatabase);
         sharedModule = new StashManagerModule(config, sharedIndex);
         sharedModule.setDatabase(sharedDatabase);
+
+        // Organizer
+        if (config.organizerEnabled) {
+            var organizer = new StashOrganizer(config, sharedIndex);
+            organizer.setInfoCallback(msg -> System.out.println("[StashOrganizer] " + msg));
+            sharedModule.setOrganizer(organizer);
+        }
 
         // API Server (created before commands so it can be passed to StashCommand)
         sharedApiServer = new ApiServer(config, sharedModule, sharedIndex, sharedDatabase);

@@ -17,6 +17,13 @@ public class StashManagerConfig {
     // Return-to-start: pathfind the bot back to its initial position after scanning
     public boolean returnToStart = true;
 
+    // Organizer
+    public boolean organizerEnabled = true;
+    public int organizerClickCooldownTicks = 3;
+    public int organizerOpenTimeoutTicks = 60;
+    // Minimum loose item count to justify packing into a shulker box
+    public int condenseMinItems = 1;
+
     // PostgreSQL database
     public boolean databaseEnabled = false;
     public String databaseUrl = "jdbc:postgresql://localhost:5432/stashmanager";
