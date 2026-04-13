@@ -20,6 +20,8 @@ import java.util.concurrent.Executors;
  *   GET  /api/v1/search       — Search by item name (?item=diamond)
  *   GET  /api/v1/stats        — Aggregate statistics (JSON)
  *   GET  /api/v1/metrics      — Prometheus-compatible metrics
+ *   GET  /api/v1/organizer    — Organizer state and progress
+ *   GET  /api/v1/regions      — Saved region list
  *   POST /api/v1/webhook/test — Webhook connectivity test
  */
 public class ApiServer implements AutoCloseable {
@@ -55,6 +57,8 @@ public class ApiServer implements AutoCloseable {
             server.createContext("/api/v1/search", handler::handleSearch);
             server.createContext("/api/v1/stats", handler::handleStats);
             server.createContext("/api/v1/metrics", handler::handleMetrics);
+            server.createContext("/api/v1/organizer", handler::handleOrganizer);
+            server.createContext("/api/v1/regions", handler::handleRegions);
             server.createContext("/api/v1/webhook/test", handler::handleWebhookTest);
 
             server.start();

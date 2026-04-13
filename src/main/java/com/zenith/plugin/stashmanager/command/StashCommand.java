@@ -14,6 +14,7 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
+import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
 
 import java.time.ZoneId;
@@ -63,11 +64,22 @@ public class StashCommand extends Command {
                 "stop",
                 "return",
                 "status",
+                "summary",
                 "update",
                 "update check",
                 "list [page]",
                 "export",
                 "clear",
+                "clearall",
+                "label <x> <y> <z> <label>",
+                "labels",
+                "region save <name>",
+                "region load <name>",
+                "region list",
+                "region delete <name>",
+                "organize",
+                "organize stop",
+                "organize status",
                 "db status",
                 "db clear",
                 "config",
@@ -326,6 +338,321 @@ public class StashCommand extends Command {
                         .successColor();
                     return OK;
                 })
+            )
+            .then(literal("clearall")
+                .executes(c -> {
+                    int count = index.size();
+                    index.clearAll();
+                    c.getSource().getEmbed()
+                        .title("Index & Database Cleared")
+                        .description("Removed " + count + " container entries from memory and database.")
+                        .successColor();
+                    return OK;
+                })
+            )
+            .then(literal("summary")
+                .executes(c -> {
+                    c.getSource().getEmbed()
+                        .title("Stash Summary")
+                        .description(index.getDetailedSummary())
+                        .primaryColor();
+                    if (index.getLastScanTimestamp() > 0) {
+                        c.getSource().getEmbed().footer("Last scan: " + index.timeSinceLastScan(), null);
+                    }
+                    return OK;
+                })
+            )
+            .then(literal("label")
+                .then(argument("x", integer())
+                    .then(argument("y", integer())
+                        .then(argument("z", integer())
+                            .then(argument("label", greedyString())
+                                .executes(c -> {
+                                    int x = IntegerArgumentType.getInteger(c, "x");
+                                    int y = IntegerArgumentType.getInteger(c, "y");
+                                    int z = IntegerArgumentType.getInteger(c, "z");
+                                    String label = StringArgumentType.getString(c, "label");
+                                    var embed = c.getSource().getEmbed();
+
+                                    // Update in-memory index
+                                    var entry = index.get(x, y, z);
+                                    if (entry != null) {
+                                        index.put(entry.withLabel(label));
+                                    }
+                                    // Update database
+                                    if (database != null && database.isInitialized()) {
+                                        try {
+                                            database.updateLabel(x, y, z, label);
+                                        } catch (Exception e) {
+                                            embed.title("Label Failed")
+                                                .description("Database error: " + e.getMessage())
+                                                .errorColor();
+                                            return OK;
+                                        }
+                                    }
+                                    embed.title("Label Set")
+                                        .description("Container at " + x + ", " + y + ", " + z + " → " + label)
+                                        .successColor();
+                                    return OK;
+                                })
+                            )
+                        )
+                    )
+                )
+            )
+            .then(literal("labels")
+                .executes(c -> {
+                    var embed = c.getSource().getEmbed()
+                        .title("Container Labels")
+                        .primaryColor();
+
+                    if (database != null && database.isInitialized()) {
+                        try {
+                            var labels = database.getAllLabels();
+                            if (labels.isEmpty()) {
+                                embed.description("No labels set. Use `/stash label <x> <y> <z> <label>` to add one.");
+                            } else {
+                                StringBuilder sb = new StringBuilder();
+                                int count = 0;
+                                for (var entry : labels.entrySet()) {
+                                    if (count >= 25) {
+                                        sb.append("... and ").append(labels.size() - 25).append(" more");
+                                        break;
+                                    }
+                                    sb.append("**").append(entry.getValue()).append("** — ").append(entry.getKey()).append("\n");
+                                    count++;
+                                }
+                                embed.description(sb.toString());
+                            }
+                        } catch (Exception e) {
+                            embed.description("Database error: " + e.getMessage()).errorColor();
+                        }
+                    } else {
+                        // Fall back to in-memory labels
+                        StringBuilder sb = new StringBuilder();
+                        int count = 0;
+                        for (var entry : index.getAll()) {
+                            if (entry.label() != null) {
+                                if (count >= 25) {
+                                    sb.append("... and more");
+                                    break;
+                                }
+                                sb.append("**").append(entry.label()).append("** — ")
+                                    .append(entry.posString()).append("\n");
+                                count++;
+                            }
+                        }
+                        embed.description(count == 0 ? "No labels set." : sb.toString());
+                    }
+                    return OK;
+                })
+            )
+            .then(literal("region")
+                .then(literal("save")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed();
+
+                            if (config.pos1 == null || config.pos2 == null) {
+                                embed.title("Region Save Failed")
+                                    .description("Region not defined. Set pos1 and pos2 first.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Region Save Failed")
+                                    .description("Database not connected. Enable and connect the database first.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            try {
+                                database.saveRegion(name, config.pos1, config.pos2);
+                                embed.title("Region Saved")
+                                    .description("**" + name + "**: " + formatPos(config.pos1) + " → " + formatPos(config.pos2))
+                                    .successColor();
+                            } catch (Exception e) {
+                                embed.title("Region Save Failed")
+                                    .description("Error: " + e.getMessage())
+                                    .errorColor();
+                            }
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("load")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed();
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Region Load Failed")
+                                    .description("Database not connected.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            try {
+                                var region = database.loadRegion(name);
+                                if (region == null) {
+                                    embed.title("Region Not Found")
+                                        .description("No saved region named: " + name)
+                                        .errorColor();
+                                } else {
+                                    config.pos1 = region.pos1();
+                                    config.pos2 = region.pos2();
+                                    embed.title("Region Loaded")
+                                        .description("**" + name + "**: " + formatPos(config.pos1) + " → " + formatPos(config.pos2))
+                                        .successColor();
+                                }
+                            } catch (Exception e) {
+                                embed.title("Region Load Failed")
+                                    .description("Error: " + e.getMessage())
+                                    .errorColor();
+                            }
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("list")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed()
+                            .title("Saved Regions")
+                            .primaryColor();
+
+                        if (database == null || !database.isInitialized()) {
+                            embed.description("Database not connected.").errorColor();
+                            return OK;
+                        }
+
+                        try {
+                            var regions = database.listRegions();
+                            if (regions.isEmpty()) {
+                                embed.description("No saved regions. Use `/stash region save <name>` to save one.");
+                            } else {
+                                for (var region : regions) {
+                                    embed.addField(region.name(),
+                                        formatPos(region.pos1()) + " → " + formatPos(region.pos2()), false);
+                                }
+                            }
+                        } catch (Exception e) {
+                            embed.description("Error: " + e.getMessage()).errorColor();
+                        }
+                        return OK;
+                    })
+                )
+                .then(literal("delete")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed();
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Region Delete Failed")
+                                    .description("Database not connected.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            try {
+                                if (database.deleteRegion(name)) {
+                                    embed.title("Region Deleted")
+                                        .description("Removed saved region: " + name)
+                                        .successColor();
+                                } else {
+                                    embed.title("Region Not Found")
+                                        .description("No saved region named: " + name)
+                                        .errorColor();
+                                }
+                            } catch (Exception e) {
+                                embed.title("Region Delete Failed")
+                                    .description("Error: " + e.getMessage())
+                                    .errorColor();
+                            }
+                            return OK;
+                        })
+                    )
+                )
+            )
+            .then(literal("organize")
+                .executes(c -> {
+                    var embed = c.getSource().getEmbed();
+                    var organizer = module.getOrganizer();
+
+                    if (organizer == null) {
+                        embed.title("Organize Failed")
+                            .description(config.organizerEnabled
+                                ? "Organizer not available."
+                                : "Organizer is disabled in config.")
+                            .errorColor();
+                        return OK;
+                    }
+
+                    if (module.getState() != StashManagerModule.ScanState.IDLE
+                            && module.getState() != StashManagerModule.ScanState.DONE) {
+                        embed.title("Organize Failed")
+                            .description("Cannot organize while a scan is in progress. Stop the scan first.")
+                            .errorColor();
+                        return OK;
+                    }
+
+                    if (organizer.start()) {
+                        embed.title("Organizing Stash")
+                            .description("Planning item moves across containers...")
+                            .successColor();
+                        if (config.pos1 != null && config.pos2 != null) {
+                            embed.addField("Region", formatPos(config.pos1) + " → " + formatPos(config.pos2), false);
+                        }
+                        embed.addField("Containers", String.valueOf(index.size()), true);
+                    } else {
+                        embed.title("Organize Failed")
+                            .description("Check that region is defined and containers are scanned.")
+                            .errorColor();
+                    }
+                    return OK;
+                })
+                .then(literal("stop")
+                    .executes(c -> {
+                        var organizer = module.getOrganizer();
+                        if (organizer != null && organizer.isActive()) {
+                            organizer.stop();
+                            c.getSource().getEmbed()
+                                .title("Organizer Stopped")
+                                .addField("Completed", String.valueOf(organizer.getCompletedTasks()), true)
+                                .addField("Total Planned", String.valueOf(organizer.getTotalTasks()), true)
+                                .primaryColor();
+                        } else {
+                            c.getSource().getEmbed()
+                                .title("Organizer")
+                                .description("Organizer is not running.")
+                                .primaryColor();
+                        }
+                        return OK;
+                    })
+                )
+                .then(literal("status")
+                    .executes(c -> {
+                        var organizer = module.getOrganizer();
+                        var embed = c.getSource().getEmbed()
+                            .title("Organizer Status")
+                            .primaryColor();
+
+                        if (organizer == null) {
+                            embed.description("Organizer not available.");
+                        } else {
+                            embed.addField("State", organizer.getState().name(), true);
+                            embed.addField("Detail", organizer.getStatus(), false);
+                            if (organizer.getTotalTasks() > 0) {
+                                embed.addField("Progress",
+                                    organizer.getCompletedTasks() + "/" + organizer.getTotalTasks(), true);
+                            }
+                        }
+                        return OK;
+                    })
+                )
             )
             .then(literal("db")
                 .then(literal("status")

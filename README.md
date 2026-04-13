@@ -11,6 +11,9 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 - **Shulker introspection** — reads nested inventory contents via NBT
 - **Double chest deduplication** — large chests are merged into a single entry
 - **Return-to-start** — bot pathfinds back to its original position after a scan completes
+- **Container labels** — assign custom names to containers for easy identification
+- **Saved regions** — name and persist scan regions in the database for reuse
+- **Stash organizer** — automated item sorting across containers by type with column detection, shulker packing, and overflow handling
 - **PostgreSQL persistence** — all scanned containers stored in a database for long-term querying
 - **REST API** — embedded HTTP server with JSON endpoints and Prometheus-format metrics
 - **Webhook notifications** — POST JSON payloads to external services (n8n, etc.) on scan completion
@@ -61,6 +64,10 @@ All commands work via **Discord**, **terminal**, and **in-game chat**.
 | `stash list [page]` | Paginated list of indexed containers |
 | `stash export` | Export index to CSV (file attachment in Discord) |
 | `stash clear` | Clear the in-memory index (region positions retained) |
+| `stash clearall` | Clear both memory index and database |
+| `stash summary` | Detailed index summary with item type breakdown |
+| `stash label <x> <y> <z> <label>` | Assign a label to a container |
+| `stash labels` | List all labeled containers |
 | `stashsearch <item>` | Search for containers holding matching items |
 
 ### Database
@@ -69,6 +76,23 @@ All commands work via **Discord**, **terminal**, and **in-game chat**.
 |---------|-------------|
 | `stash db status` | Show database connection info and row counts |
 | `stash db clear` | Delete all data from the database |
+
+### Regions
+
+| Command | Description |
+|---------|-------------|
+| `stash region save <name>` | Save the current pos1/pos2 as a named region |
+| `stash region load <name>` | Load a saved region into pos1/pos2 |
+| `stash region list` | List all saved regions |
+| `stash region delete <name>` | Delete a saved region |
+
+### Organizer
+
+| Command | Description |
+|---------|-------------|
+| `stash organize` | Start sorting items across containers by type |
+| `stash organize stop` | Stop the organizer mid-run |
+| `stash organize status` | Show organizer state and progress |
 
 ### Supply Chests
 
@@ -131,6 +155,15 @@ Saved automatically via ZenithProxy's plugin config system.
 | `maxContainers` | `2048` | Container cap per scan session |
 | `waypointDistance` | `48` | Walk distance for unloaded chunks |
 | `returnToStart` | `true` | Pathfind back to starting position after scan |
+
+### Organizer
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `organizerEnabled` | `true` | Enable/disable the stash organizer |
+| `organizerClickCooldownTicks` | `3` | Ticks between inventory slot clicks |
+| `organizerOpenTimeoutTicks` | `60` | Max wait ticks for container open |
+| `condenseMinItems` | `1` | Minimum loose items to justify shulker packing |
 
 ### Database (PostgreSQL)
 
@@ -250,9 +283,13 @@ This shows the connection state and how many containers/items are stored.
 
 | Table | Contents |
 |-------|----------|
-| `containers` | Position, type, dimension, item count, first/last seen timestamps |
+| `containers` | Position, type, dimension, item count, first/last seen timestamps, label |
 | `container_items` | Slot, item ID, display name, count per container |
 | `scan_history` | Start/end time, container count, status per scan run |
+| `regions` | Named scan regions with pos1/pos2 coordinates |
+| `config` | Key-value plugin configuration pairs |
+| `storage_chests` | Registered supply chest positions |
+| `keep_items` | Items the organizer should leave in place |
 
 ---
 
@@ -269,6 +306,8 @@ When enabled, the API server exposes the following endpoints. All endpoints requ
 | `GET` | `/api/v1/search?item=diamond` | Search containers by item name |
 | `GET` | `/api/v1/stats` | Aggregate statistics (totals, types, top items) |
 | `GET` | `/api/v1/metrics` | Prometheus-format metrics |
+| `GET` | `/api/v1/organizer` | Organizer state and task progress |
+| `GET` | `/api/v1/regions` | Saved region list |
 | `POST` | `/api/v1/webhook/test` | Send a test webhook payload |
 
 ### Example
@@ -287,6 +326,9 @@ stashmanager_items_total 56789
 stashmanager_scan_state 0
 stashmanager_database_connected 1
 stashmanager_api_uptime_seconds 3600
+stash_organizer_active 0
+stash_organizer_tasks_completed 0
+stash_organizer_tasks_total 0
 ```
 
 Add this as a Prometheus scrape target and build Grafana dashboards from the `stashmanager_*` metrics.

@@ -9,6 +9,7 @@ import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
 import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner.ContainerLocation;
@@ -28,8 +29,7 @@ import java.util.List;
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
 
-// Tick-driven container scanning state machine.
-// IDLE -> ZONE_SCANNING -> WALKING -> OPENING -> READING -> CLOSING -> RETURNING -> DONE
+// Tick-driven container scanning state machine: IDLE → ZONE_SCANNING → WALKING → OPENING → READING → CLOSING → RETURNING → DONE
 public class StashManagerModule extends Module {
 
     public enum ScanState {
@@ -49,6 +49,9 @@ public class StashManagerModule extends Module {
     private final RegionScanner regionScanner;
     private ContainerReader containerReader;
 
+    // Organizer integration
+    private StashOrganizer organizer;
+
     private volatile ScanState state = ScanState.IDLE;
     private List<ContainerLocation> pendingContainers = new ArrayList<>();
     private int currentContainerIndex = 0;
@@ -56,11 +59,11 @@ public class StashManagerModule extends Module {
     private int openTimeoutCounter = 0;
     private boolean containerDataReceived = false;
 
-    // Starting position — recorded when scan begins, used to return the bot
+    // Starting position — used for return-to-start
     private double startX, startY, startZ;
     private boolean hasStartPosition = false;
 
-    // Baritone config — saved before scan, restored after
+    // Baritone config — saved/restored around scans
     private boolean savedAllowBreak = true;
     private boolean baritoneConfigSaved = false;
 
@@ -82,6 +85,14 @@ public class StashManagerModule extends Module {
 
     public void setDatabase(DatabaseManager database) {
         this.database = database;
+    }
+
+    public void setOrganizer(StashOrganizer organizer) {
+        this.organizer = organizer;
+    }
+
+    public StashOrganizer getOrganizer() {
+        return organizer;
     }
 
     @Override
@@ -108,6 +119,10 @@ public class StashManagerModule extends Module {
                         containerDataReceived = true;
                         debug("Received container data packet (windowId={})", packet.getContainerId());
                     }
+                    // Forward container data to organizer
+                    if (organizer != null && organizer.isActive()) {
+                        organizer.onContainerData(session, packet);
+                    }
                     return packet;
                 })
                 .build())
@@ -116,6 +131,13 @@ public class StashManagerModule extends Module {
 
     @Override
     public void onEnable() {
+        // Hydrate in-memory index from database
+        if (database != null && database.isInitialized() && index.size() == 0) {
+            int loaded = index.loadFromDatabase();
+            if (loaded > 0) {
+                info("Loaded {} containers from database", loaded);
+            }
+        }
         info("StashManager module enabled");
     }
 
@@ -150,7 +172,7 @@ public class StashManagerModule extends Module {
         return Math.max(0, pendingContainers.size() - currentContainerIndex);
     }
 
-    // Start a scan. Returns true if started, false if region undefined or already scanning.
+    // Start a scan. Returns true if started.
     public boolean startScan() {
         if (config.pos1 == null || config.pos2 == null) {
             warn("Cannot start scan: region not defined (set pos1 and pos2 first)");
@@ -163,7 +185,7 @@ public class StashManagerModule extends Module {
 
         resetScanState();
 
-        // Record starting position for return-to-start
+        // Record start position for return nav
         var playerCache = CACHE.getPlayerCache();
         startX = playerCache.getX();
         startY = playerCache.getY();
@@ -172,7 +194,7 @@ public class StashManagerModule extends Module {
         info("Recorded starting position: {}, {}, {}",
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
 
-        // Protect storage blocks: disable Baritone block breaking during scan
+        // Disable Baritone block breaking during scan
         saveAndDisableBaritoneBreaking();
 
         // Record scan in DB
@@ -190,7 +212,7 @@ public class StashManagerModule extends Module {
         return true;
     }
 
-    // Abort an in-progress scan.
+    // Abort scan in progress.
     public void abortScan() {
         if (state == ScanState.IDLE) return;
 
@@ -205,8 +227,7 @@ public class StashManagerModule extends Module {
             containersFound, containersIndexed, containersFailed);
     }
 
-    // Return to the recorded starting position (can be called independently of scanning).
-    // Returns true if navigation started, false if no position recorded or already navigating.
+    // Return to recorded start position. Returns true if nav started.
     public boolean returnToStart() {
         if (!hasStartPosition) {
             warn("No starting position recorded");
@@ -223,7 +244,7 @@ public class StashManagerModule extends Module {
         return true;
     }
 
-    // Check if a starting position has been recorded.
+    // True if a start position was recorded.
     public boolean hasStartPosition() {
         return hasStartPosition;
     }
@@ -232,7 +253,7 @@ public class StashManagerModule extends Module {
     public double getStartY() { return startY; }
     public double getStartZ() { return startZ; }
 
-    // Get region dimensions in blocks.
+    // Region size in blocks.
     public int[] getRegionDimensions() {
         if (config.pos1 == null || config.pos2 == null) return null;
         return new int[]{
@@ -245,7 +266,7 @@ public class StashManagerModule extends Module {
     // ── Tick Handlers ───────────────────────────────────────────────────
 
     private void onTickStarting(ClientBotTick.Starting event) {
-        // Reset state if bot reconnects mid-scan
+        // Re-init on reconnect
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             warn("Bot reconnected during scan — resetting state");
             state = ScanState.IDLE;
@@ -253,6 +274,12 @@ public class StashManagerModule extends Module {
     }
 
     private void onTick(ClientBotTick event) {
+        // Delegate tick to organizer when active
+        if (organizer != null && organizer.isActive()) {
+            organizer.tick();
+            return;
+        }
+
         if (state == ScanState.IDLE || state == ScanState.DONE) return;
 
         switch (state) {
@@ -278,7 +305,7 @@ public class StashManagerModule extends Module {
 
         info("Zone scan complete: {} containers discovered", found.size());
 
-        // Check for unscanned chunks (beyond render distance)
+        // Check for chunks beyond render distance
         var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
         if (!unscanned.isEmpty() && pendingContainers.size() < config.maxContainers) {
             info("{} chunks still unloaded — will walk to load them", unscanned.size());
@@ -296,7 +323,7 @@ public class StashManagerModule extends Module {
 
     private void tickWalking() {
         if (!BARITONE.isActive()) {
-            // Pathing completed or failed
+            // Pathing finished
             ContainerLocation target = currentContainer();
             if (target == null) {
                 advanceToNextContainer();
@@ -305,14 +332,14 @@ public class StashManagerModule extends Module {
 
             double dist = distanceToContainer(target);
             if (dist <= 5.0) {
-                // Close enough to interact
+                // In range — open container
                 state = ScanState.OPENING;
                 tickCounter = 0;
                 openTimeoutCounter = 0;
                 containerDataReceived = false;
                 interactWithContainer(target);
             } else {
-                // Pathfinding failed to get close enough
+                // Path failed to reach target
                 warn("Failed to reach container at {}, {}, {} (dist={})",
                     target.x(), target.y(), target.z(), String.format("%.1f", dist));
                 containersFailed++;
@@ -325,7 +352,7 @@ public class StashManagerModule extends Module {
         openTimeoutCounter++;
 
         if (containerDataReceived) {
-            // Data arrived — wait a few more ticks for full content
+            // Buffer ticks for container content
             state = ScanState.READING;
             tickCounter = 0;
             return;
@@ -342,7 +369,7 @@ public class StashManagerModule extends Module {
     private void tickReading() {
         tickCounter++;
 
-        // Wait scanDelayTicks after data received before reading
+        // Enforce delay before reading
         if (tickCounter < config.scanDelayTicks) return;
 
         ContainerLocation loc = currentContainer();
@@ -368,12 +395,12 @@ public class StashManagerModule extends Module {
     private void tickClosing() {
         tickCounter++;
 
-        // Close container on first tick
+        // Close on first tick
         if (tickCounter == 1) {
             closeCurrentContainer();
         }
 
-        // Wait a couple ticks after closing before moving on
+        // Brief pause after close
         if (tickCounter >= 3) {
             advanceToNextContainer();
         }
@@ -381,7 +408,7 @@ public class StashManagerModule extends Module {
 
     private void tickWalkingToZone() {
         if (!BARITONE.isActive()) {
-            // Arrived at waypoint — rescan the zone for newly loaded chunks
+            // Arrived — re-scan zone for newly loaded chunks
             state = ScanState.ZONE_SCANNING;
         }
     }
@@ -412,7 +439,7 @@ public class StashManagerModule extends Module {
         currentContainerIndex++;
 
         if (currentContainerIndex >= pendingContainers.size()) {
-            // Check if there are still unscanned chunks
+            // Walk toward unscanned chunks
             var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
             if (!unscanned.isEmpty() && containersFound < config.maxContainers) {
                 // Walk toward unscanned area
@@ -428,7 +455,7 @@ public class StashManagerModule extends Module {
             info("All containers processed. Found={}, Indexed={}, Failed={}",
                 containersFound, containersIndexed, containersFailed);
 
-            // Return to starting position if enabled and we have one
+            // Return to start if enabled
             if (config.returnToStart && hasStartPosition) {
                 info("Returning to starting position: {}, {}, {}",
                     String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
@@ -447,7 +474,7 @@ public class StashManagerModule extends Module {
             return;
         }
 
-        // Skip double-chest partner blocks (only index the primary side)
+        // Skip double-chest partners
         if (next.type() == BlockEntityType.CHEST || next.type() == BlockEntityType.TRAPPED_CHEST) {
             if (isDoubleChestPartner(next)) {
                 debug("Skipping double chest partner at {}, {}, {}",
@@ -459,7 +486,7 @@ public class StashManagerModule extends Module {
 
         double dist = distanceToContainer(next);
         if (dist <= 5.0) {
-            // Already close enough
+            // Already in range
             state = ScanState.OPENING;
             tickCounter = 0;
             openTimeoutCounter = 0;
@@ -494,8 +521,7 @@ public class StashManagerModule extends Module {
     }
 
     private void interactWithContainer(ContainerLocation loc) {
-        // Right-click the container block to open it
-        // Baritone's getTo with interact=true can also be used
+        // Right-click the container block
         BARITONE.getTo(BLOCK_DATA.getBlockDataFromBlockStateId(
             CACHE.getChunkCache().get(loc.chunkX(), loc.chunkZ())
                 .getBlockStateId(loc.x() & 15, loc.y(), loc.z() & 15)
@@ -514,19 +540,19 @@ public class StashManagerModule extends Module {
         }
     }
 
-    // Check if a chest at this location is a double chest.
+    // Is this a double chest?
     private boolean isDoubleChest(ContainerLocation loc) {
         if (loc.type() != BlockEntityType.CHEST && loc.type() != BlockEntityType.TRAPPED_CHEST) {
             return false;
         }
-        // Check adjacent blocks for matching chest type
+        // Check adjacent blocks
         return hasAdjacentChest(loc.x() + 1, loc.y(), loc.z(), loc.type())
             || hasAdjacentChest(loc.x() - 1, loc.y(), loc.z(), loc.type())
             || hasAdjacentChest(loc.x(), loc.y(), loc.z() + 1, loc.type())
             || hasAdjacentChest(loc.x(), loc.y(), loc.z() - 1, loc.type());
     }
 
-    // Check if this is the partner half of a double chest (skip to avoid indexing twice).
+    // Is this the partner half of a double chest? (skip to avoid double-indexing)
     private boolean isDoubleChestPartner(ContainerLocation loc) {
         if (!isDoubleChest(loc)) return false;
 
@@ -536,9 +562,9 @@ public class StashManagerModule extends Module {
             int nx = loc.x() + offset[0];
             int nz = loc.z() + offset[1];
             if (hasAdjacentChest(nx, loc.y(), nz, loc.type())) {
-                // Keep the container with the lower x, then lower z
+                // Keep lower x/z as primary
                 if (loc.x() > nx || (loc.x() == nx && loc.z() > nz)) {
-                    return true; // This is the partner — skip it
+                    return true; // partner — skip
                 }
                 return false;
             }
@@ -633,7 +659,7 @@ public class StashManagerModule extends Module {
         hasStartPosition = false;
     }
 
-    // Save current Baritone allowBreak setting and disable it to protect storage blocks.
+    // Save Baritone allowBreak and disable it.
     private void saveAndDisableBaritoneBreaking() {
         var pathfinderConfig = CONFIG.client.extra.pathfinder;
         savedAllowBreak = pathfinderConfig.allowBreak;
@@ -642,7 +668,7 @@ public class StashManagerModule extends Module {
         info("Baritone block breaking disabled for scan (was={})", savedAllowBreak);
     }
 
-    // Restore Baritone allowBreak to its pre-scan value.
+    // Restore Baritone allowBreak.
     private void restoreBaritoneBreaking() {
         if (!baritoneConfigSaved) return;
         CONFIG.client.extra.pathfinder.allowBreak = savedAllowBreak;

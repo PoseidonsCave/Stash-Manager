@@ -13,7 +13,8 @@ public record ContainerEntry(
     Map<String, Integer> items,
     int shulkerCount,
     List<ShulkerDetail> shulkerDetails,
-    long timestamp
+    long timestamp,
+    String label
 ) {
 
     // Per-shulker breakdown: color and items inside.
@@ -29,6 +30,13 @@ public record ContainerEntry(
     public ContainerEntry {
         items = items == null ? Collections.emptyMap() : new LinkedHashMap<>(items);
         shulkerDetails = shulkerDetails == null ? Collections.emptyList() : List.copyOf(shulkerDetails);
+    }
+
+    // Convenience constructor without label (backwards compatible).
+    public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
+                          Map<String, Integer> items, int shulkerCount,
+                          List<ShulkerDetail> shulkerDetails, long timestamp) {
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, null);
     }
 
     // Unique position key for deduplication.
@@ -74,5 +82,15 @@ public record ContainerEntry(
             .filter(e -> e.getKey().toLowerCase().contains(lower))
             .mapToInt(Map.Entry::getValue)
             .sum();
+    }
+
+    // Count of unique item types in this container.
+    public int itemTypeCount() {
+        return items.size();
+    }
+
+    // Create a copy with a new label.
+    public ContainerEntry withLabel(String newLabel) {
+        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, newLabel);
     }
 }
