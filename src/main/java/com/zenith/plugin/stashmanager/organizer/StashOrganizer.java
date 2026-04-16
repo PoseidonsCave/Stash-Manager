@@ -951,10 +951,7 @@ public final class StashOrganizer {
 
     private void interactWithBlock(int[] pos) {
         try {
-            BARITONE.getTo(BLOCK_DATA.getBlockDataFromBlockStateId(
-                    CACHE.getChunkCache().get(pos[0] >> 4, pos[2] >> 4)
-                            .getBlockStateId(pos[0] & 15, pos[1], pos[2] & 15)
-            ), true);
+            BARITONE.rightClickBlock(pos[0], pos[1], pos[2]);
         } catch (Exception e) {
             info("Failed to interact with block at " + posString(pos) + ": " + e.getMessage());
             advanceToNextTask();

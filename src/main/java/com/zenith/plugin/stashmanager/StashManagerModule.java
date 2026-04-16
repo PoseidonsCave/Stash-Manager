@@ -317,7 +317,7 @@ public class StashManagerModule extends Module {
             return;
         }
 
-        currentContainerIndex = 0;
+        currentContainerIndex = -1;
         advanceToNextContainer();
     }
 
@@ -521,11 +521,8 @@ public class StashManagerModule extends Module {
     }
 
     private void interactWithContainer(ContainerLocation loc) {
-        // Right-click the container block
-        BARITONE.getTo(BLOCK_DATA.getBlockDataFromBlockStateId(
-            CACHE.getChunkCache().get(loc.chunkX(), loc.chunkZ())
-                .getBlockStateId(loc.x() & 15, loc.y(), loc.z() & 15)
-        ), true);
+        // Right-click the container block at exact coordinates
+        BARITONE.rightClickBlock(loc.x(), loc.y(), loc.z());
     }
 
     private void closeCurrentContainer() {
