@@ -1,5 +1,6 @@
 package com.zenith.plugin.stashmanager.organizer;
 
+import com.zenith.Proxy;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
@@ -150,6 +151,15 @@ public final class StashOrganizer {
     public boolean start() {
         if (config.pos1 == null || config.pos2 == null) {
             info("Cannot organize: region not defined (set pos1 and pos2 first)");
+            return false;
+        }
+        var proxy = Proxy.getInstance();
+        if (!proxy.isConnected()) {
+            info("Cannot organize: bot is not connected.");
+            return false;
+        }
+        if (proxy.hasActivePlayer()) {
+            info("Cannot organize: a player is currently controlling the proxy.");
             return false;
         }
         if (index.size() == 0) {
