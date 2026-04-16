@@ -1,6 +1,7 @@
 package com.zenith.plugin.stashmanager;
 
 import com.github.rfresh2.EventConsumer;
+import com.zenith.Proxy;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
@@ -112,7 +113,8 @@ public class StashManagerModule extends Module {
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
             of(ClientBotTick.class, this::onTick),
-            of(ClientBotTick.Starting.class, this::onTickStarting)
+            of(ClientBotTick.Starting.class, this::onTickStarting),
+            of(ClientBotTick.Stopped.class, this::onTickStopped)
         );
     }
 
@@ -182,12 +184,9 @@ public class StashManagerModule extends Module {
 
     // Start a scan. Returns true if started.
     public boolean startScan() {
-        if (config.pos1 == null || config.pos2 == null) {
-            warn("Cannot start scan: region not defined (set pos1 and pos2 first)");
-            return false;
-        }
-        if (state != ScanState.IDLE && state != ScanState.DONE) {
-            warn("Cannot start scan: already scanning (state={})", state);
+        String blocker = getScanStartBlocker();
+        if (blocker != null) {
+            warn("Cannot start scan: {}", blocker);
             return false;
         }
 
@@ -240,12 +239,9 @@ public class StashManagerModule extends Module {
 
     // Return to recorded start position. Returns true if nav started.
     public boolean returnToStart() {
-        if (!hasStartPosition) {
-            warn("No starting position recorded");
-            return false;
-        }
-        if (state != ScanState.IDLE && state != ScanState.DONE) {
-            warn("Cannot return while scan is active (state={})", state);
+        String blocker = getReturnToStartBlocker();
+        if (blocker != null) {
+            warn("Cannot return to start: {}", blocker);
             return false;
         }
         info("Returning to starting position: {}, {}, {}",
@@ -264,6 +260,32 @@ public class StashManagerModule extends Module {
     public double getStartY() { return startY; }
     public double getStartZ() { return startZ; }
 
+    public @Nullable String getScanStartBlocker() {
+        if (config.pos1 == null || config.pos2 == null) {
+            return "region not defined (set pos1 and pos2 first)";
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            return "already scanning (state=" + state + ")";
+        }
+        if (organizer != null && organizer.isActive()) {
+            return "organizer is active";
+        }
+        return getAutomationUnavailableReason();
+    }
+
+    public @Nullable String getReturnToStartBlocker() {
+        if (!hasStartPosition) {
+            return "no starting position recorded";
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            return "scan is active (state=" + state + ")";
+        }
+        if (organizer != null && organizer.isActive()) {
+            return "organizer is active";
+        }
+        return getAutomationUnavailableReason();
+    }
+
     // Region size in blocks.
     public int[] getRegionDimensions() {
         if (config.pos1 == null || config.pos2 == null) return null;
@@ -281,6 +303,18 @@ public class StashManagerModule extends Module {
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             warn("Bot reconnected during scan — resetting state");
             state = ScanState.IDLE;
+        }
+    }
+
+    private void onTickStopped(ClientBotTick.Stopped event) {
+        // Bot ticks stop whenever a player takes control, which also pauses Baritone.
+        if (organizer != null && organizer.isActive()) {
+            warn("Bot ticks stopped while organizer was active — stopping organizer");
+            organizer.stop();
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            warn("Bot ticks stopped while scan was active — aborting scan");
+            abortScan();
         }
     }
 
@@ -699,6 +733,17 @@ public class StashManagerModule extends Module {
         hasStartPosition = false;
         walkRetryCount = 0;
         walkingTickCount = 0;
+    }
+
+    private @Nullable String getAutomationUnavailableReason() {
+        var proxy = Proxy.getInstance();
+        if (!proxy.isConnected()) {
+            return "bot is not connected";
+        }
+        if (proxy.hasActivePlayer()) {
+            return "a player is currently controlling the proxy";
+        }
+        return null;
     }
 
     // Save Baritone allowBreak and disable it.

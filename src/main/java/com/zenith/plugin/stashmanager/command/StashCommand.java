@@ -3,6 +3,7 @@ package com.zenith.plugin.stashmanager.command;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.zenith.Proxy;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandContext;
 import com.zenith.command.api.CommandUsage;
@@ -30,6 +31,8 @@ import static com.zenith.Globals.CACHE;
 public class StashCommand extends Command {
 
     private static final int PAGE_SIZE = 10;
+    private static final String SPECTATOR_TESTING_TIP =
+        "Use spectator mode for live observation: `/spectator on`, whitelist your test account, then `/spectator playerCamOnJoin on`.";
     private static final DateTimeFormatter UPDATE_TIME_FORMAT =
         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z").withZone(ZoneId.systemDefault());
 
@@ -184,10 +187,9 @@ public class StashCommand extends Command {
                             }
                         }
                     } else {
+                        String reason = module.getScanStartBlocker();
                         embed.title("Scan Failed")
-                            .description(config.pos1 == null || config.pos2 == null
-                                ? "Region not defined. Set pos1 and pos2 first."
-                                : "A scan is already in progress.")
+                            .description(withSpectatorTip(reason != null ? reason : "Scan could not be started."))
                             .errorColor();
                     }
                     return OK;
@@ -213,10 +215,9 @@ public class StashCommand extends Command {
                                 module.getStartX(), module.getStartY(), module.getStartZ()))
                             .successColor();
                     } else {
+                        String reason = module.getReturnToStartBlocker();
                         embed.title("Return Failed")
-                            .description(module.hasStartPosition()
-                                ? "Cannot return while a scan is active. Stop the scan first."
-                                : "No starting position recorded. Run a scan first.")
+                            .description(withSpectatorTip(reason != null ? reason : "Could not return to the recorded start position."))
                             .errorColor();
                     }
                     return OK;
@@ -251,6 +252,11 @@ public class StashCommand extends Command {
                     embed.addField("Return to Start", config.returnToStart ? "Enabled" : "Disabled", true);
                     embed.addField("Database", database != null && database.isInitialized() ? "Connected" : "Disabled", true);
                     embed.addField("API Server", config.apiEnabled ? "Port " + config.apiPort : "Disabled", true);
+                    if (Proxy.getInstance().hasActivePlayer()) {
+                        embed.addField("Automation Note",
+                            "A player is controlling the proxy, so Baritone-based stash actions will not run. " + SPECTATOR_TESTING_TIP,
+                            false);
+                    }
                     embed.addField("Plugin Version", updateSnapshot.currentVersion(), true);
                     embed.addField("Updater", formatUpdaterState(updateSnapshot), true);
                     if (updateSnapshot.latestVersion() != null) {
@@ -609,7 +615,8 @@ public class StashCommand extends Command {
                         embed.addField("Containers", String.valueOf(index.size()), true);
                     } else {
                         embed.title("Organize Failed")
-                            .description("Check that region is defined and containers are scanned.")
+                            .description("Check that region is defined, containers are scanned, and no player is actively controlling the proxy.\n"
+                                + SPECTATOR_TESTING_TIP)
                             .errorColor();
                     }
                     return OK;
@@ -1264,5 +1271,12 @@ public class StashCommand extends Command {
                 ? "Check failed"
                 : "Check failed";
         };
+    }
+
+    private String withSpectatorTip(final String message) {
+        if (message != null && message.contains("currently controlling the proxy")) {
+            return message + "\n" + SPECTATOR_TESTING_TIP;
+        }
+        return message;
     }
 }
