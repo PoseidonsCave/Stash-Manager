@@ -4,6 +4,8 @@ import com.github.rfresh2.EventConsumer;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
+import com.zenith.mc.block.BlockPos;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
@@ -66,6 +68,10 @@ public class StashManagerModule extends Module {
     // Baritone config — saved/restored around scans
     private boolean savedAllowBreak = true;
     private boolean baritoneConfigSaved = false;
+
+    // Walking retry counter
+    private int walkRetryCount = 0;
+    private static final int MAX_WALK_RETRIES = 3;
 
     // Statistics
     private int containersFound = 0;
@@ -184,6 +190,9 @@ public class StashManagerModule extends Module {
         }
 
         resetScanState();
+
+        // Clear any existing Baritone state before starting
+        BARITONE.stop();
 
         // Record start position for return nav
         var playerCache = CACHE.getPlayerCache();
@@ -323,7 +332,6 @@ public class StashManagerModule extends Module {
 
     private void tickWalking() {
         if (!BARITONE.isActive()) {
-            // Pathing finished
             ContainerLocation target = currentContainer();
             if (target == null) {
                 advanceToNextContainer();
@@ -333,15 +341,23 @@ public class StashManagerModule extends Module {
             double dist = distanceToContainer(target);
             if (dist <= 5.0) {
                 // In range — open container
+                walkRetryCount = 0;
                 state = ScanState.OPENING;
                 tickCounter = 0;
                 openTimeoutCounter = 0;
                 containerDataReceived = false;
                 interactWithContainer(target);
+            } else if (walkRetryCount < MAX_WALK_RETRIES) {
+                // Re-path toward container
+                walkRetryCount++;
+                info("Re-pathing to container at {}, {}, {} (dist={}, attempt={})",
+                    target.x(), target.y(), target.z(), String.format("%.1f", dist), walkRetryCount);
+                pathToContainer(target);
             } else {
-                // Path failed to reach target
-                warn("Failed to reach container at {}, {}, {} (dist={})",
-                    target.x(), target.y(), target.z(), String.format("%.1f", dist));
+                // Exhausted retries
+                warn("Failed to reach container at {}, {}, {} after {} attempts (dist={})",
+                    target.x(), target.y(), target.z(), MAX_WALK_RETRIES, String.format("%.1f", dist));
+                walkRetryCount = 0;
                 containersFailed++;
                 advanceToNextContainer();
             }
@@ -485,6 +501,7 @@ public class StashManagerModule extends Module {
         }
 
         double dist = distanceToContainer(next);
+        walkRetryCount = 0;
         if (dist <= 5.0) {
             // Already in range
             state = ScanState.OPENING;
@@ -494,8 +511,9 @@ public class StashManagerModule extends Module {
             interactWithContainer(next);
         } else {
             state = ScanState.WALKING;
-            BARITONE.pathTo(next.x(), next.y(), next.z());
-            debug("Walking to container at {}, {}, {} (dist={})",
+            pathToContainer(next);
+            info("Walking to container {}/{} at {}, {}, {} (dist={})",
+                currentContainerIndex + 1, pendingContainers.size(),
                 next.x(), next.y(), next.z(), String.format("%.1f", dist));
         }
     }
@@ -523,6 +541,10 @@ public class StashManagerModule extends Module {
     private void interactWithContainer(ContainerLocation loc) {
         // Right-click the container block at exact coordinates
         BARITONE.rightClickBlock(loc.x(), loc.y(), loc.z());
+    }
+
+    private void pathToContainer(ContainerLocation loc) {
+        BARITONE.pathTo(new GoalGetToBlock(new BlockPos(loc.x(), loc.y(), loc.z())));
     }
 
     private void closeCurrentContainer() {
@@ -654,6 +676,7 @@ public class StashManagerModule extends Module {
         containersFailed = 0;
         currentScanId = -1;
         hasStartPosition = false;
+        walkRetryCount = 0;
     }
 
     // Save Baritone allowBreak and disable it.

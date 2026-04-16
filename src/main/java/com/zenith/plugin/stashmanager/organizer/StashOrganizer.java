@@ -2,6 +2,8 @@ package com.zenith.plugin.stashmanager.organizer;
 
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
+import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
@@ -503,8 +505,12 @@ public final class StashOrganizer {
             }
 
             // Start pathfinding
-            BARITONE.pathTo(walkTarget[0], walkTarget[1], walkTarget[2]);
+            pathToWalkTarget();
         }
+    }
+
+    private void pathToWalkTarget() {
+        BARITONE.pathTo(new GoalGetToBlock(new BlockPos(walkTarget[0], walkTarget[1], walkTarget[2])));
     }
 
     private void onArrived() {
