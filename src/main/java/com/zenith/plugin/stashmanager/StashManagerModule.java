@@ -72,6 +72,8 @@ public class StashManagerModule extends Module {
     // Walking retry counter
     private int walkRetryCount = 0;
     private static final int MAX_WALK_RETRIES = 3;
+    private int walkingTickCount = 0;
+    private static final int WALK_TIMEOUT_TICKS = 600; // 30 seconds at 20tps
 
     // Statistics
     private int containersFound = 0;
@@ -331,33 +333,49 @@ public class StashManagerModule extends Module {
     }
 
     private void tickWalking() {
-        if (!BARITONE.isActive()) {
-            ContainerLocation target = currentContainer();
-            if (target == null) {
-                advanceToNextContainer();
-                return;
-            }
+        walkingTickCount++;
 
-            double dist = distanceToContainer(target);
-            if (dist <= 5.0) {
-                // In range — open container
-                walkRetryCount = 0;
-                state = ScanState.OPENING;
-                tickCounter = 0;
-                openTimeoutCounter = 0;
-                containerDataReceived = false;
-                interactWithContainer(target);
-            } else if (walkRetryCount < MAX_WALK_RETRIES) {
-                // Re-path toward container
+        ContainerLocation target = currentContainer();
+        if (target == null) {
+            advanceToNextContainer();
+            return;
+        }
+
+        double dist = distanceToContainer(target);
+
+        // Always check distance — may have arrived regardless of Baritone state
+        if (dist <= 5.0) {
+            BARITONE.stop();
+            walkRetryCount = 0;
+            state = ScanState.OPENING;
+            tickCounter = 0;
+            openTimeoutCounter = 0;
+            containerDataReceived = false;
+            interactWithContainer(target);
+            return;
+        }
+
+        // Timeout failsafe
+        if (walkingTickCount >= WALK_TIMEOUT_TICKS) {
+            warn("Walking timeout for container at {} (dist={})",
+                currentContainerPos(), String.format("%.1f", dist));
+            BARITONE.stop();
+            containersFailed++;
+            advanceToNextContainer();
+            return;
+        }
+
+        // Use CustomGoalProcess.isActive() — not Baritone.isActive() which depends on
+        // runtime gates (chunks loaded, teleport delay) that may not have passed yet
+        if (!BARITONE.getCustomGoalProcess().isActive()) {
+            if (walkRetryCount < MAX_WALK_RETRIES) {
                 walkRetryCount++;
                 info("Re-pathing to container at {}, {}, {} (dist={}, attempt={})",
                     target.x(), target.y(), target.z(), String.format("%.1f", dist), walkRetryCount);
                 pathToContainer(target);
             } else {
-                // Exhausted retries
                 warn("Failed to reach container at {}, {}, {} after {} attempts (dist={})",
                     target.x(), target.y(), target.z(), MAX_WALK_RETRIES, String.format("%.1f", dist));
-                walkRetryCount = 0;
                 containersFailed++;
                 advanceToNextContainer();
             }
@@ -423,14 +441,13 @@ public class StashManagerModule extends Module {
     }
 
     private void tickWalkingToZone() {
-        if (!BARITONE.isActive()) {
-            // Arrived — re-scan zone for newly loaded chunks
+        if (!BARITONE.getCustomGoalProcess().isActive()) {
             state = ScanState.ZONE_SCANNING;
         }
     }
 
     private void tickReturning() {
-        if (!BARITONE.isActive()) {
+        if (!BARITONE.getCustomGoalProcess().isActive()) {
             double dist = Math.sqrt(
                 Math.pow(CACHE.getPlayerCache().getX() - startX, 2)
                 + Math.pow(CACHE.getPlayerCache().getY() - startY, 2)
@@ -500,8 +517,12 @@ public class StashManagerModule extends Module {
             }
         }
 
+        // Stop any lingering Baritone process before starting new action
+        BARITONE.stop();
+
         double dist = distanceToContainer(next);
         walkRetryCount = 0;
+        walkingTickCount = 0;
         if (dist <= 5.0) {
             // Already in range
             state = ScanState.OPENING;
@@ -677,6 +698,7 @@ public class StashManagerModule extends Module {
         currentScanId = -1;
         hasStartPosition = false;
         walkRetryCount = 0;
+        walkingTickCount = 0;
     }
 
     // Save Baritone allowBreak and disable it.
