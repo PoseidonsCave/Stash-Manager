@@ -52,6 +52,10 @@ public class ApiHandler {
         body.put("containers_indexed", module.getContainersIndexed());
         body.put("containers_failed", module.getContainersFailed());
         body.put("containers_pending", module.getPendingCount());
+        body.put("containers_processed", module.getProcessedCount());
+        body.put("scan_processed_ratio", module.getProcessedRatio());
+        body.put("scan_success_rate", module.getSuccessRate());
+        body.put("scan_failure_rate", module.getFailureRate());
         body.put("last_scan", index.timeSinceLastScan());
         body.put("database_connected", database != null && database.isInitialized());
 
@@ -187,6 +191,10 @@ public class ApiHandler {
         body.put("scan_containers_indexed", module.getContainersIndexed());
         body.put("scan_containers_failed", module.getContainersFailed());
         body.put("scan_containers_pending", module.getPendingCount());
+        body.put("scan_containers_processed", module.getProcessedCount());
+        body.put("scan_processed_ratio", module.getProcessedRatio());
+        body.put("scan_success_rate", module.getSuccessRate());
+        body.put("scan_failure_rate", module.getFailureRate());
 
         sendJson(exchange, 200, body);
     }
@@ -222,6 +230,22 @@ public class ApiHandler {
         sb.append("# HELP stash_scan_containers_pending Containers pending in current scan\n");
         sb.append("# TYPE stash_scan_containers_pending gauge\n");
         sb.append("stash_scan_containers_pending ").append(module.getPendingCount()).append('\n');
+
+        sb.append("# HELP stash_scan_containers_processed Containers processed in current or last scan\n");
+        sb.append("# TYPE stash_scan_containers_processed gauge\n");
+        sb.append("stash_scan_containers_processed ").append(module.getProcessedCount()).append('\n');
+
+        sb.append("# HELP stash_scan_processed_ratio Fraction of found containers already processed in current or last scan (0..1)\n");
+        sb.append("# TYPE stash_scan_processed_ratio gauge\n");
+        sb.append("stash_scan_processed_ratio ").append(module.getProcessedRatio()).append('\n');
+
+        sb.append("# HELP stash_scan_success_rate Fraction of found containers successfully indexed in current or last scan (0..1)\n");
+        sb.append("# TYPE stash_scan_success_rate gauge\n");
+        sb.append("stash_scan_success_rate ").append(module.getSuccessRate()).append('\n');
+
+        sb.append("# HELP stash_scan_failure_rate Fraction of found containers that failed in current or last scan (0..1)\n");
+        sb.append("# TYPE stash_scan_failure_rate gauge\n");
+        sb.append("stash_scan_failure_rate ").append(module.getFailureRate()).append('\n');
 
         sb.append("# HELP stash_last_scan_timestamp_seconds Unix timestamp of last scan completion\n");
         sb.append("# TYPE stash_last_scan_timestamp_seconds gauge\n");

@@ -182,11 +182,32 @@ public class StashManagerModule extends Module {
         return Math.max(0, pendingContainers.size() - currentContainerIndex);
     }
 
+    public int getProcessedCount() {
+        return containersIndexed + containersFailed;
+    }
+
+    public double getProcessedRatio() {
+        if (containersFound <= 0) return 0.0;
+        return (double) getProcessedCount() / containersFound;
+    }
+
+    public double getSuccessRate() {
+        if (containersFound <= 0) return 0.0;
+        return (double) containersIndexed / containersFound;
+    }
+
+    public double getFailureRate() {
+        if (containersFound <= 0) return 0.0;
+        return (double) containersFailed / containersFound;
+    }
+
     // Start a scan. Returns true if started.
     public boolean startScan() {
         String blocker = getScanStartBlocker();
         if (blocker != null) {
             warn("Cannot start scan: {}", blocker);
+            fireWebhookEvent("scan_start_blocked",
+                "\"reason\":" + jsonString(blocker));
             return false;
         }
 
@@ -213,6 +234,8 @@ public class StashManagerModule extends Module {
                 currentScanId = database.recordScanStart(config.pos1, config.pos2);
             } catch (Exception e) {
                 warn("Failed to record scan start in database: {}", e.getMessage());
+                fireWebhookEvent("scan_start_db_error",
+                    "\"message\":" + jsonString(e.getMessage()));
             }
         }
 
@@ -224,6 +247,10 @@ public class StashManagerModule extends Module {
 
     // Abort scan in progress.
     public void abortScan() {
+        abortScan("manual_abort");
+    }
+
+    private void abortScan(String reason) {
         if (state == ScanState.IDLE) return;
 
         // Close any open container
@@ -235,6 +262,8 @@ public class StashManagerModule extends Module {
         state = ScanState.IDLE;
         info("Scan aborted. Found={}, Indexed={}, Failed={}",
             containersFound, containersIndexed, containersFailed);
+        fireWebhookEvent("scan_aborted",
+            "\"reason\":" + jsonString(reason));
     }
 
     // Return to recorded start position. Returns true if nav started.
@@ -242,12 +271,16 @@ public class StashManagerModule extends Module {
         String blocker = getReturnToStartBlocker();
         if (blocker != null) {
             warn("Cannot return to start: {}", blocker);
+            fireWebhookEvent("return_to_start_blocked",
+                "\"reason\":" + jsonString(blocker));
             return false;
         }
         info("Returning to starting position: {}, {}, {}",
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
         BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
         state = ScanState.RETURNING;
+        fireWebhookEvent("return_to_start_started",
+            "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
         return true;
     }
 
@@ -302,7 +335,7 @@ public class StashManagerModule extends Module {
         // Re-init on reconnect
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             warn("Bot reconnected during scan — resetting state");
-            state = ScanState.IDLE;
+            abortScan("bot_reconnected");
         }
     }
 
@@ -314,7 +347,7 @@ public class StashManagerModule extends Module {
         }
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             warn("Bot ticks stopped while scan was active — aborting scan");
-            abortScan();
+            abortScan("bot_ticks_stopped");
         }
     }
 
@@ -359,6 +392,7 @@ public class StashManagerModule extends Module {
         if (pendingContainers.isEmpty()) {
             state = ScanState.DONE;
             info("No containers found in region");
+            fireWebhookEvent("scan_empty");
             return;
         }
 
@@ -393,6 +427,9 @@ public class StashManagerModule extends Module {
         if (walkingTickCount >= WALK_TIMEOUT_TICKS) {
             warn("Walking timeout for container at {} (dist={})",
                 currentContainerPos(), String.format("%.1f", dist));
+            fireWebhookEvent("container_walk_timeout",
+                "\"container\":" + jsonString(currentContainerPos())
+                    + ",\"distance\":" + jsonString(String.format("%.1f", dist)));
             BARITONE.stop();
             containersFailed++;
             advanceToNextContainer();
@@ -410,6 +447,10 @@ public class StashManagerModule extends Module {
             } else {
                 warn("Failed to reach container at {}, {}, {} after {} attempts (dist={})",
                     target.x(), target.y(), target.z(), MAX_WALK_RETRIES, String.format("%.1f", dist));
+                fireWebhookEvent("container_unreachable",
+                    "\"container\":" + jsonString(target.x() + ", " + target.y() + ", " + target.z())
+                        + ",\"distance\":" + jsonString(String.format("%.1f", dist))
+                        + ",\"attempts\":" + MAX_WALK_RETRIES);
                 containersFailed++;
                 advanceToNextContainer();
             }
@@ -428,6 +469,9 @@ public class StashManagerModule extends Module {
 
         if (openTimeoutCounter >= config.openTimeoutTicks) {
             warn("Timeout waiting for container open at {}", currentContainerPos());
+            fireWebhookEvent("container_open_timeout",
+                "\"container\":" + jsonString(currentContainerPos())
+                    + ",\"timeout_ticks\":" + config.openTimeoutTicks);
             containersFailed++;
             closeCurrentContainer();
             advanceToNextContainer();
@@ -454,6 +498,8 @@ public class StashManagerModule extends Module {
         } else {
             containersFailed++;
             warn("Failed to read container at {}", currentContainerPos());
+            fireWebhookEvent("container_read_failed",
+                "\"container\":" + jsonString(currentContainerPos()));
         }
 
         state = ScanState.CLOSING;
@@ -491,9 +537,17 @@ public class StashManagerModule extends Module {
             if (dist <= 3.0) {
                 info("Returned to starting position: {}, {}, {}",
                     String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+                inGameAlert("<green>Returned to starting position.</green>");
+                fireWebhookEvent("returned_to_start",
+                    "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
             } else {
                 warn("Could not reach starting position (dist={}). Finishing scan.",
                     String.format("%.1f", dist));
+                inGameAlert("<yellow>Could not reach starting position</yellow> <gray>(dist="
+                    + String.format("%.1f", dist) + "). Finishing scan.</gray>");
+                fireWebhookEvent("return_to_start_failed",
+                    "\"distance\":" + jsonString(String.format("%.1f", dist))
+                        + ",\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
             }
 
             finishScan();
@@ -526,8 +580,13 @@ public class StashManagerModule extends Module {
             if (config.returnToStart && hasStartPosition) {
                 info("Returning to starting position: {}, {}, {}",
                     String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+                inGameAlert("<aqua>Scan complete!</aqua> <gray>Found=" + containersFound
+                    + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed
+                    + ". Returning to start position...</gray>");
                 BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
                 state = ScanState.RETURNING;
+                fireWebhookEvent("return_to_start_started",
+                    "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 return;
             }
 
@@ -678,24 +737,37 @@ public class StashManagerModule extends Module {
         }
 
         // Fire webhook notification
-        fireWebhook();
+        fireWebhookEvent("scan_complete");
 
         state = ScanState.DONE;
         info("Scan complete. Found={}, Indexed={}, Failed={}",
             containersFound, containersIndexed, containersFailed);
+        inGameAlert("<green>Scan complete.</green> <gray>Found=" + containersFound
+            + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed + "</gray>");
     }
 
-    private void fireWebhook() {
+    private void fireWebhookEvent(String event) {
+        fireWebhookEvent(event, null);
+    }
+
+    private void fireWebhookEvent(String event, @Nullable String extraJsonFields) {
         if (config.webhookUrl == null || config.webhookUrl.isBlank()) return;
 
         try {
-            String json = "{" +
-                "\"event\": \"scan_complete\"," +
-                "\"containers_found\": " + containersFound + "," +
-                "\"containers_indexed\": " + containersIndexed + "," +
-                "\"containers_failed\": " + containersFailed + "," +
-                "\"timestamp\": " + System.currentTimeMillis() +
-                "}";
+            StringBuilder json = new StringBuilder("{")
+                .append("\"event\":").append(jsonString(event)).append(',')
+                .append("\"scan_state\":").append(jsonString(state.name())).append(',')
+                .append("\"containers_found\":").append(containersFound).append(',')
+                .append("\"containers_indexed\":").append(containersIndexed).append(',')
+                .append("\"containers_failed\":").append(containersFailed);
+
+            if (extraJsonFields != null && !extraJsonFields.isBlank()) {
+                json.append(',').append(extraJsonFields);
+            }
+
+            json.append(',')
+                .append("\"timestamp\":").append(System.currentTimeMillis())
+                .append('}');
 
             HttpClient client = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(5))
@@ -705,7 +777,7 @@ public class StashManagerModule extends Module {
                 .uri(URI.create(config.webhookUrl))
                 .header("Content-Type", "application/json")
                 .timeout(Duration.ofSeconds(10))
-                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .POST(HttpRequest.BodyPublishers.ofString(json.toString()))
                 .build();
 
             client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
@@ -717,6 +789,18 @@ public class StashManagerModule extends Module {
         } catch (Exception e) {
             warn("Failed to fire webhook: {}", e.getMessage());
         }
+    }
+
+    private String jsonString(String value) {
+        return "\"" + escapeJson(value) + "\"";
+    }
+
+    private String escapeJson(String value) {
+        return value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r");
     }
 
     private void resetScanState() {
