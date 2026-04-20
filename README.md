@@ -2,6 +2,10 @@
 
 A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, indexes, and provides Discord-queryable access to container inventories in a Minecraft world. Supports PostgreSQL persistence, a built-in REST API with Prometheus metrics, webhook notifications, and full configuration via Discord commands.
 
+## Discord Server
+We have a Discord server! Feel free to join for up-to-date information:
+https://discord.gg/8ACQJUtQse
+
 ![Build](https://github.com/PoseidonsCave/Stash-Management/actions/workflows/build.yml/badge.svg)
 
 ## Features
