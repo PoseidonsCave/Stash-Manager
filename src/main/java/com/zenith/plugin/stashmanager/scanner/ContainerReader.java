@@ -1,10 +1,9 @@
 package com.zenith.plugin.stashmanager.scanner;
 
 import com.zenith.cache.data.inventory.Container;
-import com.zenith.mc.item.ItemData;
-import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
 
@@ -77,9 +76,7 @@ public class ContainerReader {
     }
 
     private String getItemId(ItemStack stack) {
-        ItemData data = ItemRegistry.REGISTRY.get(stack.getId());
-        if (data != null) return data.name();
-        return "minecraft:unknown_" + stack.getId();
+        return ItemIdentifier.getItemId(stack);
     }
 
     private boolean isShulkerBox(String itemId) {

@@ -15,12 +15,14 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
-import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
+import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.Map;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
 import static com.mojang.brigadier.arguments.StringArgumentType.greedyString;
@@ -80,6 +82,16 @@ public class StashCommand extends Command {
                 "region load <name>",
                 "region list",
                 "region delete <name>",
+                "kit list",
+                "kit show <name>",
+                "kit snapshot <name>",
+                "kit add <name> <item_id> <count>",
+                "kit remove <name> <item_id>",
+                "kit delete <name>",
+                "get <item_id> [count]",
+                "get kit <name>",
+                "get status",
+                "get stop",
                 "organize",
                 "organize stop",
                 "organize status",
@@ -581,6 +593,392 @@ public class StashCommand extends Command {
                             return OK;
                         })
                     )
+                )
+            )
+            .then(literal("kit")
+                .then(literal("list")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed()
+                            .title("Saved Kits")
+                            .primaryColor();
+
+                        if (database == null || !database.isInitialized()) {
+                            embed.description("Database not connected.").errorColor();
+                            return OK;
+                        }
+
+                        try {
+                            var kits = database.listKits();
+                            if (kits.isEmpty()) {
+                                embed.description("No kits saved. Use `/stash kit snapshot <name>` to create one.");
+                            } else {
+                                embed.description(String.join("\n", kits));
+                            }
+                        } catch (Exception e) {
+                            embed.description("Error: " + e.getMessage()).errorColor();
+                        }
+                        return OK;
+                    })
+                )
+                .then(literal("show")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed()
+                                .title("Kit: " + name)
+                                .primaryColor();
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.description("Database not connected.").errorColor();
+                                return OK;
+                            }
+
+                            try {
+                                var items = database.loadKit(name);
+                                if (items.isEmpty()) {
+                                    embed.description("Kit is empty or does not exist.");
+                                } else {
+                                    StringBuilder sb = new StringBuilder();
+                                    int shown = 0;
+                                    for (var item : items.entrySet()) {
+                                        if (shown >= 25) {
+                                            sb.append("... and ").append(items.size() - 25).append(" more\n");
+                                            break;
+                                        }
+                                        sb.append(item.getValue()).append("x ")
+                                            .append(IndexExporter.toReadableName(item.getKey()))
+                                            .append(" (`").append(item.getKey()).append("`)\n");
+                                        shown++;
+                                    }
+                                    embed.description(sb.toString())
+                                        .addField("Unique Items", String.valueOf(items.size()), true);
+                                }
+                            } catch (Exception e) {
+                                embed.description("Error: " + e.getMessage()).errorColor();
+                            }
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("snapshot")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed();
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Kit Snapshot Failed")
+                                    .description("Database not connected.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            var snapshot = snapshotPlayerInventory();
+                            if (snapshot.isEmpty()) {
+                                module.fireWebhookEvent("kit_snapshot_failed", Map.of(
+                                    "kit_name", name,
+                                    "reason", "inventory_empty"
+                                ));
+                                embed.title("Kit Snapshot Failed")
+                                    .description("Player inventory is empty.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            int uniqueBefore = snapshot.size();
+                            int totalBefore = snapshot.values().stream().mapToInt(Integer::intValue).sum();
+                            var expectedPersisted = DatabaseManager.truncateKitItems(snapshot);
+                            int persistedTotal = expectedPersisted.values().stream().mapToInt(Integer::intValue).sum();
+                            boolean truncated = uniqueBefore > expectedPersisted.size();
+
+                            try {
+                                database.saveKit(name, snapshot);
+                                var persisted = database.loadKit(name);
+                                if (!persisted.equals(expectedPersisted)) {
+                                    module.fireWebhookEvent("kit_snapshot_failed", Map.of(
+                                        "kit_name", name,
+                                        "reason", "verification_failed",
+                                        "expected_unique_items", expectedPersisted.size(),
+                                        "persisted_unique_items", persisted.size()
+                                    ));
+                                    embed.title("Kit Snapshot Failed")
+                                        .description("Snapshot verification failed after saving **" + name + "**.")
+                                        .errorColor();
+                                    return OK;
+                                }
+
+                                if (truncated) {
+                                    module.fireWebhookEvent("kit_snapshot_truncated", Map.of(
+                                        "kit_name", name,
+                                        "original_unique_items", uniqueBefore,
+                                        "persisted_unique_items", expectedPersisted.size()
+                                    ));
+                                }
+                                module.fireWebhookEvent("kit_snapshot_saved", Map.of(
+                                    "kit_name", name,
+                                    "original_unique_items", uniqueBefore,
+                                    "persisted_unique_items", expectedPersisted.size(),
+                                    "persisted_total_count", persistedTotal,
+                                    "truncated", truncated
+                                ));
+
+                                String description = truncated
+                                    ? "Saved **" + name + "** from current inventory. Truncated to the first **"
+                                        + DatabaseManager.KIT_MAX_SLOTS + "** unique items to match one shulker load."
+                                    : "Saved **" + name + "** from current inventory.";
+                                embed.title("Kit Snapshot Saved")
+                                    .description(description)
+                                    .addField("Unique Items", String.valueOf(expectedPersisted.size()), true)
+                                    .addField("Total Count", String.valueOf(persistedTotal), true)
+                                    .successColor();
+                            } catch (Exception e) {
+                                module.fireWebhookEvent("kit_snapshot_failed", Map.of(
+                                    "kit_name", name,
+                                    "reason", "exception",
+                                    "message", e.getMessage()
+                                ));
+                                embed.title("Kit Snapshot Failed")
+                                    .description("Error: " + e.getMessage())
+                                    .errorColor();
+                            }
+                            return OK;
+                        })
+                    )
+                )
+                .then(literal("add")
+                    .then(argument("name", string())
+                        .then(argument("item_id", string())
+                            .then(argument("count", integer(1, 100000))
+                                .executes(c -> {
+                                    String name = StringArgumentType.getString(c, "name");
+                                    String itemId = normalizeItemId(StringArgumentType.getString(c, "item_id"));
+                                    int count = IntegerArgumentType.getInteger(c, "count");
+                                    var embed = c.getSource().getEmbed();
+
+                                    if (database == null || !database.isInitialized()) {
+                                        embed.title("Kit Update Failed")
+                                            .description("Database not connected.")
+                                            .errorColor();
+                                        return OK;
+                                    }
+
+                                    try {
+                                        if (database.setKitItem(name, itemId, count)) {
+                                            module.fireWebhookEvent("kit_item_updated", Map.of(
+                                                "kit_name", name,
+                                                "item_id", itemId,
+                                                "quantity", count
+                                            ));
+                                            embed.title("Kit Updated")
+                                                .description("Set **" + itemId + "** = **" + count + "** in kit **" + name + "**")
+                                                .successColor();
+                                        } else {
+                                            module.fireWebhookEvent("kit_item_update_rejected", Map.of(
+                                                "kit_name", name,
+                                                "item_id", itemId,
+                                                "quantity", count,
+                                                "reason", "kit_slot_limit_reached"
+                                            ));
+                                            embed.title("Kit Update Rejected")
+                                                .description("Kit **" + name + "** is already at the **" + DatabaseManager.KIT_MAX_SLOTS + "** item slot limit.")
+                                                .errorColor();
+                                        }
+                                    } catch (Exception e) {
+                                        module.fireWebhookEvent("kit_item_update_failed", Map.of(
+                                            "kit_name", name,
+                                            "item_id", itemId,
+                                            "quantity", count,
+                                            "message", e.getMessage()
+                                        ));
+                                        embed.title("Kit Update Failed")
+                                            .description("Error: " + e.getMessage())
+                                            .errorColor();
+                                    }
+                                    return OK;
+                                })
+                            )
+                        )
+                    )
+                )
+                .then(literal("remove")
+                    .then(argument("name", string())
+                        .then(argument("item_id", string())
+                            .executes(c -> {
+                                String name = StringArgumentType.getString(c, "name");
+                                String itemId = normalizeItemId(StringArgumentType.getString(c, "item_id"));
+                                var embed = c.getSource().getEmbed();
+
+                                if (database == null || !database.isInitialized()) {
+                                    embed.title("Kit Update Failed")
+                                        .description("Database not connected.")
+                                        .errorColor();
+                                    return OK;
+                                }
+
+                                try {
+                                    if (database.removeKitItem(name, itemId)) {
+                                        module.fireWebhookEvent("kit_item_removed", Map.of(
+                                            "kit_name", name,
+                                            "item_id", itemId
+                                        ));
+                                        embed.title("Kit Updated")
+                                            .description("Removed **" + itemId + "** from kit **" + name + "**")
+                                            .successColor();
+                                    } else {
+                                        module.fireWebhookEvent("kit_item_remove_miss", Map.of(
+                                            "kit_name", name,
+                                            "item_id", itemId
+                                        ));
+                                        embed.title("Kit Update")
+                                            .description("Item not found in kit: **" + itemId + "**")
+                                            .primaryColor();
+                                    }
+                                } catch (Exception e) {
+                                    module.fireWebhookEvent("kit_item_remove_failed", Map.of(
+                                        "kit_name", name,
+                                        "item_id", itemId,
+                                        "message", e.getMessage()
+                                    ));
+                                    embed.title("Kit Update Failed")
+                                        .description("Error: " + e.getMessage())
+                                        .errorColor();
+                                }
+                                return OK;
+                            })
+                        )
+                    )
+                )
+                .then(literal("delete")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed();
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Kit Delete Failed")
+                                    .description("Database not connected.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            try {
+                                if (database.deleteKit(name)) {
+                                    module.fireWebhookEvent("kit_deleted", Map.of("kit_name", name));
+                                    embed.title("Kit Deleted")
+                                        .description("Removed kit **" + name + "**")
+                                        .successColor();
+                                } else {
+                                    module.fireWebhookEvent("kit_delete_miss", Map.of("kit_name", name));
+                                    embed.title("Kit Not Found")
+                                        .description("No kit named: **" + name + "**")
+                                        .errorColor();
+                                }
+                            } catch (Exception e) {
+                                module.fireWebhookEvent("kit_delete_failed", Map.of(
+                                    "kit_name", name,
+                                    "message", e.getMessage()
+                                ));
+                                embed.title("Kit Delete Failed")
+                                    .description("Error: " + e.getMessage())
+                                    .errorColor();
+                            }
+                            return OK;
+                        })
+                    )
+                )
+            )
+            .then(literal("get")
+                .then(argument("item_id", string())
+                    .executes(c -> {
+                        String itemId = normalizeItemId(StringArgumentType.getString(c, "item_id"));
+                        return startRetrieval(c, "item:" + itemId, Map.of(itemId, 64));
+                    })
+                    .then(argument("count", integer(1, 100000))
+                        .executes(c -> {
+                            String itemId = normalizeItemId(StringArgumentType.getString(c, "item_id"));
+                            int count = IntegerArgumentType.getInteger(c, "count");
+                            return startRetrieval(c, "item:" + itemId, Map.of(itemId, count));
+                        })
+                    )
+                )
+                .then(literal("kit")
+                    .then(argument("name", string())
+                        .executes(c -> {
+                            String kitName = StringArgumentType.getString(c, "name");
+                            var embed = c.getSource().getEmbed();
+
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Retrieve Failed")
+                                    .description("Database not connected.")
+                                    .errorColor();
+                                return OK;
+                            }
+
+                            try {
+                                var kitItems = database.loadKit(kitName);
+                                if (kitItems.isEmpty()) {
+                                    embed.title("Retrieve Failed")
+                                        .description("Kit is empty or not found: **" + kitName + "**")
+                                        .errorColor();
+                                    return OK;
+                                }
+                                return startRetrieval(c, "kit:" + kitName, kitItems);
+                            } catch (Exception e) {
+                                embed.title("Retrieve Failed")
+                                    .description("Error loading kit: " + e.getMessage())
+                                    .errorColor();
+                                return OK;
+                            }
+                        })
+                    )
+                )
+                .then(literal("status")
+                    .executes(c -> {
+                        var retriever = module.getRetriever();
+                        var embed = c.getSource().getEmbed()
+                            .title("Retrieval Status")
+                            .primaryColor();
+
+                        embed.addField("State", retriever.getState().name(), true)
+                            .addField("Detail", retriever.getStatus(), false);
+
+                        if (retriever.getActiveRequestName() != null) {
+                            embed.addField("Request", retriever.getActiveRequestName(), true);
+                        }
+                        embed.addField("Remaining Total", String.valueOf(retriever.getRemainingTotal()), true);
+
+                        var remaining = retriever.getRemainingItems();
+                        if (!remaining.isEmpty()) {
+                            StringBuilder sb = new StringBuilder();
+                            int shown = 0;
+                            for (var item : remaining.entrySet()) {
+                                if (item.getValue() <= 0) continue;
+                                if (shown >= 15) {
+                                    sb.append("... and more");
+                                    break;
+                                }
+                                sb.append(item.getValue()).append("x ")
+                                    .append(IndexExporter.toReadableName(item.getKey()))
+                                    .append("\n");
+                                shown++;
+                            }
+                            if (sb.length() > 0) {
+                                embed.addField("Needed Items", sb.toString(), false);
+                            }
+                        }
+
+                        return OK;
+                    })
+                )
+                .then(literal("stop")
+                    .executes(c -> {
+                        module.stopRetrieval();
+                        c.getSource().getEmbed()
+                            .title("Retrieval Stopped")
+                            .description("Stopped active stash retrieval task.")
+                            .successColor();
+                        return OK;
+                    })
                 )
             )
             .then(literal("organize")
@@ -1278,5 +1676,48 @@ public class StashCommand extends Command {
             return message + "\n" + SPECTATOR_TESTING_TIP;
         }
         return message;
+    }
+
+    private int startRetrieval(com.mojang.brigadier.context.CommandContext<CommandContext> c,
+                               String requestName,
+                               Map<String, Integer> wantedItems) {
+        var embed = c.getSource().getEmbed();
+        if (module.startKitRetrieval(requestName, wantedItems)) {
+            embed.title("Retrieval Started")
+                .description("Request: **" + requestName + "**")
+                .addField("Unique Items", String.valueOf(wantedItems.size()), true)
+                .addField("Total Count", String.valueOf(wantedItems.values().stream().mapToInt(Integer::intValue).sum()), true)
+                .successColor();
+        } else {
+            String reason = module.getRetrieveBlocker();
+            embed.title("Retrieve Failed")
+                .description(withSpectatorTip(reason != null ? reason : "Could not start stash retrieval."))
+                .errorColor();
+        }
+        return OK;
+    }
+
+    private Map<String, Integer> snapshotPlayerInventory() {
+        var snapshot = new java.util.LinkedHashMap<String, Integer>();
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) return snapshot;
+
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = playerContainer.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0) continue;
+            String itemId = itemIdFromStack(stack);
+            snapshot.merge(itemId, stack.getAmount(), Integer::sum);
+        }
+
+        return snapshot;
+    }
+
+    private String itemIdFromStack(ItemStack stack) {
+        return ItemIdentifier.getItemId(stack);
+    }
+
+    private String normalizeItemId(String input) {
+        return input.contains(":") ? input.toLowerCase() : "minecraft:" + input.toLowerCase();
     }
 }

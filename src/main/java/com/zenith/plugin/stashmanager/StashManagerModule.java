@@ -13,6 +13,7 @@ import com.zenith.network.codec.PacketHandlerStateCodec;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
+import com.zenith.plugin.stashmanager.retriever.StashRetriever;
 import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner.ContainerLocation;
@@ -28,6 +29,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
@@ -54,6 +56,7 @@ public class StashManagerModule extends Module {
 
     // Organizer integration
     private StashOrganizer organizer;
+    private final StashRetriever retriever;
 
     private volatile ScanState state = ScanState.IDLE;
     private List<ContainerLocation> pendingContainers = new ArrayList<>();
@@ -90,6 +93,8 @@ public class StashManagerModule extends Module {
         this.index = index;
         this.regionScanner = new RegionScanner();
         this.containerReader = new ContainerReader(index);
+        this.retriever = new StashRetriever();
+        this.retriever.setEventCallback(this::fireWebhookEvent);
     }
 
     public void setDatabase(DatabaseManager database) {
@@ -98,10 +103,17 @@ public class StashManagerModule extends Module {
 
     public void setOrganizer(StashOrganizer organizer) {
         this.organizer = organizer;
+        if (this.organizer != null) {
+            this.organizer.setEventCallback(this::fireWebhookEvent);
+        }
     }
 
     public StashOrganizer getOrganizer() {
         return organizer;
+    }
+
+    public StashRetriever getRetriever() {
+        return retriever;
     }
 
     @Override
@@ -133,6 +145,9 @@ public class StashManagerModule extends Module {
                     if (organizer != null && organizer.isActive()) {
                         organizer.onContainerData(session, packet);
                     }
+                    if (retriever.isActive()) {
+                        retriever.onContainerData(session, packet);
+                    }
                     return packet;
                 })
                 .build())
@@ -153,6 +168,9 @@ public class StashManagerModule extends Module {
 
     @Override
     public void onDisable() {
+        if (retriever.isActive()) {
+            retriever.stop();
+        }
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             info("StashManager module disabled — aborting scan");
             abortScan();
@@ -199,6 +217,54 @@ public class StashManagerModule extends Module {
     public double getFailureRate() {
         if (containersFound <= 0) return 0.0;
         return (double) containersFailed / containersFound;
+    }
+
+    public @Nullable String getRetrieveBlocker() {
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            return "scan is active (state=" + state + ")";
+        }
+        if (organizer != null && organizer.isActive()) {
+            return "organizer is active";
+        }
+        if (retriever.isActive()) {
+            return "retriever is already active";
+        }
+        if (database == null || !database.isInitialized()) {
+            return "database not connected";
+        }
+        return getAutomationUnavailableReason();
+    }
+
+    public boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems) {
+        String blocker = getRetrieveBlocker();
+        if (blocker != null) {
+            warn("Cannot start retrieval: {}", blocker);
+            fireWebhookEvent("retrieve_start_blocked", Map.of(
+                "request_name", requestName,
+                "reason", blocker
+            ));
+            return false;
+        }
+
+        final List<com.zenith.plugin.stashmanager.index.ContainerEntry> entries;
+        try {
+            entries = database.getAllContainers();
+        } catch (Exception e) {
+            warn("Cannot start retrieval: failed to load containers from database: {}", e.getMessage());
+            fireWebhookEvent("retrieve_start_db_error", Map.of(
+                "request_name", requestName,
+                "message", e.getMessage()
+            ));
+            return false;
+        }
+
+        return retriever.startKit(requestName, kitItems, entries);
+    }
+
+    public void stopRetrieval() {
+        if (retriever.isActive()) {
+            retriever.stop();
+        }
     }
 
     // Start a scan. Returns true if started.
@@ -303,6 +369,9 @@ public class StashManagerModule extends Module {
         if (organizer != null && organizer.isActive()) {
             return "organizer is active";
         }
+        if (retriever.isActive()) {
+            return "retriever is active";
+        }
         return getAutomationUnavailableReason();
     }
 
@@ -315,6 +384,9 @@ public class StashManagerModule extends Module {
         }
         if (organizer != null && organizer.isActive()) {
             return "organizer is active";
+        }
+        if (retriever.isActive()) {
+            return "retriever is active";
         }
         return getAutomationUnavailableReason();
     }
@@ -345,6 +417,10 @@ public class StashManagerModule extends Module {
             warn("Bot ticks stopped while organizer was active — stopping organizer");
             organizer.stop();
         }
+        if (retriever.isActive()) {
+            warn("Bot ticks stopped while retriever was active — stopping retriever");
+            retriever.stop();
+        }
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             warn("Bot ticks stopped while scan was active — aborting scan");
             abortScan("bot_ticks_stopped");
@@ -355,6 +431,11 @@ public class StashManagerModule extends Module {
         // Delegate tick to organizer when active
         if (organizer != null && organizer.isActive()) {
             organizer.tick();
+            return;
+        }
+
+        if (retriever.isActive()) {
+            retriever.tick();
             return;
         }
 
@@ -746,8 +827,24 @@ public class StashManagerModule extends Module {
             + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed + "</gray>");
     }
 
-    private void fireWebhookEvent(String event) {
-        fireWebhookEvent(event, null);
+    public void fireWebhookEvent(String event) {
+        fireWebhookEvent(event, (Map<String, Object>) null);
+    }
+
+    public void fireWebhookEvent(String event, @Nullable Map<String, Object> extraFields) {
+        if (extraFields == null || extraFields.isEmpty()) {
+            fireWebhookEvent(event, (String) null);
+            return;
+        }
+
+        StringBuilder extraJson = new StringBuilder();
+        boolean first = true;
+        for (var entry : extraFields.entrySet()) {
+            if (!first) extraJson.append(',');
+            first = false;
+            extraJson.append(jsonString(entry.getKey())).append(':').append(toJsonValue(entry.getValue()));
+        }
+        fireWebhookEvent(event, extraJson.toString());
     }
 
     private void fireWebhookEvent(String event, @Nullable String extraJsonFields) {
@@ -789,6 +886,12 @@ public class StashManagerModule extends Module {
         } catch (Exception e) {
             warn("Failed to fire webhook: {}", e.getMessage());
         }
+    }
+
+    private String toJsonValue(@org.jspecify.annotations.Nullable Object value) {
+        if (value == null) return "null";
+        if (value instanceof Number || value instanceof Boolean) return String.valueOf(value);
+        return jsonString(String.valueOf(value));
     }
 
     private String jsonString(String value) {

@@ -5,9 +5,8 @@ import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.mc.block.BlockPos;
-import com.zenith.mc.item.ItemData;
-import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
+import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
@@ -19,6 +18,7 @@ import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.S
 import org.geysermc.mcprotocollib.network.Session;
 
 import java.util.*;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
 import static com.zenith.Globals.*;
@@ -82,6 +82,7 @@ public final class StashOrganizer {
     private final StashManagerConfig config;
     private final ContainerIndex index;
     private InfoCallback infoCallback;
+    private BiConsumer<String, Map<String, Object>> eventCallback;
 
     // ── Task Queue ──────────────────────────────────────────────────────
 
@@ -141,6 +142,10 @@ public final class StashOrganizer {
         this.infoCallback = callback;
     }
 
+    public void setEventCallback(BiConsumer<String, Map<String, Object>> callback) {
+        this.eventCallback = callback;
+    }
+
     // ── Public API ──────────────────────────────────────────────────────
 
     public State getState() { return state; }
@@ -151,19 +156,23 @@ public final class StashOrganizer {
     public boolean start() {
         if (config.pos1 == null || config.pos2 == null) {
             info("Cannot organize: region not defined (set pos1 and pos2 first)");
+            emit("organize_start_blocked", Map.of("reason", "region_not_defined"));
             return false;
         }
         var proxy = Proxy.getInstance();
         if (!proxy.isConnected()) {
             info("Cannot organize: bot is not connected.");
+            emit("organize_start_blocked", Map.of("reason", "bot_not_connected"));
             return false;
         }
         if (proxy.hasActivePlayer()) {
             info("Cannot organize: a player is currently controlling the proxy.");
+            emit("organize_start_blocked", Map.of("reason", "proxy_in_use"));
             return false;
         }
         if (index.size() == 0) {
             info("Cannot organize: no scanned data. Run /stash scan first.");
+            emit("organize_start_blocked", Map.of("reason", "no_scanned_data"));
             return false;
         }
 
@@ -180,6 +189,10 @@ public final class StashOrganizer {
         openContainerId = -1;
 
         state = State.PLANNING;
+        emit("organize_started", Map.of(
+            "region_pos1", posString(config.pos1),
+            "region_pos2", posString(config.pos2)
+        ));
         return true;
     }
 
@@ -193,6 +206,7 @@ public final class StashOrganizer {
         currentTask = null;
         overflowItems.clear();
         columnAssignment.clear();
+        emit("organize_stopped", Map.of("reason", "manual_stop"));
         info("Organizer stopped.");
     }
 
@@ -239,6 +253,7 @@ public final class StashOrganizer {
         if (regionContainers.isEmpty()) {
             info("No containers in region. Index has " + index.size()
                     + " containers total. Check that pos1/pos2 cover the scanned area.");
+            emit("organize_failed", Map.of("reason", "no_containers_in_region"));
             state = State.DONE;
             return;
         }
@@ -449,6 +464,14 @@ public final class StashOrganizer {
         if (shulkerMoves > 0) summary.append(", ").append(shulkerMoves).append(" shulker sorts");
         summary.append(").");
         info(summary.toString());
+        emit("organize_planned", Map.of(
+            "planned_moves", totalTasks,
+            "columns", columns.size(),
+            "item_types", itemLocations.size(),
+            "condense_types", condenseTypes,
+            "shared_types", shared,
+            "shulker_moves", shulkerMoves
+        ));
 
         if (!consolidationQueue.isEmpty()) {
             info(consolidationQueue.size() + " condensing tasks (will pack loose items into shulker boxes).");
@@ -564,6 +587,7 @@ public final class StashOrganizer {
 
         if (openWaitTicks > config.organizerOpenTimeoutTicks) {
             info("Timeout opening container, skipping.");
+            emit("organize_failed", Map.of("reason", "open_timeout"));
             advanceToNextTask();
         }
     }
@@ -686,6 +710,7 @@ public final class StashOrganizer {
 
             if (completedTasks % 5 == 0 || completedTasks == totalTasks) {
                 info("Progress: " + completedTasks + "/" + totalTasks);
+                emit("organize_progress", Map.of());
             }
 
             advanceToNextTask();
@@ -706,6 +731,7 @@ public final class StashOrganizer {
 
         if (openWaitTicks > config.organizerOpenTimeoutTicks) {
             info("Timeout opening container for shulker fetch.");
+            emit("organize_failed", Map.of("reason", "shulker_fetch_open_timeout"));
             startOverflow();
         }
     }
@@ -760,6 +786,7 @@ public final class StashOrganizer {
 
         if (openWaitTicks > config.organizerOpenTimeoutTicks) {
             info("Timeout opening destination for shulker deposit.");
+            emit("organize_failed", Map.of("reason", "shulker_store_open_timeout"));
             advanceToNextTask();
         }
     }
@@ -825,6 +852,7 @@ public final class StashOrganizer {
         overflowChestPos = findOverflowChest();
         if (overflowChestPos == null) {
             info("No chest available for overflow items!");
+            emit("organize_failed", Map.of("reason", "overflow_chest_missing"));
             advanceToNextTask();
             return;
         }
@@ -848,6 +876,7 @@ public final class StashOrganizer {
 
         if (openWaitTicks > config.organizerOpenTimeoutTicks) {
             info("Timeout opening overflow chest.");
+            emit("organize_failed", Map.of("reason", "overflow_open_timeout"));
             advanceToNextTask();
         }
     }
@@ -951,6 +980,9 @@ public final class StashOrganizer {
     private void finishOrganization() {
         BARITONE.stop();
         state = State.DONE;
+        emit("organize_completed", Map.of(
+            "overflow_types", overflowItems.size()
+        ));
         info("Organization complete! " + completedTasks + " moves executed.");
 
         if (!overflowItems.isEmpty()) {
@@ -970,6 +1002,11 @@ public final class StashOrganizer {
             BARITONE.rightClickBlock(pos[0], pos[1], pos[2]);
         } catch (Exception e) {
             info("Failed to interact with block at " + posString(pos) + ": " + e.getMessage());
+            emit("organize_failed", Map.of(
+                "reason", "interact_failed",
+                "walk_target", posString(pos),
+                "message", e.getMessage()
+            ));
             advanceToNextTask();
         }
     }
@@ -1029,10 +1066,7 @@ public final class StashOrganizer {
     // ── Item Helpers ────────────────────────────────────────────────────
 
     private static String itemIdFromStack(ItemStack stack) {
-        if (stack == null || stack.getAmount() == 0) return "";
-        ItemData data = ItemRegistry.REGISTRY.get(stack.getId());
-        if (data != null) return data.name();
-        return "minecraft:unknown_" + stack.getId();
+        return ItemIdentifier.getItemId(stack);
     }
 
     private static boolean isShulkerBoxItem(String itemId) {
@@ -1077,6 +1111,26 @@ public final class StashOrganizer {
 
     private void info(String message) {
         if (infoCallback != null) infoCallback.info(message);
+    }
+
+    private void emit(String event, Map<String, Object> extraFields) {
+        if (eventCallback == null) return;
+
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("organizer_state", state.name());
+        payload.put("completed_tasks", completedTasks);
+        payload.put("total_tasks", totalTasks);
+        if (currentTask != null) {
+            payload.put("item_id", currentTask.itemId());
+            payload.put("source_position", posString(currentTask.source()));
+            payload.put("destination_position", posString(currentTask.destination()));
+            if (currentTask.shulkerContentFilter() != null) {
+                payload.put("shulker_content_filter", currentTask.shulkerContentFilter());
+            }
+        }
+        if (walkTarget != null) payload.put("walk_target", posString(walkTarget));
+        if (extraFields != null && !extraFields.isEmpty()) payload.putAll(extraFields);
+        eventCallback.accept(event, payload);
     }
 
     // ── Status ──────────────────────────────────────────────────────────

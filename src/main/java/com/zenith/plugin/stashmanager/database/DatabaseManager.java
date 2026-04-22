@@ -138,6 +138,26 @@ public class DatabaseManager implements AutoCloseable {
                 )
                 """);
 
+            // Retrieval kits
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS kits (
+                    name VARCHAR(128) PRIMARY KEY,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS kit_items (
+                    kit_name VARCHAR(128) NOT NULL REFERENCES kits(name) ON DELETE CASCADE,
+                    item_id VARCHAR(128) NOT NULL,
+                    quantity INTEGER NOT NULL,
+                    PRIMARY KEY (kit_name, item_id)
+                )
+                """);
+
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_kit_items_kit ON kit_items(kit_name)");
+
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_items_item_id ON container_items(item_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_position ON containers(x, y, z)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_block_type ON containers(block_type)");
@@ -656,6 +676,180 @@ public class DatabaseManager implements AutoCloseable {
             }
         }
         return result;
+    }
+
+    // ── Kits ───────────────────────────────────────────────────────────
+
+    public static final int KIT_MAX_SLOTS = 27;
+
+    public static Map<String, Integer> truncateKitItems(Map<String, Integer> items) {
+        if (items == null || items.isEmpty()) return Collections.emptyMap();
+
+        Map<String, Integer> truncated = new LinkedHashMap<>();
+        int slots = 0;
+        for (var entry : items.entrySet()) {
+            if (entry.getValue() == null || entry.getValue() <= 0) continue;
+            if (slots >= KIT_MAX_SLOTS) break;
+            truncated.put(entry.getKey(), entry.getValue());
+            slots++;
+        }
+        return truncated;
+    }
+
+    public void saveKit(String name, Map<String, Integer> items) throws SQLException {
+        if (!initialized) return;
+
+        Map<String, Integer> persistedItems = truncateKitItems(items);
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO kits (name, updated_at) VALUES (?, CURRENT_TIMESTAMP) " +
+                            "ON CONFLICT (name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP")) {
+                    ps.setString(1, name);
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement("DELETE FROM kit_items WHERE kit_name = ?")) {
+                    ps.setString(1, name);
+                    ps.executeUpdate();
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO kit_items (kit_name, item_id, quantity) VALUES (?, ?, ?)") ) {
+                    for (var item : persistedItems.entrySet()) {
+                        ps.setString(1, name);
+                        ps.setString(2, item.getKey());
+                        ps.setInt(3, item.getValue());
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
+    public int countKitSlots(String name) throws SQLException {
+        if (!initialized) return 0;
+
+        try (Connection conn = dataSource.getConnection()) {
+            return countKitSlots(conn, name);
+        }
+    }
+
+    private int countKitSlots(Connection conn, String name) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT COUNT(*) FROM kit_items WHERE kit_name = ?")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getInt(1) : 0;
+            }
+        }
+    }
+
+    public Map<String, Integer> loadKit(String name) throws SQLException {
+        if (!initialized) return Collections.emptyMap();
+
+        Map<String, Integer> items = new LinkedHashMap<>();
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "SELECT item_id, quantity FROM kit_items WHERE kit_name = ? ORDER BY item_id")) {
+            ps.setString(1, name);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    items.put(rs.getString("item_id"), rs.getInt("quantity"));
+                }
+            }
+        }
+        return items;
+    }
+
+    public List<String> listKits() throws SQLException {
+        if (!initialized) return Collections.emptyList();
+
+        List<String> kits = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT name FROM kits ORDER BY name")) {
+            while (rs.next()) {
+                kits.add(rs.getString("name"));
+            }
+        }
+        return kits;
+    }
+
+    public boolean deleteKit(String name) throws SQLException {
+        if (!initialized) return false;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM kits WHERE name = ?")) {
+            ps.setString(1, name);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    public boolean setKitItem(String kitName, String itemId, int quantity) throws SQLException {
+        if (!initialized) return false;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO kits (name, updated_at) VALUES (?, CURRENT_TIMESTAMP) " +
+                            "ON CONFLICT (name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP")) {
+                    ps.setString(1, kitName);
+                    ps.executeUpdate();
+                }
+
+                boolean exists;
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "SELECT 1 FROM kit_items WHERE kit_name = ? AND item_id = ?")) {
+                    ps.setString(1, kitName);
+                    ps.setString(2, itemId);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        exists = rs.next();
+                    }
+                }
+
+                if (!exists && countKitSlots(conn, kitName) >= KIT_MAX_SLOTS) {
+                    conn.rollback();
+                    return false;
+                }
+
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO kit_items (kit_name, item_id, quantity) VALUES (?, ?, ?) " +
+                            "ON CONFLICT (kit_name, item_id) DO UPDATE SET quantity = EXCLUDED.quantity")) {
+                    ps.setString(1, kitName);
+                    ps.setString(2, itemId);
+                    ps.setInt(3, quantity);
+                    ps.executeUpdate();
+                }
+
+                conn.commit();
+                return true;
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
+    public boolean removeKitItem(String kitName, String itemId) throws SQLException {
+        if (!initialized) return false;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                 "DELETE FROM kit_items WHERE kit_name = ? AND item_id = ?")) {
+            ps.setString(1, kitName);
+            ps.setString(2, itemId);
+            return ps.executeUpdate() > 0;
+        }
     }
 
     // ── Scan History ────────────────────────────────────────────────────
