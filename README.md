@@ -7,6 +7,7 @@ We have a Discord server! Feel free to join for up-to-date information:
 https://discord.gg/8ACQJUtQse
 
 ![Build](https://github.com/PoseidonsCave/Stash-Management/actions/workflows/build.yml/badge.svg)
+![Downloads](https://img.shields.io/github/downloads/PoseidonsCave/Stash-Management/total)
 
 ## Features
 
