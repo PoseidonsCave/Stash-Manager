@@ -44,6 +44,15 @@ Requires Java 21+.
 
 The output JAR will be in `build/libs/`.
 
+### CI Notes
+
+GitHub Actions now enforces a few supply-chain integrity checks during CI and release builds.
+
+- Pull requests run dependency review and may fail if a new dependency introduces a moderate-or-higher known vulnerability.
+- Build jobs validate the Gradle wrapper, generate SHA-256 checksums for release JARs, and create GitHub artifact provenance attestations.
+- Tag builds verify that the pushed tag matches `plugin_version` in `gradle.properties`. For example, `v2.0.0` must match `plugin_version=2.0.0`.
+- Artifact attestations only work on public repositories for GitHub Free/Pro/Team plans. If you copy this workflow to a private repo, the attestation step may need to be removed or gated unless you are on a premium GitHub tier.
+
 ---
 
 ## Commands
@@ -90,6 +99,23 @@ All commands work via **Discord**, **terminal**, and **in-game chat**.
 | `stash region load <name>` | Load a saved region into pos1/pos2 |
 | `stash region list` | List all saved regions |
 | `stash region delete <name>` | Delete a saved region |
+
+### Kits & Retrieval
+
+These commands use the indexed container data stored in PostgreSQL, so the database must be enabled and connected first.
+
+| Command | Description |
+|---------|-------------|
+| `stash kit list` | List all saved kits |
+| `stash kit show <name>` | Show the saved contents of a kit |
+| `stash kit snapshot <name>` | Save the player's current main inventory as a kit |
+| `stash kit add <name> <item_id> <count>` | Add or replace one item entry in a kit |
+| `stash kit remove <name> <item_id>` | Remove one item entry from a kit |
+| `stash kit delete <name>` | Delete a saved kit |
+| `stash get <item_id> [count]` | Start retrieving one item from indexed containers |
+| `stash get kit <name>` | Start retrieving every item listed in a saved kit |
+| `stash get status` | Show retrieval progress and remaining items |
+| `stash get stop` | Stop the active retrieval task |
 
 ### Organizer
 

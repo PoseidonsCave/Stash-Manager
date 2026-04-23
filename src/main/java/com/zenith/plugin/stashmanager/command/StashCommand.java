@@ -724,7 +724,7 @@ public class StashCommand extends Command {
 
                                 String description = truncated
                                     ? "Saved **" + name + "** from current inventory. Truncated to the first **"
-                                        + DatabaseManager.KIT_MAX_SLOTS + "** unique items to match one shulker load."
+                                        + DatabaseManager.KIT_MAX_SLOTS + "** unique item entries."
                                     : "Saved **" + name + "** from current inventory.";
                                 embed.title("Kit Snapshot Saved")
                                     .description(description)

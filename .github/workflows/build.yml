@@ -10,19 +10,39 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build:
+  dependency-review:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
+        with:
+          fail-on-severity: moderate
+
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           persist-credentials: false
 
       - name: Setup JDK
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
         with:
           java-version: '25'
           distribution: 'temurin'
@@ -30,29 +50,51 @@ jobs:
       - name: Elevate wrapper permissions
         run: chmod +x ./gradlew
 
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@0723195856401067f7a2779048b490ace7a47d7c # v5
+
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v5
+        uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
 
       - name: Build Plugin
-        run: ./gradlew build
+        run: ./gradlew --no-daemon build
+
+      - name: Resolve build artifact path
+        run: |
+          jar_path="$(echo build/libs/*.jar)"
+          echo "JAR_PATH=${jar_path}" >> "$GITHUB_ENV"
+
+      - name: Generate SHA-256 checksum
+        run: sha256sum "${{ env.JAR_PATH }}" > "${{ env.JAR_PATH }}.sha256"
+
+      - name: Attest build provenance
+        uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
+        with:
+          subject-path: ${{ env.JAR_PATH }}
 
       - name: Upload Plugin Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: stash-manager
-          path: build/libs/*.jar
+          path: |
+            build/libs/*.jar
+            build/libs/*.jar.sha256
           if-no-files-found: error
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
 
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: stash-manager
           path: build/libs
@@ -60,11 +102,27 @@ jobs:
       - name: Get plugin version
         run: echo "PLUGIN_VERSION=$(grep '^plugin_version=' gradle.properties | cut -d'=' -f2)" >> $GITHUB_ENV
 
-      - name: Create GitHub Release
-        uses: ncipollo/release-action@v1
-        with:
-          tag: v${{ env.PLUGIN_VERSION }}
-          artifacts: build/libs/*.jar
-          generateReleaseNotes: true
-          allowUpdates: true
-          replacesArtifacts: true
+      - name: Verify tag matches plugin version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          expected_tag="v${PLUGIN_VERSION}"
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match plugin_version ${expected_tag}" >&2
+            exit 1
+          fi
+
+      - name: Verify release checksum
+        working-directory: build/libs
+        run: sha256sum -c ./*.jar.sha256
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${PLUGIN_VERSION}"
+          assets=(build/libs/*.jar build/libs/*.jar.sha256)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --generate-notes
+          fi
