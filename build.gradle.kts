@@ -36,3 +36,10 @@ dependencies {
     implementation("com.zaxxer:HikariCP:6.2.1")
     implementation("com.google.code.gson:gson:2.11.0")
 }
+
+tasks.withType<Jar>().configureEach {
+    from("LICENSE") {
+        into("META-INF")
+        rename("LICENSE", "${pluginId}-LICENSE.txt")
+    }
+}
