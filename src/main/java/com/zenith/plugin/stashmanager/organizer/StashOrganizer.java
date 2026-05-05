@@ -452,6 +452,9 @@ public final class StashOrganizer {
             info("Stash is already organized! (" + regionContainers.size() + " containers in "
                     + columns.size() + " columns, " + itemLocations.size() + " item types)");
             state = State.DONE;
+            emit("organize_completed", Map.of(
+                "overflow_types", 0
+            ));
             return;
         }
 
