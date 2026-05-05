@@ -53,6 +53,7 @@ public class StashManagerModule extends Module {
     private final ContainerIndex index;
     private final RegionScanner regionScanner;
     private ContainerReader containerReader;
+    private final StashManagerNotifications notifications = new StashManagerNotifications();
 
     // Organizer integration
     private StashOrganizer organizer;
@@ -68,6 +69,7 @@ public class StashManagerModule extends Module {
     // Starting position — used for return-to-start
     private double startX, startY, startZ;
     private boolean hasStartPosition = false;
+    private boolean finishScanAfterReturn = false;
 
     // Baritone config — saved/restored around scans
     private boolean savedAllowBreak = true;
@@ -94,7 +96,7 @@ public class StashManagerModule extends Module {
         this.regionScanner = new RegionScanner();
         this.containerReader = new ContainerReader(index);
         this.retriever = new StashRetriever();
-        this.retriever.setEventCallback(this::fireWebhookEvent);
+        this.retriever.setEventCallback(this::handleAutomationEvent);
     }
 
     public void setDatabase(DatabaseManager database) {
@@ -104,7 +106,7 @@ public class StashManagerModule extends Module {
     public void setOrganizer(StashOrganizer organizer) {
         this.organizer = organizer;
         if (this.organizer != null) {
-            this.organizer.setEventCallback(this::fireWebhookEvent);
+            this.organizer.setEventCallback(this::handleAutomationEvent);
         }
     }
 
@@ -324,6 +326,7 @@ public class StashManagerModule extends Module {
 
         // Restore Baritone config
         restoreBaritoneBreaking();
+        finishScanAfterReturn = false;
 
         state = ScanState.IDLE;
         info("Scan aborted. Found={}, Indexed={}, Failed={}",
@@ -345,6 +348,7 @@ public class StashManagerModule extends Module {
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
         BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
         state = ScanState.RETURNING;
+        finishScanAfterReturn = false;
         fireWebhookEvent("return_to_start_started",
             "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
         return true;
@@ -474,6 +478,7 @@ public class StashManagerModule extends Module {
             state = ScanState.DONE;
             info("No containers found in region");
             fireWebhookEvent("scan_empty");
+            notifications.sendScanFinished(0, 0, 0);
             return;
         }
 
@@ -621,6 +626,7 @@ public class StashManagerModule extends Module {
                 inGameAlert("<green>Returned to starting position.</green>");
                 fireWebhookEvent("returned_to_start",
                     "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+                notifications.sendReturnToStartCompleted(startX, startY, startZ);
             } else {
                 warn("Could not reach starting position (dist={}). Finishing scan.",
                     String.format("%.1f", dist));
@@ -629,9 +635,14 @@ public class StashManagerModule extends Module {
                 fireWebhookEvent("return_to_start_failed",
                     "\"distance\":" + jsonString(String.format("%.1f", dist))
                         + ",\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+                notifications.sendReturnToStartFailed(startX, startY, startZ, dist);
             }
 
-            finishScan();
+            if (finishScanAfterReturn) {
+                finishScan();
+            } else {
+                state = ScanState.DONE;
+            }
         }
     }
 
@@ -666,6 +677,7 @@ public class StashManagerModule extends Module {
                     + ". Returning to start position...</gray>");
                 BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
                 state = ScanState.RETURNING;
+                finishScanAfterReturn = true;
                 fireWebhookEvent("return_to_start_started",
                     "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 return;
@@ -819,6 +831,7 @@ public class StashManagerModule extends Module {
 
         // Fire webhook notification
         fireWebhookEvent("scan_complete");
+        notifications.sendScanFinished(containersFound, containersIndexed, containersFailed);
 
         state = ScanState.DONE;
         info("Scan complete. Found={}, Indexed={}, Failed={}",
@@ -918,8 +931,58 @@ public class StashManagerModule extends Module {
         containersFailed = 0;
         currentScanId = -1;
         hasStartPosition = false;
+        finishScanAfterReturn = false;
         walkRetryCount = 0;
         walkingTickCount = 0;
+    }
+
+    private void handleAutomationEvent(String event, Map<String, Object> payload) {
+        fireWebhookEvent(event, payload);
+        switch (event) {
+            case "retrieve_completed" -> notifications.sendRetrievalFinished(
+                stringValue(payload, "request_name"),
+                true,
+                intValue(payload, "moved_stacks"),
+                intValue(payload, "obtained_total"),
+                intValue(payload, "remaining_total"),
+                null
+            );
+            case "retrieve_incomplete" -> notifications.sendRetrievalFinished(
+                stringValue(payload, "request_name"),
+                false,
+                intValue(payload, "moved_stacks"),
+                intValue(payload, "obtained_total"),
+                intValue(payload, "remaining_total"),
+                stringValue(payload, "reason")
+            );
+            case "organize_completed" -> notifications.sendOrganizerFinished(
+                intValue(payload, "completed_tasks"),
+                intValue(payload, "total_tasks"),
+                intValue(payload, "overflow_types")
+            );
+            default -> {
+            }
+        }
+    }
+
+    private int intValue(Map<String, Object> payload, String key) {
+        Object value = payload.get(key);
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value == null) {
+            return 0;
+        }
+        try {
+            return Integer.parseInt(String.valueOf(value));
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
+    }
+
+    private @Nullable String stringValue(Map<String, Object> payload, String key) {
+        Object value = payload.get(key);
+        return value == null ? null : String.valueOf(value);
     }
 
     private @Nullable String getAutomationUnavailableReason() {
