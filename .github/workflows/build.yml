@@ -61,11 +61,14 @@ jobs:
 
       - name: Resolve build artifact path
         run: |
-          jar_path="$(echo build/libs/*.jar)"
+          jar_path="$(find build/libs -maxdepth 1 -type f -name '*.jar' | head -n 1)"
+          jar_name="$(basename "${jar_path}")"
           echo "JAR_PATH=${jar_path}" >> "$GITHUB_ENV"
+          echo "JAR_NAME=${jar_name}" >> "$GITHUB_ENV"
 
       - name: Generate SHA-256 checksum
-        run: sha256sum "${{ env.JAR_PATH }}" > "${{ env.JAR_PATH }}.sha256"
+        working-directory: build/libs
+        run: sha256sum "${{ env.JAR_NAME }}" > "${{ env.JAR_NAME }}.sha256"
 
       - name: Attest build provenance
         uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
@@ -77,8 +80,8 @@ jobs:
         with:
           name: stash-manager
           path: |
-            build/libs/*.jar
-            build/libs/*.jar.sha256
+            ${{ env.JAR_PATH }}
+            build/libs/${{ env.JAR_NAME }}.sha256
           if-no-files-found: error
 
   release:
