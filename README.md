@@ -31,7 +31,7 @@ https://discord.gg/8ACQJUtQse
 ## Installation
 
 1. Build the plugin JAR (or download from [Releases](https://github.com/PoseidonsCave/Stash-Management/releases))
-2. Place `stash-manager-1.1.0.jar` in ZenithProxy's `plugins/` directory
+2. Place `stash-manager-2.0.1.jar` in ZenithProxy's `plugins/` directory
 3. Restart ZenithProxy
 
 ## Building
@@ -50,7 +50,7 @@ GitHub Actions now enforces a few supply-chain integrity checks during CI and re
 
 - Pull requests run dependency review and may fail if a new dependency introduces a moderate-or-higher known vulnerability.
 - Build jobs validate the Gradle wrapper, generate SHA-256 checksums for release JARs, and create GitHub artifact provenance attestations.
-- Tag builds verify that the pushed tag matches `plugin_version` in `gradle.properties`. For example, `v2.0.0` must match `plugin_version=2.0.0`.
+- Tag builds verify that the pushed tag matches `plugin_version` in `gradle.properties`. For example, `v2.0.1` must match `plugin_version=2.0.1`.
 - Artifact attestations only work on public repositories for GitHub Free/Pro/Team plans. If you copy this workflow to a private repo, the attestation step may need to be removed or gated unless you are on a premium GitHub tier.
 
 ---
