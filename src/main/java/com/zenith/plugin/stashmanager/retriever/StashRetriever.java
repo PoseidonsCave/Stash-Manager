@@ -26,8 +26,10 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.function.BiConsumer;
 
@@ -99,6 +101,19 @@ public final class StashRetriever {
 
     private int lastTeleportQueueSize = -1;
     private int ticksSinceTeleportQueueChange;
+
+    // Split-take state (partial stack retrieval)
+    private boolean splitInProgress;
+    private int splitSrcSlot = -1;
+    private int splitPutbacksLeft;
+    private int splitNeeded;
+    private boolean splitCursorReady;
+    private String splitItemId;
+
+    // Owned shulker tracking (shulkers taken for their contents)
+    private final Set<Integer> ownedShulkerSlots = new HashSet<>();
+    private String pendingOwnedShulkerFingerprint;
+    private final Set<Integer> pendingOwnedShulkerCandidateSlots = new HashSet<>();
 
     private BiConsumer<String, Map<String, Object>> eventCallback;
 
@@ -294,6 +309,14 @@ public final class StashRetriever {
             return;
         }
 
+        // Drive any in-progress partial-take split first
+        if (splitInProgress) {
+            if (tickSplitTake()) {
+                actionCooldown = CLICK_COOLDOWN_TICKS;
+                return;
+            }
+        }
+
         if (containerSlots == null || openContainerId < 0) {
             consecutiveFailures++;
             advanceToNextTarget("container_sync_failed");
@@ -311,12 +334,24 @@ public final class StashRetriever {
                 Integer needed = remaining.get(itemId);
 
                 if ((wantedDirectly || wantedForContents) && hasInventoryRoom()) {
+                    
+                    // If wanted directly and stack exceeds need, do partial-take split
+                    if (wantedDirectly && !wantedForContents && needed != null && needed > 0 && stack.getAmount() > needed) {
+                        beginSplitTake(actionSlotIndex, itemId, stack.getAmount(), needed);
+                        actionSlotIndex++;
+                        actionCooldown = CLICK_COOLDOWN_TICKS;
+                        return;
+                    }
+
                     quickMoveSlot(actionSlotIndex);
                     successfulTransfers++;
                     actionSlotIndex++;
                     actionCooldown = CLICK_COOLDOWN_TICKS;
 
                     if (wantedForContents) {
+                        // Track this shulker as owned since we're taking it for contents
+                        beginTrackingOwnedShulker(stack, chestSlots);
+                        
                         int[] revisitTarget = currentTarget == null ? null : currentTarget.clone();
                         closeCurrentContainer();
                         if (revisitTarget != null) {
@@ -688,6 +723,10 @@ public final class StashRetriever {
         lastTeleportQueueSize = -1;
         ticksSinceTeleportQueueChange = 0;
         resetUnloadState();
+        resetSplit();
+        ownedShulkerSlots.clear();
+        pendingOwnedShulkerFingerprint = null;
+        pendingOwnedShulkerCandidateSlots.clear();
     }
 
     private void resetUnloadState() {
@@ -922,4 +961,265 @@ public final class StashRetriever {
         double dz = pc.getZ() - z;
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
+
+    // ── Split-Take (Partial Stack Retrieval) ───────────────────────────
+
+    /**
+     * Drives one tick of an in-progress partial-take split. Returns true if a
+     * click was issued (caller should set its cooldown and stop). Returns
+     * false when the split is complete (state cleared, recordTaken called).
+     */
+    private boolean tickSplitTake() {
+        if (serverSession == null || openContainerId < 0) {
+            resetSplit();
+            return false;
+        }
+
+        // Step 1: pick up the source stack to cursor
+        if (!splitCursorReady) {
+            try {
+                var packet = new ServerboundContainerClickPacket(
+                    openContainerId,
+                    containerStateId,
+                    splitSrcSlot,
+                    ContainerActionType.CLICK_ITEM,
+                    org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.LEFT_CLICK,
+                    null,
+                    new Int2ObjectOpenHashMap<>()
+                );
+                serverSession.send(packet);
+                containerStateId++;
+            } catch (Exception e) {
+                resetSplit();
+                return false;
+            }
+            splitCursorReady = true;
+            return true;
+        }
+
+        // Step 2: right-click source to drop excess back, one item per tick
+        if (splitPutbacksLeft > 0) {
+            try {
+                var packet = new ServerboundContainerClickPacket(
+                    openContainerId,
+                    containerStateId,
+                    splitSrcSlot,
+                    ContainerActionType.CLICK_ITEM,
+                    org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.RIGHT_CLICK,
+                    null,
+                    new Int2ObjectOpenHashMap<>()
+                );
+                serverSession.send(packet);
+                containerStateId++;
+            } catch (Exception e) {
+                resetSplit();
+                return false;
+            }
+            splitPutbacksLeft--;
+            return true;
+        }
+
+        // Step 3: drop the kept portion into an empty player slot
+        int chestSlots = getOpenContainerSlotCount();
+        int playerStart = chestSlots;
+        int dropSlot = -1;
+        for (int s = playerStart; s < playerStart + 36; s++) {
+            if (containerSlots != null && s < containerSlots.length) {
+                ItemStack slotStack = containerSlots[s];
+                if (slotStack == null || slotStack.getAmount() == 0) {
+                    dropSlot = s;
+                    break;
+                }
+            }
+        }
+
+        if (dropSlot == -1) {
+            // No room. Put cursor back at source as fallback and bail
+            try {
+                var packet = new ServerboundContainerClickPacket(
+                    openContainerId,
+                    containerStateId,
+                    splitSrcSlot,
+                    ContainerActionType.CLICK_ITEM,
+                    org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.LEFT_CLICK,
+                    null,
+                    new Int2ObjectOpenHashMap<>()
+                );
+                serverSession.send(packet);
+                containerStateId++;
+            } catch (Exception ignored) {}
+            resetSplit();
+            return true;
+        }
+
+        try {
+            var packet = new ServerboundContainerClickPacket(
+                openContainerId,
+                containerStateId,
+                dropSlot,
+                ContainerActionType.CLICK_ITEM,
+                org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.LEFT_CLICK,
+                null,
+                new Int2ObjectOpenHashMap<>()
+            );
+            serverSession.send(packet);
+            containerStateId++;
+        } catch (Exception e) {
+            resetSplit();
+            return false;
+        }
+
+        // Record that we took the needed amount
+        recordTaken(splitItemId, splitNeeded);
+        resetSplit();
+        return true;
+    }
+
+    /** Begin a partial-take split for a slot whose stack exceeds what we need. */
+    private void beginSplitTake(int srcSlot, String itemId, int stackCount, int needed) {
+        splitInProgress = true;
+        splitSrcSlot = srcSlot;
+        splitItemId = itemId;
+        splitNeeded = Math.max(1, Math.min(needed, stackCount));
+        splitPutbacksLeft = stackCount - splitNeeded;
+        splitCursorReady = false;
+    }
+
+    private void resetSplit() {
+        splitInProgress = false;
+        splitSrcSlot = -1;
+        splitPutbacksLeft = 0;
+        splitNeeded = 0;
+        splitCursorReady = false;
+        splitItemId = null;
+    }
+
+    private void recordTaken(String itemId, int count) {
+        Integer current = remaining.get(itemId);
+        if (current != null && current > 0) {
+            remaining.put(itemId, Math.max(0, current - count));
+        }
+        consecutiveFailures = 0; // reset on successful take
+    }
+
+    // ── Owned Shulker Tracking ──────────────────────────────────────────
+
+    /**
+     * Begin tracking a shulker taken from a container for its contents.
+     * Records the shulker's fingerprint and candidate slots so we can identify
+     * which inventory slot receives it when the container is closed.
+     */
+    private void beginTrackingOwnedShulker(ItemStack stack, int chestSlots) {
+        pendingOwnedShulkerFingerprint = shulkerFingerprint(stack);
+        pendingOwnedShulkerCandidateSlots.clear();
+        
+        // Record all empty player inventory slots as candidates
+        if (containerSlots != null) {
+            for (int slot = chestSlots; slot < chestSlots + 36; slot++) {
+                if (slot < containerSlots.length) {
+                    ItemStack invStack = containerSlots[slot];
+                    if (invStack == null || invStack.getAmount() == 0) {
+                        pendingOwnedShulkerCandidateSlots.add(playerInventorySlotFromContainerSlot(chestSlots, slot));
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolve pending owned shulker by finding which candidate slot now contains
+     * a shulker matching the fingerprint.
+     */
+    private void resolvePendingOwnedShulker() {
+        if (pendingOwnedShulkerFingerprint == null || pendingOwnedShulkerCandidateSlots.isEmpty()) return;
+
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) return;
+
+        for (int slot : pendingOwnedShulkerCandidateSlots) {
+            ItemStack stack = playerContainer.getItemStack(slot);
+            if (stack != null && stack.getAmount() > 0) {
+                String itemId = ItemIdentifier.getItemId(stack);
+                if (isShulkerBoxItem(itemId)) {
+                    if (pendingOwnedShulkerFingerprint.equals(shulkerFingerprint(stack))) {
+                        ownedShulkerSlots.add(slot);
+                        pendingOwnedShulkerFingerprint = null;
+                        pendingOwnedShulkerCandidateSlots.clear();
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Swap owned shulker slot tracking when inventory slots are swapped.
+     */
+    private void swapOwnedShulkerSlots(int slotA, int slotB) {
+        boolean ownedA = ownedShulkerSlots.remove(slotA);
+        boolean ownedB = ownedShulkerSlots.remove(slotB);
+        if (ownedA) ownedShulkerSlots.add(slotB);
+        if (ownedB) ownedShulkerSlots.add(slotA);
+    }
+
+    /**
+     * Create a fingerprint of a shulker box based on its item ID and contents.
+     * Used to track the same shulker across container interactions.
+     */
+    private String shulkerFingerprint(ItemStack stack) {
+        String itemId = ItemIdentifier.getItemId(stack);
+        // Include NBT hash or contents if available
+        // Simplified for now - would need proper NBT reading
+        return itemId + "|" + stack.hashCode();
+    }
+
+    /**
+     * Convert container slot index to player inventory slot index.
+     */
+    private static int playerInventorySlotFromContainerSlot(int chestSlots, int slot) {
+        int relative = slot - chestSlots;
+        if (relative < 27) return relative + 9; // Main inventory
+        return relative - 27; // Hotbar
+    }
+
+    /**
+     * Find a shulker in player inventory that contains items we still need.
+     * Returns the inventory slot, or -1 if none found.
+     */
+    private int findShulkerWithNeededItems() {
+        resolvePendingOwnedShulker();
+        
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) return -1;
+
+        var it = ownedShulkerSlots.iterator();
+        while (it.hasNext()) {
+            int slot = it.next();
+            ItemStack stack = playerContainer.getItemStack(slot);
+            if (stack == null || stack.getAmount() == 0) {
+                it.remove();
+                continue;
+            }
+            
+            String itemId = ItemIdentifier.getItemId(stack);
+            if (!isShulkerBoxItem(itemId)) {
+                it.remove();
+                continue;
+            }
+
+            // Check if shulker contains needed items
+            // Would need NBT reading to check contents
+            // Simplified: assume it has needed items if it's tracked
+            for (String neededItem : remaining.keySet()) {
+                if (remaining.get(neededItem) > 0) {
+                    return slot;
+                }
+            }
+        }
+        
+        return -1;
+    }
 }
+

@@ -42,12 +42,28 @@ public final class StashOrganizer {
         DEPOSITING,
         CLOSING_DEST,
         // Shulker packing cycle
+        SHULKER_SELECTING,
+        SHULKER_PLACING,
+        SHULKER_WAIT_PLACE,
+        SHULKER_OPENING,
+        SHULKER_FILLING,
+        SHULKER_CLOSING,
+        SHULKER_BREAKING,
+        SHULKER_PICKUP,
         SHULKER_FETCH_WALK,
         SHULKER_FETCH_OPEN,
         SHULKER_FETCH_TAKE,
         SHULKER_STORE_WALK,
         SHULKER_STORE_OPEN,
         SHULKER_STORE_DEPOSIT,
+        // Crafting shulker boxes
+        CRAFT_MATERIAL_WALK,
+        CRAFT_MATERIAL_OPEN,
+        CRAFT_MATERIAL_TAKE,
+        CRAFT_WALKING,
+        CRAFT_OPENING,
+        CRAFT_PLACING,
+        CRAFT_TAKING,
         // Overflow
         OVERFLOW_WALKING,
         OVERFLOW_OPENING,
@@ -97,6 +113,11 @@ public final class StashOrganizer {
 
     private static final int OPEN_TIMEOUT_TICKS = 60;
     private static final int HOTBAR_SIZE = 9;
+    private static final int CLICK_COOLDOWN_TICKS = 3;
+    private static final int PLACE_DELAY_TICKS = 4;
+    private static final int PICKUP_DELAY_TICKS = 20;
+    private static final int BREAK_TIMEOUT_TICKS = 100;
+    private static final int CONDENSE_MIN_ITEMS = 1;
 
     // ── Runtime State ───────────────────────────────────────────────────
 
@@ -109,6 +130,24 @@ public final class StashOrganizer {
     private int completedTasks;
 
     private boolean consolidationMode = false;
+
+    // ── Shulker Packing State ───────────────────────────────────────────
+
+    private String packItemId;
+    private int[] packDestination;
+    private int[] shulkerPlacePos;
+    private float savedYaw, savedPitch;
+    private int shulkerTicks;
+    private int shulkerPlaceRetries;
+
+    // ── Crafting State ──────────────────────────────────────────────────
+
+    private int[] craftingTablePos;
+    private int shulkersToCraft;
+    private int craftTicks;
+    private final Deque<int[]> materialSources = new ArrayDeque<>();
+    private int shellsNeeded;
+    private int chestsNeeded;
 
     // ── Container Interaction State ─────────────────────────────────────
 
@@ -232,12 +271,27 @@ public final class StashOrganizer {
             case CLOSING_SOURCE      -> tickClosingSource();
             case DEPOSITING          -> tickDepositing();
             case CLOSING_DEST        -> tickClosingDest();
+            case SHULKER_SELECTING   -> tickShulkerSelecting();
+            case SHULKER_PLACING     -> tickShulkerPlacing();
+            case SHULKER_WAIT_PLACE  -> tickShulkerWaitPlace();
+            case SHULKER_OPENING     -> tickShulkerOpening();
+            case SHULKER_FILLING     -> tickShulkerFilling();
+            case SHULKER_CLOSING     -> tickShulkerClosing();
+            case SHULKER_BREAKING    -> tickShulkerBreaking();
+            case SHULKER_PICKUP      -> tickShulkerPickup();
             case SHULKER_FETCH_WALK  -> tickWalking();
             case SHULKER_FETCH_OPEN  -> tickShulkerFetchOpen();
             case SHULKER_FETCH_TAKE  -> tickShulkerFetchTake();
             case SHULKER_STORE_WALK  -> tickWalking();
             case SHULKER_STORE_OPEN  -> tickShulkerStoreOpen();
             case SHULKER_STORE_DEPOSIT -> tickShulkerStoreDeposit();
+            case CRAFT_MATERIAL_WALK -> tickWalking();
+            case CRAFT_MATERIAL_OPEN -> tickCraftMaterialOpen();
+            case CRAFT_MATERIAL_TAKE -> tickCraftMaterialTake();
+            case CRAFT_WALKING       -> tickWalking();
+            case CRAFT_OPENING       -> tickCraftOpening();
+            case CRAFT_PLACING       -> tickCraftPlacing();
+            case CRAFT_TAKING        -> tickCraftTaking();
             case OVERFLOW_WALKING    -> tickWalking();
             case OVERFLOW_OPENING    -> tickOverflowOpening();
             case OVERFLOW_DEPOSITING -> tickOverflowDepositing();
@@ -680,6 +734,18 @@ public final class StashOrganizer {
                         continue;
                     }
 
+                    // Check if chest has room before depositing
+                    if (!hasChestRoom()) {
+                        // Chest full — try cascading to next chest in column
+                        closeCurrentContainer();
+                        if (cascadeToNextInColumn()) {
+                            return;
+                        }
+                        // No more chests in column — start shulker packing
+                        startShulkerPacking(currentTask.itemId(), currentTask.destination());
+                        return;
+                    }
+
                     // Map player slot → container window slot
                     int containerSlotIndex;
                     if (playerSlot < 9) {
@@ -847,6 +913,320 @@ public final class StashOrganizer {
         } else {
             advanceToNextTask();
         }
+    }
+
+    // ── SHULKER PACKING CYCLE ───────────────────────────────────────────
+
+    private void startShulkerPacking(String itemId, int[] destination) {
+        this.packItemId = itemId;
+        this.packDestination = destination;
+        info("Starting shulker packing for: " + itemId);
+        state = State.SHULKER_SELECTING;
+        shulkerTicks = 0;
+    }
+
+    private void tickShulkerSelecting() {
+        shulkerTicks++;
+        
+        // Find empty shulker in inventory
+        int shulkerSlot = findEmptyShulkerInInventory();
+        if (shulkerSlot < 0) {
+            // Need to fetch from region or craft
+            if (hasEmptyShulkerInRegion()) {
+                startFetchShulker();
+                return;
+            }
+            if (canCraftShulkers()) {
+                startCrafting();
+                return;
+            }
+            info("No empty shulkers available - overflow");
+            startOverflow();
+            return;
+        }
+
+        // Find placement spot
+        shulkerPlacePos = findShulkerPlaceSpot();
+        if (shulkerPlacePos == null) {
+            info("No suitable spot to place shulker");
+            startOverflow();
+            return;
+        }
+
+        // Save player rotation
+        var player = CACHE.getPlayerCache();
+        savedYaw = player.getYaw();
+        savedPitch = player.getPitch();
+
+        state = State.SHULKER_PLACING;
+        shulkerTicks = 0;
+        shulkerPlaceRetries = 0;
+    }
+
+    private void tickShulkerPlacing() {
+        shulkerTicks++;
+
+        // Note: Physical shulker placement is not supported in proxy context
+        // In a full client, this would place the shulker in the world
+        // For now, skip to overflow
+        info("Shulker packing requires physical block placement (not supported in proxy)");
+        startOverflow();
+    }
+
+    private void tickShulkerWaitPlace() {
+        shulkerTicks++;
+        
+        // Check if shulker placed successfully
+        if (isShulkerAtPosition(shulkerPlacePos)) {
+            state = State.SHULKER_OPENING;
+            shulkerTicks = 0;
+            openWaitTicks = 0;
+            containerDataReceived = false;
+            return;
+        }
+
+        if (shulkerTicks > PLACE_DELAY_TICKS * 2) {
+            shulkerPlaceRetries++;
+            if (shulkerPlaceRetries > 3) {
+                info("Shulker placement verification timeout");
+                startOverflow();
+            } else {
+                state = State.SHULKER_PLACING;
+                shulkerTicks = 0;
+            }
+        }
+    }
+
+    private void tickShulkerOpening() {
+        openWaitTicks++;
+
+        // Note: Physical shulker opening requires block interaction
+        // Not supported in proxy context - skip to overflow
+        info("Shulker packing requires container interaction (not supported in proxy)");
+        startOverflow();
+    }
+
+    private void tickShulkerFilling() {
+        if (actionCooldown > 0) { actionCooldown--; return; }
+
+        if (containerSlots == null || openContainerId < 0) {
+            startOverflow();
+            return;
+        }
+
+        int chestSlots = getOpenContainerSlotCount(); // Should be 27 for shulker
+
+        // Deposit packItemId from player inventory into shulker
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) {
+            closeCurrentContainer();
+            state = State.SHULKER_CLOSING;
+            shulkerTicks = 0;
+            return;
+        }
+
+        // Check if shulker is full
+        boolean shulkerFull = true;
+        for (int i = 0; i < chestSlots; i++) {
+            if (containerSlots[i] == null || containerSlots[i].getAmount() == 0) {
+                shulkerFull = false;
+                break;
+            }
+        }
+
+        if (shulkerFull) {
+            closeCurrentContainer();
+            state = State.SHULKER_CLOSING;
+            shulkerTicks = 0;
+            return;
+        }
+
+        while (actionSlotIndex < 36) {
+            ItemStack stack = playerContainer.getItemStack(actionSlotIndex);
+            if (stack != null && stack.getAmount() > 0) {
+                String itemId = itemIdFromStack(stack);
+                if (itemId.equals(packItemId)) {
+                    int containerSlotIndex;
+                    if (actionSlotIndex < 9) {
+                        containerSlotIndex = chestSlots + 27 + actionSlotIndex;
+                    } else {
+                        containerSlotIndex = chestSlots + actionSlotIndex - 9;
+                    }
+
+                    quickMoveSlot(containerSlotIndex);
+                    actionCooldown = config.organizerClickCooldownTicks;
+                    return;
+                }
+            }
+            actionSlotIndex++;
+        }
+
+        // No more items to pack
+        closeCurrentContainer();
+        state = State.SHULKER_CLOSING;
+        shulkerTicks = 0;
+    }
+
+    private void tickShulkerClosing() {
+        shulkerTicks++;
+
+        if (shulkerTicks < 3) return; // Wait after closing
+
+        // Select best tool for breaking
+        // (In Zenith context, we may not have tool selection; skip for now)
+
+        state = State.SHULKER_BREAKING;
+        shulkerTicks = 0;
+    }
+
+    private void tickShulkerBreaking() {
+        shulkerTicks++;
+
+        // Note: Physical block breaking not supported in proxy context
+        info("Shulker packing requires block breaking (not supported in proxy)");
+        startOverflow();
+    }
+
+    private void tickShulkerPickup() {
+        shulkerTicks++;
+
+        if (shulkerTicks >= PICKUP_DELAY_TICKS) {
+            // Check if we have filled shulker in inventory
+            if (hasFilledShulkerInInventory()) {
+                // Store it in destination
+                walkTarget = packDestination;
+                state = State.SHULKER_STORE_WALK;
+                openWaitTicks = 0;
+                containerDataReceived = false;
+            } else {
+                info("Shulker pickup failed");
+                startOverflow();
+            }
+        }
+    }
+
+    // ── CRAFTING SHULKER BOXES ──────────────────────────────────────────
+
+    private void startCrafting() {
+        craftingTablePos = findCraftingTable();
+        if (craftingTablePos == null) {
+            info("No crafting table found in region");
+            startOverflow();
+            return;
+        }
+
+        // Count materials
+        int shellsInRegion = countItemInRegion("minecraft:shulker_shell");
+        int chestsInRegion = countItemInRegion("minecraft:chest");
+        int shellsInInv = countItemInInventory("minecraft:shulker_shell");
+        int chestsInInv = countItemInInventory("minecraft:chest");
+        int totalShells = shellsInRegion + shellsInInv;
+        int totalChests = chestsInRegion + chestsInInv;
+        shulkersToCraft = Math.min(totalShells / 2, totalChests);
+
+        if (shulkersToCraft <= 0) {
+            startOverflow();
+            return;
+        }
+
+        info("Crafting " + shulkersToCraft + " shulker boxes");
+
+        // Check if materials in inventory
+        if (hasShulkerMaterialsInInventory()) {
+            walkTarget = craftingTablePos;
+            state = State.CRAFT_WALKING;
+            openWaitTicks = 0;
+            return;
+        }
+
+        // Need to collect materials
+        shellsNeeded = shulkersToCraft * 2 - shellsInInv;
+        chestsNeeded = shulkersToCraft - chestsInInv;
+
+        materialSources.clear();
+        for (ContainerEntry container : index.getAll()) {
+            if (isInRegion(container.x(), container.y(), container.z())) {
+                if (container.items().containsKey("minecraft:shulker_shell")
+                        || container.items().containsKey("minecraft:chest")) {
+                    materialSources.add(new int[]{container.x(), container.y(), container.z()});
+                }
+            }
+        }
+
+        if (materialSources.isEmpty()) {
+            startOverflow();
+            return;
+        }
+
+        info("Collecting crafting materials");
+        walkTarget = materialSources.poll();
+        state = State.CRAFT_MATERIAL_WALK;
+        openWaitTicks = 0;
+        containerDataReceived = false;
+    }
+
+    private void tickCraftMaterialOpen() {
+        // Note: Crafting requires container interaction not fully supported yet
+        info("Crafting shulker boxes not fully implemented in proxy context");
+        advanceCraftMaterial();
+    }
+
+    private void tickCraftMaterialTake() {
+        // Note: Crafting requires container interaction not fully supported yet
+        info("Crafting shulker boxes not fully implemented in proxy context");
+        advanceCraftMaterial();
+    }
+
+    private void advanceCraftMaterial() {
+        if (!materialSources.isEmpty()) {
+            walkTarget = materialSources.poll();
+            state = State.CRAFT_MATERIAL_WALK;
+            openWaitTicks = 0;
+            containerDataReceived = false;
+            return;
+        }
+
+        // Check if we have enough for at least one
+        if (hasShulkerMaterialsInInventory()) {
+            int shellsHave = countItemInInventory("minecraft:shulker_shell");
+            int chestsHave = countItemInInventory("minecraft:chest");
+            shulkersToCraft = Math.min(shellsHave / 2, chestsHave);
+            walkTarget = craftingTablePos;
+            state = State.CRAFT_WALKING;
+            openWaitTicks = 0;
+            containerDataReceived = false;
+        } else {
+            startOverflow();
+        }
+    }
+
+    private void tickCraftOpening() {
+        // Note: Crafting requires container interaction not fully supported yet
+        info("Crafting shulker boxes not fully implemented in proxy context");
+        startOverflow();
+    }
+
+    private void tickCraftPlacing() {
+        if (actionCooldown > 0) { actionCooldown--; return; }
+
+        if (containerSlots == null || openContainerId < 0) {
+            startOverflow();
+            return;
+        }
+
+        // Place materials in crafting grid (slots 1, 5, 9 for shell, chest, shell)
+        // This is complex and requires specific slot manipulation
+        // For now, skip the detailed implementation and move to overflow
+        info("Crafting table interaction not fully implemented yet");
+        closeCurrentContainer();
+        startOverflow();
+    }
+
+    private void tickCraftTaking() {
+        // Note: Crafting requires container interaction not fully supported yet
+        info("Crafting shulker boxes not fully implemented in proxy context");
+        startOverflow();
     }
 
     // ── OVERFLOW ────────────────────────────────────────────────────────
@@ -1066,6 +1446,38 @@ public final class StashOrganizer {
         return false;
     }
 
+    private boolean hasChestRoom() {
+        if (containerSlots == null || openContainerId < 0) return false;
+        int chestSlots = getOpenContainerSlotCount();
+        for (int i = 0; i < chestSlots; i++) {
+            ItemStack stack = containerSlots[i];
+            if (stack == null || stack.getAmount() == 0) return true;
+        }
+        return false;
+    }
+
+    /**
+     * When a destination chest is full, try the next chest down in the same column.
+     * Returns true if a cascade target was found (will walk there).
+     */
+    private boolean cascadeToNextInColumn() {
+        if (currentTask == null) return false;
+        Column col = columnAssignment.get(currentTask.itemId());
+        if (col == null) return false;
+
+        depositColumnIndex++;
+        if (depositColumnIndex < col.chests().size()) {
+            int[] next = col.chests().get(depositColumnIndex);
+            walkTarget = next;
+            currentRole = TargetRole.DESTINATION;
+            actionSlotIndex = 0;
+            containerDataReceived = false;
+            state = State.WALKING;
+            return true;
+        }
+        return false;
+    }
+
     // ── Item Helpers ────────────────────────────────────────────────────
 
     private static String itemIdFromStack(ItemStack stack) {
@@ -1149,10 +1561,16 @@ public final class StashOrganizer {
             case CLOSING_SOURCE    -> "Closing source...";
             case DEPOSITING        -> "Depositing items...";
             case CLOSING_DEST      -> "Closing destination...";
+            case SHULKER_SELECTING, SHULKER_PLACING, SHULKER_WAIT_PLACE, SHULKER_OPENING, 
+                 SHULKER_FILLING, SHULKER_CLOSING, SHULKER_BREAKING, SHULKER_PICKUP
+                                   -> "Packing items into shulker...";
             case SHULKER_FETCH_WALK, SHULKER_FETCH_OPEN, SHULKER_FETCH_TAKE
                                    -> "Fetching empty shulker...";
             case SHULKER_STORE_WALK, SHULKER_STORE_OPEN, SHULKER_STORE_DEPOSIT
                                    -> "Storing filled shulker...";
+            case CRAFT_MATERIAL_WALK, CRAFT_MATERIAL_OPEN, CRAFT_MATERIAL_TAKE,
+                 CRAFT_WALKING, CRAFT_OPENING, CRAFT_PLACING, CRAFT_TAKING
+                                   -> "Crafting shulker boxes...";
             case OVERFLOW_WALKING, OVERFLOW_OPENING, OVERFLOW_DEPOSITING
                                    -> "Depositing overflow items...";
             case DONE              -> "Done";
@@ -1162,4 +1580,175 @@ public final class StashOrganizer {
         }
         return detail;
     }
+
+    // ── Helper Methods ──────────────────────────────────────────────────
+
+    private int findEmptyShulkerInInventory() {
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) return -1;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = playerContainer.getItemStack(i);
+            if (stack != null && stack.getAmount() > 0) {
+                String itemId = itemIdFromStack(stack);
+                if (isShulkerBoxItem(itemId)) {
+                    // Check if empty (no NBT data or empty container)
+                    // Simplified check - may need refinement
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private boolean hasFilledShulkerInInventory() {
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) return false;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = playerContainer.getItemStack(i);
+            if (stack != null && stack.getAmount() > 0) {
+                String itemId = itemIdFromStack(stack);
+                if (isShulkerBoxItem(itemId)) {
+                    return true; // Assume filled if present after packing
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasEmptyShulkerInRegion() {
+        for (ContainerEntry container : index.getAll()) {
+            if (isInRegion(container.x(), container.y(), container.z())) {
+                for (String itemId : container.items().keySet()) {
+                    if (isShulkerBoxItem(itemId)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    private void startFetchShulker() {
+        // Find container with shulker
+        for (ContainerEntry container : index.getAll()) {
+            if (isInRegion(container.x(), container.y(), container.z())) {
+                for (String itemId : container.items().keySet()) {
+                    if (isShulkerBoxItem(itemId)) {
+                        walkTarget = new int[]{container.x(), container.y(), container.z()};
+                        state = State.SHULKER_FETCH_WALK;
+                        openWaitTicks = 0;
+                        containerDataReceived = false;
+                        return;
+                    }
+                }
+            }
+        }
+        startOverflow();
+    }
+
+    private int[] findShulkerPlaceSpot() {
+        // Find a suitable spot near player to place shulker temporarily
+        var player = CACHE.getPlayerCache();
+        int px = (int) Math.floor(player.getX());
+        int py = (int) Math.floor(player.getY());
+        int pz = (int) Math.floor(player.getZ());
+
+        // Try nearby positions
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                for (int dy = 0; dy <= 1; dy++) {
+                    int[] pos = new int[]{px + dx, py + dy, pz + dz};
+                    // Simple check: would need block state verification in real implementation
+                    if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 0) {
+                        return pos;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isShulkerAtPosition(int[] pos) {
+        // Check if shulker box exists at position
+        // In Zenith context, would need block state lookup
+        // Simplified placeholder
+        return false; // TODO: implement block state check
+    }
+
+    private void swapToHotbar(int fromSlot, int hotbarSlot) {
+        // Swap item from inventory slot to hotbar
+        // Would use window click packets
+        // Simplified placeholder
+    }
+
+    private boolean canCraftShulkers() {
+        // Check if we have crafting table and materials available in region
+        if (findCraftingTable() == null) return false;
+
+        int shells = countItemInRegion("minecraft:shulker_shell") + countItemInInventory("minecraft:shulker_shell");
+        int chests = countItemInRegion("minecraft:chest") + countItemInInventory("minecraft:chest");
+
+        return shells >= 2 && chests >= 1;
+    }
+
+    private int[] findCraftingTable() {
+        // Find crafting table in region
+        for (ContainerEntry container : index.getAll()) {
+            if (isInRegion(container.x(), container.y(), container.z())) {
+                // Check if position is a crafting table
+                // Simplified: would need block type check
+                // For now, return null to skip crafting
+            }
+        }
+        return null;
+    }
+
+    private int countItemInRegion(String itemId) {
+        int count = 0;
+        for (ContainerEntry container : index.getAll()) {
+            if (isInRegion(container.x(), container.y(), container.z())) {
+                Integer qty = container.items().get(itemId);
+                if (qty != null) count += qty;
+            }
+        }
+        return count;
+    }
+
+    private int countItemInInventory(String itemId) {
+        int count = 0;
+        var invCache = CACHE.getPlayerCache().getInventoryCache();
+        var playerContainer = invCache.getPlayerInventory();
+        if (playerContainer == null) return 0;
+
+        for (int i = 0; i < 36; i++) {
+            ItemStack stack = playerContainer.getItemStack(i);
+            if (stack != null && stack.getAmount() > 0) {
+                if (itemIdFromStack(stack).equals(itemId)) {
+                    count += stack.getAmount();
+                }
+            }
+        }
+        return count;
+    }
+
+    private boolean hasShulkerMaterialsInInventory() {
+        int shells = countItemInInventory("minecraft:shulker_shell");
+        int chests = countItemInInventory("minecraft:chest");
+        return shells >= 2 && chests >= 1;
+    }
+
+    private boolean isInRegion(int x, int y, int z) {
+        int minX = Math.min(config.pos1[0], config.pos2[0]);
+        int maxX = Math.max(config.pos1[0], config.pos2[0]);
+        int minY = Math.min(config.pos1[1], config.pos2[1]);
+        int maxY = Math.max(config.pos1[1], config.pos2[1]);
+        int minZ = Math.min(config.pos1[2], config.pos2[2]);
+        int maxZ = Math.max(config.pos1[2], config.pos2[2]);
+        return x >= minX && x <= maxX && y >= minY && y <= maxY && z >= minZ && z <= maxZ;
+    }
 }
+
