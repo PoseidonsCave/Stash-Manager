@@ -493,7 +493,7 @@ public final class StashOrganizer {
             for (ShulkerLoc sl : entry.getValue()) {
                 if (!columnChestKeys.contains(posKey(sl.pos()[0], sl.pos()[1], sl.pos()[2]))) {
                     taskQueue.add(new MoveTask(sl.pos(), col.top(),
-                            "minecraft:" + sl.shulkerType(), contentType));
+                            "minecraft:" + sl.shulkerType() + "_shulker_box", contentType));
                     shulkerMoves++;
                 }
             }
@@ -695,11 +695,8 @@ public final class StashOrganizer {
         actionCooldown++;
         if (actionCooldown >= 3) {
             actionCooldown = 0;
-            if (consolidationMode) {
-                advanceConsolidation();
-            } else {
-                transitionToDestination();
-            }
+            // Always transition to destination to deposit items
+            transitionToDestination();
         }
     }
 
@@ -1340,14 +1337,19 @@ public final class StashOrganizer {
     }
 
     private void advanceToNextTask() {
+        // If in consolidation mode, advance within consolidation queue
+        if (consolidationMode) {
+            advanceConsolidation();
+            return;
+        }
+
         if (taskQueue.isEmpty()) {
-            if (!consolidationMode && !consolidationQueue.isEmpty()) {
+            if (!consolidationQueue.isEmpty()) {
                 consolidationMode = true;
                 info("Starting condensing — packing loose items into shulker boxes...");
                 advanceConsolidation();
                 return;
             }
-            consolidationMode = false;
             finishOrganization();
             return;
         }
