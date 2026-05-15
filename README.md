@@ -5,6 +5,7 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 ![Build](https://github.com/PoseidonsCave/Stash-Manager/actions/workflows/build.yml/badge.svg)
 ![Downloads](https://img.shields.io/github/downloads/PoseidonsCave/Stash-Manager/total)
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/6v5greuSp)
 ## Features
 
 - **Region-based container scanning** — tick-driven state machine walks to, opens, and reads every container in a defined area
