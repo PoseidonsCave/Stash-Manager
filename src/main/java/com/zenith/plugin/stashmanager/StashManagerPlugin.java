@@ -5,8 +5,10 @@ import com.zenith.plugin.api.PluginAPI;
 import com.zenith.plugin.api.ZenithProxyPlugin;
 import com.zenith.plugin.stashmanager.api.ApiServer;
 import com.zenith.plugin.stashmanager.command.StashCommand;
+import com.zenith.plugin.stashmanager.command.StashDeliverCommand;
 import com.zenith.plugin.stashmanager.command.StashSearchCommand;
 import com.zenith.plugin.stashmanager.command.StashSupplyCommand;
+import com.zenith.plugin.stashmanager.command.StashTunnelCommand;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
@@ -23,6 +25,7 @@ import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 )
 public class StashManagerPlugin implements ZenithProxyPlugin {
 
+    private static StashManagerConfig sharedConfig;
     private static ContainerIndex sharedIndex;
     private static StashManagerModule sharedModule;
     private static DatabaseManager sharedDatabase;
@@ -33,7 +36,8 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
     @Override
     public void onLoad(PluginAPI pluginAPI) {
         sharedLogger = pluginAPI.getLogger();
-        var config = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, StashManagerConfig.class);
+        sharedConfig = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, StashManagerConfig.class);
+        var config = sharedConfig;
         sharedUpdateService = new PluginUpdateService(config, sharedLogger);
 
         // Database
@@ -73,7 +77,13 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
         pluginAPI.registerCommand(new StashCommand(config, sharedModule, sharedIndex, sharedDatabase, sharedApiServer, sharedUpdateService));
         pluginAPI.registerCommand(new StashSearchCommand(sharedIndex, sharedDatabase));
         pluginAPI.registerCommand(new StashSupplyCommand(config));
+        pluginAPI.registerCommand(new StashTunnelCommand());
+        pluginAPI.registerCommand(new StashDeliverCommand());
         sharedUpdateService.scheduleStartupCheck();
+    }
+
+    public static StashManagerConfig getConfig() {
+        return sharedConfig;
     }
 
     public static ContainerIndex getIndex() {
