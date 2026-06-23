@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
+import com.zenith.plugin.stashmanager.travel.tunnel.storage.TunnelRepository;
 
 import java.sql.*;
 import java.util.*;
@@ -162,7 +163,15 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_position ON containers(x, y, z)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_block_type ON containers(block_type)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_scan_ts ON containers(scan_timestamp)");
+
+            // Tunnel travel system tables
+            TunnelRepository.createSchema(stmt);
         }
+    }
+
+    /** Expose a pooled connection to other repository classes in this package. */
+    public Connection getConnection() throws SQLException {
+        return dataSource.getConnection();
     }
 
     private void migrateSchema() throws SQLException {

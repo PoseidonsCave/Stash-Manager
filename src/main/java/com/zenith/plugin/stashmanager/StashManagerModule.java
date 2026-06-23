@@ -17,6 +17,7 @@ import com.zenith.plugin.stashmanager.retriever.StashRetriever;
 import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner.ContainerLocation;
+import com.zenith.plugin.stashmanager.travel.tunnel.network.sync.SyncWorker;
 import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
@@ -90,6 +91,9 @@ public class StashManagerModule extends Module {
     private DatabaseManager database;
     private long currentScanId = -1;
 
+    // Tunnel network sync
+    private final SyncWorker tunnelNetworkSyncWorker;
+
     public StashManagerModule(StashManagerConfig config, ContainerIndex index) {
         this.config = config;
         this.index = index;
@@ -97,10 +101,12 @@ public class StashManagerModule extends Module {
         this.containerReader = new ContainerReader(index);
         this.retriever = new StashRetriever();
         this.retriever.setEventCallback(this::handleAutomationEvent);
+        this.tunnelNetworkSyncWorker = new SyncWorker(config);
     }
 
     public void setDatabase(DatabaseManager database) {
         this.database = database;
+        this.tunnelNetworkSyncWorker.setDatabase(database);
     }
 
     public void setOrganizer(StashOrganizer organizer) {
@@ -150,6 +156,12 @@ public class StashManagerModule extends Module {
                     if (retriever.isActive()) {
                         retriever.onContainerData(session, packet);
                     }
+                    // Forward to delivery sub-systems if active
+                    var tm = com.zenith.plugin.stashmanager.travel.TravelManager.get();
+                    var gatherOp = tm.getActiveGatherOp();
+                    if (gatherOp != null) gatherOp.onContainerData(session, packet);
+                    var chestDep = tm.getActiveChestDeposit();
+                    if (chestDep != null) chestDep.onContainerData(session, packet);
                     return packet;
                 })
                 .build())
@@ -173,6 +185,7 @@ public class StashManagerModule extends Module {
         if (retriever.isActive()) {
             retriever.stop();
         }
+        tunnelNetworkSyncWorker.stop();
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             info("StashManager module disabled — aborting scan");
             abortScan();
@@ -432,6 +445,10 @@ public class StashManagerModule extends Module {
     }
 
     private void onTick(ClientBotTick event) {
+        // Tick TravelManager independently (it manages its own state)
+        com.zenith.plugin.stashmanager.travel.TravelManager.get().tick();
+        tunnelNetworkSyncWorker.tick();
+
         // Delegate tick to organizer when active
         if (organizer != null && organizer.isActive()) {
             organizer.tick();
