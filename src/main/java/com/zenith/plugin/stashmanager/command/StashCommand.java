@@ -17,6 +17,7 @@ import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.util.ItemResolver;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 
 import java.time.ZoneId;
@@ -1718,6 +1719,6 @@ public class StashCommand extends Command {
     }
 
     private String normalizeItemId(String input) {
-        return input.contains(":") ? input.toLowerCase() : "minecraft:" + input.toLowerCase();
+        return ItemResolver.resolve(input.toLowerCase());
     }
 }

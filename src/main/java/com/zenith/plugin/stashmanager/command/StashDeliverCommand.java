@@ -10,6 +10,7 @@ import com.zenith.command.api.CommandUsage;
 import com.zenith.plugin.stashmanager.travel.TravelManager;
 import com.zenith.plugin.stashmanager.travel.TravelMission;
 import com.zenith.plugin.stashmanager.travel.TravelPhase;
+import com.zenith.plugin.stashmanager.util.ItemResolver;
 
 import java.util.ArrayList;
 
@@ -46,10 +47,8 @@ public class StashDeliverCommand extends Command {
             } else {
                 itemId = token;
             }
-            // Normalise: add "minecraft:" prefix if no namespace present
-            if (!itemId.contains(":")) {
-                itemId = "minecraft:" + itemId;
-            }
+            // Resolve item term → full ID (supports human-friendly aliases)
+            itemId = ItemResolver.resolve(itemId);
             ids.add(itemId);
             qtys.add(qty);
         }
