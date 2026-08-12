@@ -131,6 +131,8 @@ public final class StashOrganizer {
     private int completedTasks;
 
     private boolean consolidationMode = false;
+    private boolean savedAllowBreak = true;
+    private boolean baritoneBreakingGuardActive = false;
 
     // Shulker Packing State
     private String packItemId;
@@ -213,6 +215,7 @@ public final class StashOrganizer {
         }
 
         BARITONE.stop();
+        saveAndDisableBaritoneBreaking();
         taskQueue.clear();
         consolidationQueue.clear();
         overflowItems.clear();
@@ -237,6 +240,7 @@ public final class StashOrganizer {
     public void stop() {
         BARITONE.stop();
         closeCurrentContainer();
+        restoreBaritoneBreaking();
         state = State.IDLE;
         taskQueue.clear();
         consolidationQueue.clear();
@@ -260,6 +264,8 @@ public final class StashOrganizer {
     // Tick
     public void tick() {
         if (state == State.IDLE || state == State.DONE) return;
+
+        setBaritoneBreakingAllowed(state == State.SHULKER_BREAKING);
 
         switch (state) {
             case PLANNING            -> tickPlanning();
@@ -305,6 +311,7 @@ public final class StashOrganizer {
             info("No containers in region. Index has " + index.size()
                     + " containers total. Check that pos1/pos2 cover the scanned area.");
             emit("organize_failed", Map.of("reason", "no_containers_in_region"));
+            restoreBaritoneBreaking();
             state = State.DONE;
             return;
         }
@@ -502,6 +509,7 @@ public final class StashOrganizer {
         if (taskQueue.isEmpty() && consolidationQueue.isEmpty()) {
             info("Stash is already organized! (" + regionContainers.size() + " containers in "
                     + columns.size() + " columns, " + itemLocations.size() + " item types)");
+            restoreBaritoneBreaking();
             state = State.DONE;
             emit("organize_completed", Map.of(
                 "overflow_types", 0
@@ -610,6 +618,7 @@ public final class StashOrganizer {
     }
 
     private void pathToWalkTarget() {
+        setBaritoneBreakingAllowed(false);
         BARITONE.pathTo(new GoalGetToBlock(new BlockPos(walkTarget[0], walkTarget[1], walkTarget[2])));
     }
 
@@ -1440,6 +1449,7 @@ public final class StashOrganizer {
 
     private void finishOrganization() {
         BARITONE.stop();
+        restoreBaritoneBreaking();
         state = State.DONE;
         emit("organize_completed", Map.of(
             "overflow_types", overflowItems.size()
@@ -1481,6 +1491,27 @@ public final class StashOrganizer {
         } catch (Exception ignored) {}
         containerDataReceived = false;
         openContainerId = -1;
+    }
+
+    private void saveAndDisableBaritoneBreaking() {
+        if (baritoneBreakingGuardActive) return;
+        savedAllowBreak = CONFIG.client.extra.pathfinder.allowBreak;
+        baritoneBreakingGuardActive = true;
+        setBaritoneBreakingAllowed(false);
+        info("Baritone block breaking disabled for organizer navigation.");
+    }
+
+    private void setBaritoneBreakingAllowed(boolean allowed) {
+        if (baritoneBreakingGuardActive) {
+            CONFIG.client.extra.pathfinder.allowBreak = allowed;
+        }
+    }
+
+    private void restoreBaritoneBreaking() {
+        if (!baritoneBreakingGuardActive) return;
+        CONFIG.client.extra.pathfinder.allowBreak = savedAllowBreak;
+        baritoneBreakingGuardActive = false;
+        info("Baritone block breaking restored to " + savedAllowBreak + ".");
     }
 
     private int getOpenContainerSlotCount() {
