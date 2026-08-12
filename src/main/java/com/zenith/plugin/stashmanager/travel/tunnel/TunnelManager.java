@@ -1,7 +1,6 @@
 package com.zenith.plugin.stashmanager.travel.tunnel;
 
 import com.zenith.plugin.stashmanager.travel.bridge.TravelBaritoneBridge;
-import com.zenith.plugin.stashmanager.travel.delivery.DimensionHelper;
 import com.zenith.plugin.stashmanager.travel.tunnel.builder.TunnelBuildPhase;
 import com.zenith.plugin.stashmanager.travel.tunnel.builder.TunnelBuilder;
 import com.zenith.plugin.stashmanager.travel.tunnel.core.Tunnel;
@@ -15,8 +14,6 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 
-import static com.zenith.Globals.CACHE;
-
 // Coordinates tunnel route lookup, scanning, building, persistence, and traversal.
 public final class TunnelManager {
 
@@ -28,7 +25,7 @@ public final class TunnelManager {
     /** Minimum confidence required to reuse a stored tunnel. */
     private static final double MIN_CONFIDENCE = 0.5;
 
-    private enum State { IDLE, SCANNING, ROUTING, BUILDING, TRAVERSING, DONE, FAILED }
+    private enum State { IDLE, SCANNING, ROUTING, BUILDING, DONE, FAILED }
 
     // ── Dependencies ──────────────────────────────────────────────────────────
 
@@ -44,9 +41,6 @@ public final class TunnelManager {
     private int         surfaceY;
     private Tunnel      activeTunnel = null;
     private String      failReason   = null;
-
-    /** Ticks spent in BUILDING or TRAVERSING. For progress display. */
-    private int stateTicks = 0;
 
     /** Y to resurface to at the destination. Defaults to ~112 (typical nether surface). */
     private static final int DEFAULT_SURFACE_Y = 112;
@@ -78,7 +72,6 @@ public final class TunnelManager {
         this.surfaceY = surfaceY;
         this.activeTunnel = null;
         this.failReason   = null;
-        this.stateTicks   = 0;
 
         LOGGER.info("TunnelManager: route requested to [{},{}]", destX, destZ);
         transition(State.SCANNING);
@@ -86,20 +79,17 @@ public final class TunnelManager {
 
     // Call every game tick while a route is pending or a build is active.
     public void tick() {
-        stateTicks++;
         switch (state) {
             case SCANNING    -> tickScanning();
             case ROUTING     -> tickRouting();
             case BUILDING    -> tickBuilding();
-            case TRAVERSING  -> tickTraversing();
-            default          -> { /* IDLE / DONE / FAILED — nothing to do */ }
+            default          -> { /* IDLE / DONE / FAILED - nothing to do */ }
         }
     }
 
     public boolean isIdle()        { return state == State.IDLE;       }
     public boolean isReady()       { return state == State.DONE;       }
     public boolean isBuilding()    { return state == State.BUILDING;   }
-    public boolean isTraversing()  { return state == State.TRAVERSING; }
     public boolean isBuildFailed() { return state == State.FAILED;     }
 
     /** The tunnel selected or built for the current request. Null until ready. */
@@ -117,20 +107,6 @@ public final class TunnelManager {
     /** Current builder phase (IDLE when not building). */
     public TunnelBuildPhase getBuildPhase() {
         return builder.getPhase();
-    }
-
-    /**
-     * Notify TunnelManager that the active tunnel was successfully traversed.
-     * Updates statistics in the repository.
-     */
-    public void notifyTraversalComplete() {
-        if (activeTunnel == null) return;
-        activeTunnel.recordUse();
-        if (activeTunnel.id > 0) {
-            repository.recordUse(activeTunnel.id);
-        }
-        LOGGER.info("Traversal complete for tunnel id={}", activeTunnel.id);
-        transition(State.IDLE);
     }
 
     /**
@@ -211,12 +187,6 @@ public final class TunnelManager {
         }
     }
 
-    private void tickTraversing() {
-        // Traversal is driven externally by TravelManager (Baritone is active).
-        // TunnelManager only tracks progress — TravelManager calls
-        // notifyTraversalComplete() when Baritone arrives at the destination.
-    }
-
     // ── Route selection ───────────────────────────────────────────────────────
 
     // Ranks candidates by confidence × (1 / detour); checks forward and reversed direction.
@@ -267,7 +237,6 @@ public final class TunnelManager {
     private void transition(State next) {
         LOGGER.info("TunnelManager: {} → {}", state, next);
         state = next;
-        stateTicks = 0;
     }
 
     private void fail(String reason) {

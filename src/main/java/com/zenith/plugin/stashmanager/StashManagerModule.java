@@ -29,8 +29,10 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
@@ -156,12 +158,6 @@ public class StashManagerModule extends Module {
                     if (retriever.isActive()) {
                         retriever.onContainerData(session, packet);
                     }
-                    // Forward to delivery sub-systems if active
-                    var tm = com.zenith.plugin.stashmanager.travel.TravelManager.get();
-                    var gatherOp = tm.getActiveGatherOp();
-                    if (gatherOp != null) gatherOp.onContainerData(session, packet);
-                    var chestDep = tm.getActiveChestDeposit();
-                    if (chestDep != null) chestDep.onContainerData(session, packet);
                     return packet;
                 })
                 .build())
@@ -250,6 +246,32 @@ public class StashManagerModule extends Module {
         return getAutomationUnavailableReason();
     }
 
+    public @Nullable String getOrganizerBlocker() {
+        if (organizer == null) {
+            return config.organizerEnabled ? "organizer not available" : "organizer is disabled in config";
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            return "scan is active (state=" + state + ")";
+        }
+        if (organizer.isActive()) {
+            return "organizer is already active";
+        }
+        if (retriever.isActive()) {
+            return "retriever is active";
+        }
+        return getAutomationUnavailableReason();
+    }
+
+    public boolean startOrganizer() {
+        String blocker = getOrganizerBlocker();
+        if (blocker != null) {
+            warn("Cannot start organizer: {}", blocker);
+            fireWebhookEvent("organize_start_blocked", Map.of("reason", blocker));
+            return false;
+        }
+        return organizer.start();
+    }
+
     public boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems) {
         String blocker = getRetrieveBlocker();
         if (blocker != null) {
@@ -273,7 +295,43 @@ public class StashManagerModule extends Module {
             return false;
         }
 
-        return retriever.startKit(requestName, kitItems, entries);
+        return retriever.startKit(
+            requestName,
+            kitItems,
+            entries,
+            config.pos1,
+            config.pos2,
+            getReservedContainerKeys()
+        );
+    }
+
+    private Set<Long> getReservedContainerKeys() {
+        Set<Long> reserved = new HashSet<>();
+        for (int[] pos : config.supplyChests) {
+            if (pos != null && pos.length >= 3) reserved.add(posKey(pos[0], pos[1], pos[2]));
+        }
+
+        if (database != null && database.isInitialized()) {
+            try {
+                var storage = database.loadStorageChests();
+                for (int[] pos : storage.chests()) {
+                    if (pos != null && pos.length >= 3) reserved.add(posKey(pos[0], pos[1], pos[2]));
+                }
+                int[] overflow = storage.overflowChest();
+                if (overflow != null && overflow.length >= 3) {
+                    reserved.add(posKey(overflow[0], overflow[1], overflow[2]));
+                }
+            } catch (Exception e) {
+                warn("Failed to load reserved storage chests: {}", e.getMessage());
+            }
+        }
+        return reserved;
+    }
+
+    private static long posKey(int x, int y, int z) {
+        return ((long) x & 0x3FFFFFFL) << 38
+            | ((long) y & 0xFFFL) << 26
+            | ((long) z & 0x3FFFFFFL);
     }
 
     public void stopRetrieval() {
@@ -478,7 +536,7 @@ public class StashManagerModule extends Module {
 
     private void tickZoneScanning() {
         List<ContainerLocation> found = regionScanner.scanRegion(
-            config.pos1, config.pos2, config.maxContainers);
+            config.pos1, config.pos2, config.maxContainers, getReservedContainerKeys());
 
         pendingContainers.addAll(found);
         containersFound = pendingContainers.size();
@@ -489,6 +547,12 @@ public class StashManagerModule extends Module {
         var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
         if (!unscanned.isEmpty() && pendingContainers.size() < config.maxContainers) {
             info("{} chunks still unloaded — will walk to load them", unscanned.size());
+        }
+
+        if (pendingContainers.isEmpty() && !unscanned.isEmpty()
+                && pendingContainers.size() < config.maxContainers) {
+            startWalkingToUnscannedChunk(unscanned.get(0));
+            return;
         }
 
         if (pendingContainers.isEmpty()) {
@@ -672,13 +736,7 @@ public class StashManagerModule extends Module {
             // Walk toward unscanned chunks
             var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
             if (!unscanned.isEmpty() && containersFound < config.maxContainers) {
-                // Walk toward unscanned area
-                int[] target = unscanned.get(0);
-                int targetX = target[0] * 16 + 8;
-                int targetZ = target[1] * 16 + 8;
-                info("Walking toward unscanned chunk at {}, {}", targetX, targetZ);
-                BARITONE.pathTo(targetX, targetZ);
-                state = ScanState.WALKING_TO_ZONE;
+                startWalkingToUnscannedChunk(unscanned.get(0));
                 return;
             }
 
@@ -740,6 +798,28 @@ public class StashManagerModule extends Module {
                 currentContainerIndex + 1, pendingContainers.size(),
                 next.x(), next.y(), next.z(), String.format("%.1f", dist));
         }
+    }
+
+    private void startWalkingToUnscannedChunk(int[] chunk) {
+        int chunkCenterX = chunk[0] * 16 + 8;
+        int chunkCenterZ = chunk[1] * 16 + 8;
+        double playerX = CACHE.getPlayerCache().getX();
+        double playerZ = CACHE.getPlayerCache().getZ();
+        double dx = chunkCenterX - playerX;
+        double dz = chunkCenterZ - playerZ;
+        double distance = Math.sqrt(dx * dx + dz * dz);
+        int legLength = Math.max(16, config.waypointDistance);
+
+        int targetX = chunkCenterX;
+        int targetZ = chunkCenterZ;
+        if (distance > legLength) {
+            targetX = (int) Math.round(playerX + dx / distance * legLength);
+            targetZ = (int) Math.round(playerZ + dz / distance * legLength);
+        }
+
+        info("Walking toward unscanned chunk via waypoint at {}, {}", targetX, targetZ);
+        BARITONE.pathTo(targetX, targetZ);
+        state = ScanState.WALKING_TO_ZONE;
     }
 
     private ContainerLocation currentContainer() {

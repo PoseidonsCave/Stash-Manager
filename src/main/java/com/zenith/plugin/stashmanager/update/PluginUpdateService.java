@@ -1,13 +1,14 @@
 package com.zenith.plugin.stashmanager.update;
 
-import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import com.zenith.plugin.stashmanager.BuildConstants;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.StashManagerPlugin;
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
+import org.geysermc.mcprotocollib.protocol.codec.MinecraftCodec;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -21,10 +22,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.Comparator;
-import java.util.Locale;
+import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.zip.ZipEntry;
@@ -40,10 +41,11 @@ public final class PluginUpdateService {
     private final StashManagerConfig config;
     private final ComponentLogger logger;
     private final HttpClient httpClient;
-    private final Gson gson;
     private final ExecutorService executor;
     private final Path currentArtifactPath;
     private final Path pluginsDirectory;
+    private final String runtimeMcVersion;
+    private final String updateTarget;
 
     private volatile StatusSnapshot snapshot;
 
@@ -54,7 +56,6 @@ public final class PluginUpdateService {
             .followRedirects(HttpClient.Redirect.ALWAYS)
             .connectTimeout(Duration.ofSeconds(5))
             .build();
-        this.gson = new Gson();
         this.executor = Executors.newSingleThreadExecutor(r -> {
             var thread = new Thread(r, "stash-manager-updater");
             thread.setDaemon(true);
@@ -62,6 +63,17 @@ public final class PluginUpdateService {
         });
         this.currentArtifactPath = resolveCurrentArtifactPath();
         this.pluginsDirectory = resolvePluginsDirectory(this.currentArtifactPath);
+        this.runtimeMcVersion = MinecraftCodec.CODEC.getMinecraftVersion();
+        this.updateTarget = resolveUpdateTarget(runtimeMcVersion).orElse(null);
+        if (updateTarget == null) {
+            logger.warn("Automatic updates are unavailable for ZenithProxy Minecraft version {}.", runtimeMcVersion);
+        } else if (!BuildConstants.MC_VERSION.equals(updateTarget)) {
+            logger.warn(
+                "Installed plugin targets Minecraft {}, but ZenithProxy runs {}. A compatible update is required.",
+                BuildConstants.MC_VERSION,
+                updateTarget
+            );
+        }
         this.snapshot = new StatusSnapshot(
             UpdateState.NOT_CHECKED,
             BuildConstants.VERSION,
@@ -99,13 +111,24 @@ public final class PluginUpdateService {
 
         final Instant checkedAt = Instant.now();
         try {
-            final var release = fetchLatestRelease();
+            if (updateTarget == null) {
+                throw new IOException("Unsupported ZenithProxy Minecraft version: " + runtimeMcVersion + ".");
+            }
+
+            final boolean targetRepair = !BuildConstants.MC_VERSION.equals(updateTarget);
+            final var release = fetchLatestRelease(updateTarget);
+            if (targetRepair && compareVersions(BuildConstants.VERSION, release.version()) > 0) {
+                throw new IOException(
+                    "Latest compatible release " + release.version()
+                        + " is older than installed plugin " + BuildConstants.VERSION + "."
+                );
+            }
             final var baseSnapshot = snapshot
                 .withLatestVersion(release.version())
                 .withLastCheckedAt(checkedAt)
                 .withLastError(null);
 
-            if (!isNewerVersion(BuildConstants.VERSION, release.version())) {
+            if (!targetRepair && !isNewerVersion(BuildConstants.VERSION, release.version())) {
                 snapshot = baseSnapshot.withState(UpdateState.UP_TO_DATE);
                 return new UpdateResult(
                     UpdateOutcome.UP_TO_DATE,
@@ -118,16 +141,20 @@ public final class PluginUpdateService {
 
             if (!stageIfAvailable) {
                 snapshot = baseSnapshot.withState(UpdateState.UPDATE_AVAILABLE);
+                final String message = targetRepair
+                    ? "Installed plugin targets Minecraft " + BuildConstants.MC_VERSION
+                        + ", but ZenithProxy runs " + updateTarget + ". A compatible replacement is available."
+                    : "Update available: " + release.version() + " (current " + BuildConstants.VERSION + ").";
                 return new UpdateResult(
                     UpdateOutcome.UPDATE_AVAILABLE,
-                    "Update available: " + release.version() + " (current " + BuildConstants.VERSION + ").",
+                    message,
                     BuildConstants.VERSION,
                     release.version(),
                     null
                 );
             }
 
-            return stageRelease(release, checkedAt, baseSnapshot);
+            return stageRelease(release, checkedAt, baseSnapshot, targetRepair);
         } catch (Exception e) {
             snapshot = snapshot
                 .withState(UpdateState.FAILED)
@@ -145,7 +172,8 @@ public final class PluginUpdateService {
 
     private UpdateResult stageRelease(final ReleaseInfo release,
                                       final Instant checkedAt,
-                                      final StatusSnapshot baseSnapshot) throws IOException, InterruptedException {
+                                      final StatusSnapshot baseSnapshot,
+                                      final boolean targetRepair) throws IOException, InterruptedException {
         Files.createDirectories(pluginsDirectory);
 
         final Path targetPath = resolveStageTarget(release);
@@ -153,7 +181,8 @@ public final class PluginUpdateService {
             final Optional<JarMetadata> existingMetadata = readJarMetadata(targetPath);
             if (existingMetadata.isPresent()
                 && BuildConstants.PLUGIN_ID.equals(existingMetadata.get().pluginId())
-                && release.version().equals(normalizeVersion(existingMetadata.get().version()))) {
+                && release.version().equals(normalizeVersion(existingMetadata.get().version()))
+                && existingMetadata.get().mcVersions().contains(updateTarget)) {
                 snapshot = baseSnapshot
                     .withState(UpdateState.STAGED)
                     .withStagedVersion(release.version())
@@ -183,7 +212,11 @@ public final class PluginUpdateService {
             if (!release.version().equals(downloadedVersion)) {
                 throw new IOException("Downloaded jar version " + downloadedVersion + " does not match release " + release.version());
             }
-            if (!isNewerVersion(BuildConstants.VERSION, downloadedVersion)) {
+            if (!metadata.mcVersions().contains(updateTarget)) {
+                throw new IOException("Downloaded jar does not support Minecraft " + updateTarget + ".");
+            }
+            final int versionComparison = compareVersions(BuildConstants.VERSION, downloadedVersion);
+            if (versionComparison > 0 || (!targetRepair && versionComparison == 0)) {
                 throw new IOException("Downloaded jar is not newer than the current version.");
             }
 
@@ -206,7 +239,7 @@ public final class PluginUpdateService {
         }
     }
 
-    private ReleaseInfo fetchLatestRelease() throws IOException, InterruptedException {
+    private ReleaseInfo fetchLatestRelease(final String target) throws IOException, InterruptedException {
         final HttpRequest request = HttpRequest.newBuilder(LATEST_RELEASE_URI)
             .header("User-Agent", "StashManager/" + BuildConstants.VERSION)
             .header("Accept", "application/vnd.github+json")
@@ -220,9 +253,9 @@ public final class PluginUpdateService {
             throw new IOException("GitHub API returned HTTP " + response.statusCode());
         }
 
-        final JsonObject json = gson.fromJson(response.body(), JsonObject.class);
-        if (json == null) throw new IOException("Empty response from GitHub.");
-
+        final JsonElement releaseJson = JsonParser.parseString(response.body());
+        if (!releaseJson.isJsonObject()) throw new IOException("Invalid response from GitHub.");
+        final JsonObject json = releaseJson.getAsJsonObject();
         final String tagName = getRequiredString(json, "tag_name");
         final String latestVersion = normalizeVersion(tagName);
         final JsonArray assets = json.getAsJsonArray("assets");
@@ -230,33 +263,24 @@ public final class PluginUpdateService {
             throw new IOException("Latest release has no downloadable jar assets.");
         }
 
-        final AssetInfo asset = chooseJarAsset(assets)
-            .orElseThrow(() -> new IOException("Latest release has no matching .jar asset."));
+        final AssetInfo asset = chooseJarAsset(assets, target)
+            .orElseThrow(() -> new IOException(
+                "Latest release has no jar for Minecraft " + target + "."
+            ));
         return new ReleaseInfo(tagName, latestVersion, asset.name(), URI.create(asset.downloadUrl()));
     }
 
-    private Optional<AssetInfo> chooseJarAsset(final JsonArray assets) {
-        return assets.asList().stream()
-            .map(JsonElement::getAsJsonObject)
-            .map(asset -> new AssetInfo(
+    private Optional<AssetInfo> chooseJarAsset(final JsonArray assets, final String target) {
+        final String targetSuffix = "+" + target + ".jar";
+        for (JsonElement element : assets) {
+            final JsonObject asset = element.getAsJsonObject();
+            final AssetInfo assetInfo = new AssetInfo(
                 getRequiredString(asset, "name"),
                 getRequiredString(asset, "browser_download_url")
-            ))
-            .filter(asset -> asset.name().toLowerCase(Locale.ROOT).endsWith(".jar"))
-            .max(Comparator.comparingInt(this::assetScore));
-    }
-
-    private int assetScore(final AssetInfo asset) {
-        final String name = asset.name().toLowerCase(Locale.ROOT);
-        int score = 0;
-        if (name.endsWith(".jar")) score += 100;
-        if (name.contains(BuildConstants.PLUGIN_ID.toLowerCase(Locale.ROOT))) score += 50;
-        if (currentArtifactPath.getFileName() != null) {
-            final String currentName = currentArtifactPath.getFileName().toString().toLowerCase(Locale.ROOT);
-            if (name.equals(currentName)) score += 10;
-            if (name.startsWith(stripExtension(currentName))) score += 5;
+            );
+            if (assetInfo.name().endsWith(targetSuffix)) return Optional.of(assetInfo);
         }
-        return score;
+        return Optional.empty();
     }
 
     private void downloadReleaseAsset(final ReleaseInfo release, final Path tempFile)
@@ -286,11 +310,19 @@ public final class PluginUpdateService {
             );
             if (entry == null) return Optional.empty();
             try (InputStream in = zipFile.getInputStream(entry)) {
-                final JsonObject json = gson.fromJson(new String(in.readAllBytes()), JsonObject.class);
-                if (json == null) return Optional.empty();
+                final JsonElement metadataJson = JsonParser.parseString(new String(in.readAllBytes()));
+                if (!metadataJson.isJsonObject()) return Optional.empty();
+                final JsonObject json = metadataJson.getAsJsonObject();
                 final String pluginId = getRequiredString(json, "id");
                 final String version = readVersionField(json.get("version"));
-                return Optional.of(new JarMetadata(pluginId, version));
+                final Set<String> mcVersions = new HashSet<>();
+                final JsonArray mcVersionArray = json.getAsJsonArray("mcVersions");
+                if (mcVersionArray != null) {
+                    for (JsonElement mcVersion : mcVersionArray) {
+                        mcVersions.add(mcVersion.getAsString());
+                    }
+                }
+                return Optional.of(new JarMetadata(pluginId, version, Set.copyOf(mcVersions)));
             }
         }
     }
@@ -399,15 +431,18 @@ public final class PluginUpdateService {
         return normalized;
     }
 
+    private static Optional<String> resolveUpdateTarget(final String runtimeVersion) {
+        return switch (runtimeVersion) {
+            case "1.21.4", "1.21.8", "1.21.11", "26.1.2" -> Optional.of(runtimeVersion);
+            case "26.2" -> Optional.of("26.2.0");
+            default -> Optional.empty();
+        };
+    }
+
     private static String addSuffixBeforeExtension(final String fileName, final String suffix) {
         final int dot = fileName.lastIndexOf('.');
         if (dot <= 0) return fileName + suffix;
         return fileName.substring(0, dot) + suffix + fileName.substring(dot);
-    }
-
-    private static String stripExtension(final String fileName) {
-        final int dot = fileName.lastIndexOf('.');
-        return dot <= 0 ? fileName : fileName.substring(0, dot);
     }
 
     public enum UpdateState {
@@ -474,5 +509,5 @@ public final class PluginUpdateService {
 
     private record AssetInfo(String name, String downloadUrl) { }
 
-    private record JarMetadata(String pluginId, String version) { }
+    private record JarMetadata(String pluginId, String version, Set<String> mcVersions) { }
 }

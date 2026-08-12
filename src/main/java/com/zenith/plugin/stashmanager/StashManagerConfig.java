@@ -21,6 +21,7 @@ public class StashManagerConfig {
     public boolean organizerEnabled = true;
     public int organizerClickCooldownTicks = 3;
     public int organizerOpenTimeoutTicks = 60;
+    public int organizerWalkTimeoutTicks = 400;
     // Minimum loose item count to justify packing into a shulker box
     public int condenseMinItems = 1;
 
@@ -65,12 +66,4 @@ public class StashManagerConfig {
     public int tunnelNetworkSyncIntervalMinutes = 30;
     public boolean tunnelNetworkUploadDiscoveries = true;
     public boolean tunnelNetworkDownloadRoutes = true;
-
-    // ── Stealth / operation timing ────────────────────────────────────────────
-    /** Minimum random delay (ticks) added between successive inventory-click operations. */
-    public int stealthClickDelayMinTicks = 1;
-    /** Maximum random delay (ticks) added between successive inventory-click operations. */
-    public int stealthClickDelayMaxTicks = 4;
-    /** Extra pause (ticks) between opening successive containers in a deposit run. 0 = no gap. */
-    public int stealthChestGapTicks = 5;
 }

@@ -6,6 +6,8 @@ group = properties["maven_group"] as String
 version = properties["plugin_version"] as String
 val mc = properties["mc"] as String
 val pluginId = properties["plugin_id"] as String
+val pluginName = properties["plugin_name"] as String
+val javaRelease = if (mc in setOf("1.21.11", "26.1.2", "26.2.0")) 25 else 21
 
 java {
     toolchain { languageVersion = JavaLanguageVersion.of(25) }
@@ -18,7 +20,7 @@ zenithProxyPlugin {
         "plugin_id" to pluginId,
         "maven_group" to group as String,
     )
-    javaReleaseVersion = JavaLanguageVersion.of(21)
+    javaReleaseVersion = JavaLanguageVersion.of(javaRelease)
 }
 
 repositories {
@@ -37,8 +39,15 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
 }
 
+tasks.named<Copy>("generateTemplates") {
+    from(rootProject.file("src/main/templates"))
+}
+
 tasks.withType<Jar>().configureEach {
-    from("LICENSE") {
+    if (name == "shadowJar") {
+        archiveFileName.set("${pluginName}-${project.version}+${mc}.jar")
+    }
+    from(rootProject.file("LICENSE")) {
         into("META-INF")
         rename("LICENSE", "${pluginId}-LICENSE.txt")
     }

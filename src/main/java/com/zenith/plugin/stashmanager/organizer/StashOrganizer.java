@@ -3,14 +3,23 @@ package com.zenith.plugin.stashmanager.organizer;
 import com.zenith.Proxy;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
+import com.zenith.feature.inventory.actions.SetHeldItem;
+import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
+import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
+import com.zenith.mc.item.ItemData;
+import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
+import com.zenith.plugin.stashmanager.util.BaritoneCompat;
+import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerActionType;
+import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
@@ -114,14 +123,16 @@ public final class StashOrganizer {
     private static final int OPEN_TIMEOUT_TICKS = 60;
     private static final int HOTBAR_SIZE = 9;
     private static final int CLICK_COOLDOWN_TICKS = 3;
-    private static final int PLACE_DELAY_TICKS = 4;
     private static final int PICKUP_DELAY_TICKS = 20;
     private static final int BREAK_TIMEOUT_TICKS = 100;
     private static final int CONDENSE_MIN_ITEMS = 1;
+    private static final int SHULKER_HOTBAR_SLOT = 6;
 
     // ── Runtime State ───────────────────────────────────────────────────
 
     private int[] walkTarget;
+    private long trackedWalkTargetKey = Long.MIN_VALUE;
+    private int walkingTicks;
     private int openWaitTicks;
     private int actionSlotIndex;
     private int actionCooldown;
@@ -136,6 +147,9 @@ public final class StashOrganizer {
     private String packItemId;
     private int[] packDestination;
     private int[] shulkerPlacePos;
+    private ItemData packShulkerItemData;
+    private PathingRequestFuture shulkerPlaceFuture;
+    private PathingRequestFuture shulkerBreakFuture;
     private float savedYaw, savedPitch;
     private int shulkerTicks;
     private int shulkerPlaceRetries;
@@ -221,6 +235,8 @@ public final class StashOrganizer {
         overflowItems.clear();
         currentTask = null;
         walkTarget = null;
+        trackedWalkTargetKey = Long.MIN_VALUE;
+        walkingTicks = 0;
         consolidationMode = false;
         completedTasks = 0;
         totalTasks = 0;
@@ -586,15 +602,30 @@ public final class StashOrganizer {
             return;
         }
 
-        if (!BARITONE.isActive()) {
-            double dist = distanceTo(walkTarget);
+        long targetKey = posKey(walkTarget[0], walkTarget[1], walkTarget[2]);
+        if (targetKey != trackedWalkTargetKey) {
+            trackedWalkTargetKey = targetKey;
+            walkingTicks = 0;
+        }
+        walkingTicks++;
 
-            if (dist <= 5.0) {
-                onArrived();
-                return;
-            }
+        double dist = distanceTo(walkTarget);
+        if (dist <= 5.0) {
+            BARITONE.stop();
+            onArrived();
+            return;
+        }
 
-            // Start pathfinding
+        if (walkingTicks > config.organizerWalkTimeoutTicks) {
+            info("Timeout walking to container, skipping.");
+            emit("organize_target_failed", Map.of("reason", "walk_timeout"));
+            BARITONE.stop();
+            trackedWalkTargetKey = Long.MIN_VALUE;
+            advanceToNextTask();
+            return;
+        }
+
+        if (!BARITONE.getCustomGoalProcess().isActive()) {
             pathToWalkTarget();
         }
     }
@@ -955,19 +986,46 @@ public final class StashOrganizer {
         savedYaw = player.getYaw();
         savedPitch = player.getPitch();
 
+        ItemStack shulkerStack = getPlayerInventoryStack(shulkerSlot);
+        packShulkerItemData = shulkerStack == null ? null : ItemRegistry.REGISTRY.get(shulkerStack.getId());
+        if (packShulkerItemData == null) {
+            info("Could not resolve shulker item data");
+            startOverflow();
+            return;
+        }
+        moveShulkerToHotbar(shulkerSlot);
+
         state = State.SHULKER_PLACING;
         shulkerTicks = 0;
         shulkerPlaceRetries = 0;
+        shulkerPlaceFuture = null;
     }
 
     private void tickShulkerPlacing() {
         shulkerTicks++;
 
-        // Note: Physical shulker placement is not supported in proxy context
-        // In a full client, this would place the shulker in the world
-        // For now, skip to overflow
-        info("Shulker packing requires physical block placement (not supported in proxy)");
-        startOverflow();
+        if (isShulkerAtPosition(shulkerPlacePos)) {
+            state = State.SHULKER_OPENING;
+            shulkerTicks = 0;
+            openWaitTicks = 0;
+            containerDataReceived = false;
+            shulkerPlaceFuture = null;
+            return;
+        }
+
+        if (shulkerTicks > config.organizerOpenTimeoutTicks) {
+            info("Shulker placement timed out");
+            emit("organize_failed", Map.of("reason", "shulker_place_timeout"));
+            startOverflow();
+            return;
+        }
+
+        if (shulkerPlaceFuture == null) {
+            shulkerPlaceFuture = BaritoneCompat.placeBlock(
+                shulkerPlacePos[0], shulkerPlacePos[1], shulkerPlacePos[2], packShulkerItemData);
+            state = State.SHULKER_WAIT_PLACE;
+            shulkerTicks = 0;
+        }
     }
 
     private void tickShulkerWaitPlace() {
@@ -982,12 +1040,26 @@ public final class StashOrganizer {
             return;
         }
 
-        if (shulkerTicks > PLACE_DELAY_TICKS * 2) {
+        if (shulkerPlaceFuture != null && shulkerPlaceFuture.isDone() && !shulkerPlaceFuture.getNow()) {
+            shulkerPlaceRetries++;
+            shulkerPlaceFuture = null;
+            if (shulkerPlaceRetries > 3) {
+                info("Shulker placement rejected after 3 attempts");
+                startOverflow();
+            } else {
+                state = State.SHULKER_PLACING;
+                shulkerTicks = 0;
+            }
+            return;
+        }
+
+        if (shulkerTicks > config.organizerOpenTimeoutTicks) {
             shulkerPlaceRetries++;
             if (shulkerPlaceRetries > 3) {
                 info("Shulker placement verification timeout");
                 startOverflow();
             } else {
+                shulkerPlaceFuture = null;
                 state = State.SHULKER_PLACING;
                 shulkerTicks = 0;
             }
@@ -997,10 +1069,23 @@ public final class StashOrganizer {
     private void tickShulkerOpening() {
         openWaitTicks++;
 
-        // Note: Physical shulker opening requires block interaction
-        // Not supported in proxy context - skip to overflow
-        info("Shulker packing requires container interaction (not supported in proxy)");
-        startOverflow();
+        if (containerDataReceived && openContainerId >= 0) {
+            state = State.SHULKER_FILLING;
+            actionSlotIndex = 9;
+            actionCooldown = 0;
+            return;
+        }
+
+        if (openWaitTicks > config.organizerOpenTimeoutTicks) {
+            info("Timeout opening placed shulker");
+            emit("organize_failed", Map.of("reason", "shulker_open_timeout"));
+            startOverflow();
+            return;
+        }
+
+        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+            BARITONE.rightClickBlock(shulkerPlacePos[0], shulkerPlacePos[1], shulkerPlacePos[2]);
+        }
     }
 
     private void tickShulkerFilling() {
@@ -1080,9 +1165,31 @@ public final class StashOrganizer {
     private void tickShulkerBreaking() {
         shulkerTicks++;
 
-        // Note: Physical block breaking not supported in proxy context
-        info("Shulker packing requires block breaking (not supported in proxy)");
-        startOverflow();
+        if (!isShulkerAtPosition(shulkerPlacePos)) {
+            state = State.SHULKER_PICKUP;
+            shulkerTicks = 0;
+            shulkerBreakFuture = null;
+            return;
+        }
+
+        if (shulkerTicks > BREAK_TIMEOUT_TICKS) {
+            info("Shulker breaking timed out");
+            emit("organize_failed", Map.of("reason", "shulker_break_timeout"));
+            startOverflow();
+            return;
+        }
+
+        if (shulkerBreakFuture == null) {
+            shulkerBreakFuture = BaritoneCompat.breakBlock(
+                shulkerPlacePos[0], shulkerPlacePos[1], shulkerPlacePos[2], true);
+            return;
+        }
+
+        if (shulkerBreakFuture.isDone() && !shulkerBreakFuture.getNow()) {
+            info("Shulker breaking was rejected");
+            emit("organize_failed", Map.of("reason", "shulker_break_rejected"));
+            startOverflow();
+        }
     }
 
     private void tickShulkerPickup() {
@@ -1590,13 +1697,11 @@ public final class StashOrganizer {
         var playerContainer = invCache.getPlayerInventory();
         if (playerContainer == null) return -1;
 
-        for (int i = 0; i < 36; i++) {
+        for (int i = 9; i <= 44; i++) {
             ItemStack stack = playerContainer.getItemStack(i);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
-                if (isShulkerBoxItem(itemId)) {
-                    // Check if empty (no NBT data or empty container)
-                    // Simplified check - may need refinement
+                if (isShulkerBoxItem(itemId) && ItemIdentifier.readShulkerContents(stack).isEmpty()) {
                     return i;
                 }
             }
@@ -1609,12 +1714,12 @@ public final class StashOrganizer {
         var playerContainer = invCache.getPlayerInventory();
         if (playerContainer == null) return false;
 
-        for (int i = 0; i < 36; i++) {
+        for (int i = 9; i <= 44; i++) {
             ItemStack stack = playerContainer.getItemStack(i);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
-                if (isShulkerBoxItem(itemId)) {
-                    return true; // Assume filled if present after packing
+                if (isShulkerBoxItem(itemId) && !ItemIdentifier.readShulkerContents(stack).isEmpty()) {
+                    return true;
                 }
             }
         }
@@ -1653,38 +1758,57 @@ public final class StashOrganizer {
     }
 
     private int[] findShulkerPlaceSpot() {
-        // Find a suitable spot near player to place shulker temporarily
         var player = CACHE.getPlayerCache();
         int px = (int) Math.floor(player.getX());
         int py = (int) Math.floor(player.getY());
         int pz = (int) Math.floor(player.getZ());
 
-        // Try nearby positions
-        for (int dx = -2; dx <= 2; dx++) {
-            for (int dz = -2; dz <= 2; dz++) {
-                for (int dy = 0; dy <= 1; dy++) {
-                    int[] pos = new int[]{px + dx, py + dy, pz + dz};
-                    // Simple check: would need block state verification in real implementation
-                    if (Math.abs(dx) + Math.abs(dy) + Math.abs(dz) > 0) {
-                        return pos;
-                    }
-                }
-            }
+        int[][] offsets = {
+            {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+            {1, 1}, {-1, 1}, {1, -1}, {-1, -1},
+            {2, 0}, {-2, 0}, {0, 2}, {0, -2}
+        };
+        for (int[] offset : offsets) {
+            int x = px + offset[0];
+            int y = py;
+            int z = pz + offset[1];
+            if (!World.isInWorldBounds(x, y, z)) continue;
+            var target = World.getBlock(x, y, z);
+            var above = World.getBlock(x, y + 1, z);
+            var below = World.getBlock(x, y - 1, z);
+                if (!BlockCompat.canReplace(target)
+                    || !BlockCompat.canReplace(above)
+                    || BlockCompat.isAir(below)
+                    || !BlockCompat.isSolid(x, y - 1, z)) continue;
+            return new int[]{x, y, z};
         }
         return null;
     }
 
     private boolean isShulkerAtPosition(int[] pos) {
-        // Check if shulker box exists at position
-        // In Zenith context, would need block state lookup
-        // Simplified placeholder
-        return false; // TODO: implement block state check
+        return pos != null && World.getBlock(pos[0], pos[1], pos[2]).name().contains("shulker_box");
     }
 
-    private void swapToHotbar(int fromSlot, int hotbarSlot) {
-        // Swap item from inventory slot to hotbar
-        // Would use window click packets
-        // Simplified placeholder
+    private ItemStack getPlayerInventoryStack(int slot) {
+        var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        return playerContainer == null ? null : playerContainer.getItemStack(slot);
+    }
+
+    private void moveShulkerToHotbar(int slot) {
+        try {
+            var builder = InventoryActionRequest.builder().owner(this).priority(6000);
+            if (slot >= 36 && slot <= 44) {
+                builder.actions(new SetHeldItem(slot - 36));
+            } else {
+                builder.actions(
+                    new MoveToHotbarSlot(slot, MoveToHotbarAction.SLOT_7),
+                    new SetHeldItem(SHULKER_HOTBAR_SLOT)
+                );
+            }
+            INVENTORY.submit(builder.build());
+        } catch (Exception e) {
+            info("Failed to move shulker to hotbar: " + e.getMessage());
+        }
     }
 
     private boolean canCraftShulkers() {

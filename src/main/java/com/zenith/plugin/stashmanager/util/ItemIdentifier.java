@@ -4,12 +4,14 @@ import com.zenith.mc.enchantment.EnchantmentRegistry;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
+import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponents;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.ItemEnchantments;
 
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 // Shared item-ID logic so scan, kit, organize, and retrieve all agree on tool variants.
@@ -47,10 +49,14 @@ public final class ItemIdentifier {
         if (shulkerStack == null || shulkerStack.getAmount() <= 0) return contents;
 
         try {
-            List<ItemStack> containerItems = shulkerStack.getDataComponentsOrEmpty().get(DataComponentTypes.CONTAINER);
-            if (containerItems == null) return contents;
+            DataComponents components = shulkerStack.getDataComponents();
+            if (components == null) return contents;
+            Object containerValue = components.get(DataComponentTypes.CONTAINER);
+            if (!(containerValue instanceof List<?> containerItems)) return contents;
 
-            for (ItemStack innerStack : containerItems) {
+            for (Object entry : containerItems) {
+                Object value = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
+                if (!(value instanceof ItemStack innerStack)) continue;
                 if (innerStack == null || innerStack.getId() == 0 || innerStack.getAmount() <= 0) continue;
                 contents.merge(getItemId(innerStack), innerStack.getAmount(), Integer::sum);
             }
@@ -62,7 +68,9 @@ public final class ItemIdentifier {
 
     private static String getPickaxeEnchantSuffix(ItemStack stack) {
         try {
-            ItemEnchantments itemEnchantments = stack.getDataComponentsOrEmpty().get(DataComponentTypes.ENCHANTMENTS);
+            DataComponents components = stack.getDataComponents();
+            if (components == null) return null;
+            ItemEnchantments itemEnchantments = components.get(DataComponentTypes.ENCHANTMENTS);
             if (itemEnchantments == null) return null;
 
             if (itemEnchantments.getEnchantments().containsKey(EnchantmentRegistry.SILK_TOUCH.get().id())) {

@@ -3,7 +3,7 @@ package com.zenith.plugin.stashmanager.travel.tunnel.scanner;
 import com.zenith.plugin.stashmanager.travel.tunnel.core.Tunnel;
 import com.zenith.plugin.stashmanager.travel.tunnel.core.TunnelDiscovery;
 import com.zenith.plugin.stashmanager.travel.tunnel.core.TunnelStatus;
-import com.zenith.plugin.stashmanager.travel.tunnel.core.TunnelWaypoint;
+import com.zenith.plugin.stashmanager.util.BlockCompat;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -133,9 +133,9 @@ public final class TunnelScanner {
 
             if (floor == null || feet == null || head == null) return false;
 
-            boolean floorIsSolid = floor.solidBlock() && !floor.isAir();
-            boolean feetIsAir    = feet.isAir();
-            boolean headIsAir    = head.isAir();
+            boolean floorIsSolid = BlockCompat.isSolid(x, SCAN_Y, z) && !BlockCompat.isAir(floor);
+            boolean feetIsAir    = BlockCompat.isAir(feet);
+            boolean headIsAir    = BlockCompat.isAir(head);
 
             return floorIsSolid && feetIsAir && headIsAir;
         } catch (Exception e) {

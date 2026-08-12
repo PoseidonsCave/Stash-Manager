@@ -82,57 +82,10 @@ public final class StashManagerNotifications {
         DISCORD.sendEmbedMessage(embed);
     }
 
-    // ── Delivery notifications ────────────────────────────────────────────────
-
-    public void sendDeliveryStarted(int destX, int destZ, String[] itemIds, int[] quantities) {
-        var sb = new StringBuilder();
-        for (int i = 0; i < itemIds.length; i++) {
-            if (i > 0) sb.append('\n');
-            String shortName = itemIds[i].contains(":") ? itemIds[i].split(":", 2)[1] : itemIds[i];
-            sb.append("× ").append(quantities[i]).append("  ").append(shortName);
-        }
-        var embed = Embed.builder()
-            .title("Delivery Started")
-            .description("Bot is beginning a delivery run.")
-            .addField("Destination", destX + ", " + destZ, true)
-            .addField("Items", sb.toString().isBlank() ? "(none)" : sb.toString(), false)
-            .primaryColor();
-        DISCORD.sendEmbedMessage(embed);
-    }
-
-    public void sendDeliveryComplete(int destX, int destZ, long durationMs) {
-        var embed = Embed.builder()
-            .title("Delivery Complete")
-            .description("Items have been deposited at the destination.")
-            .addField("Destination", destX + ", " + destZ, true)
-            .addField("Duration", formatDuration(durationMs), true)
-            .successColor();
-        DISCORD.sendEmbedMessage(embed);
-    }
-
-    public void sendDeliveryFailed(int destX, int destZ, String reason, long durationMs) {
-        var embed = Embed.builder()
-            .title("Delivery Failed")
-            .description("The delivery run was aborted.")
-            .addField("Destination", destX + ", " + destZ, true)
-            .addField("Reason", reason == null || reason.isBlank() ? "unknown" : reason, false)
-            .addField("Duration", formatDuration(durationMs), true)
-            .errorColor();
-        DISCORD.sendEmbedMessage(embed);
-    }
-
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private String formatPosition(double x, double y, double z) {
         return String.format("%.1f, %.1f, %.1f", x, y, z);
     }
 
-    private String formatDuration(long ms) {
-        long totalSec = ms / 1000;
-        long minutes  = totalSec / 60;
-        long seconds  = totalSec % 60;
-        return minutes > 0
-            ? String.format("%dm %ds", minutes, seconds)
-            : String.format("%ds", seconds);
-    }
 }

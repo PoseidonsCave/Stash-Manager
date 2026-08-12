@@ -135,8 +135,6 @@ public class StashTunnelCommand extends Command {
             sb.append("State: **BUILDING**\n");
             sb.append("Phase: ").append(tm.getBuildPhase()).append("\n");
             sb.append("Progress: ").append(String.format("%.1f%%", tm.getBuildProgress() * 100));
-        } else if (tm.isTraversing()) {
-            sb.append("State: **TRAVERSING**");
         } else if (tm.isBuildFailed()) {
             sb.append("State: **FAILED** — ").append(tm.getFailReason());
         } else {

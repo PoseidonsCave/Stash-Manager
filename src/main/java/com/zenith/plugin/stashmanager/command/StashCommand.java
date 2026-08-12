@@ -985,26 +985,15 @@ public class StashCommand extends Command {
             .then(literal("organize")
                 .executes(c -> {
                     var embed = c.getSource().getEmbed();
-                    var organizer = module.getOrganizer();
-
-                    if (organizer == null) {
+                    String blocker = module.getOrganizerBlocker();
+                    if (blocker != null) {
                         embed.title("Organize Failed")
-                            .description(config.organizerEnabled
-                                ? "Organizer not available."
-                                : "Organizer is disabled in config.")
+                            .description("Cannot start organizer: " + blocker + ".")
                             .errorColor();
                         return OK;
                     }
 
-                    if (module.getState() != StashManagerModule.ScanState.IDLE
-                            && module.getState() != StashManagerModule.ScanState.DONE) {
-                        embed.title("Organize Failed")
-                            .description("Cannot organize while a scan is in progress. Stop the scan first.")
-                            .errorColor();
-                        return OK;
-                    }
-
-                    if (organizer.start()) {
+                    if (module.startOrganizer()) {
                         embed.title("Organizing Stash")
                             .description("Planning item moves across containers...")
                             .successColor();
