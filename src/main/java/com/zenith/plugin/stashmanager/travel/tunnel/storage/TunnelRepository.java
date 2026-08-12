@@ -25,9 +25,8 @@ public class TunnelRepository {
         this.db = db;
     }
 
-    // ── Schema ────────────────────────────────────────────────────────────────
-
-    /** Called by DatabaseManager.createSchema() during startup. */
+    // Schema
+    // Called by DatabaseManager.createSchema() during startup.
     public static void createSchema(Statement stmt) throws SQLException {
         stmt.execute("""
             CREATE TABLE IF NOT EXISTS tunnels (
@@ -79,8 +78,7 @@ public class TunnelRepository {
             """);
     }
 
-    // ── Write ─────────────────────────────────────────────────────────────────
-
+    // Write
     // Inserts or returns existing id if same start/end/floor/dimension already exists.
     public Optional<Long> save(Tunnel tunnel) {
         if (!db.isInitialized()) return Optional.empty();
@@ -160,7 +158,7 @@ public class TunnelRepository {
         }
     }
 
-    /** Update status and confidence for an existing tunnel. */
+    // Update status and confidence for an existing tunnel.
     public void updateStatus(long tunnelId, TunnelStatus status, double confidence) {
         if (!db.isInitialized()) return;
         String sql = """
@@ -179,7 +177,7 @@ public class TunnelRepository {
         }
     }
 
-    /** Record that a tunnel was successfully used. */
+    // Record that a tunnel was successfully used.
     public void recordUse(long tunnelId) {
         if (!db.isInitialized()) return;
         String sql = """
@@ -196,8 +194,7 @@ public class TunnelRepository {
         }
     }
 
-    // ── Read ──────────────────────────────────────────────────────────────────
-
+    // Read
     // Finds tunnels whose start is within radius blocks; confidence >= minConfidence.
     public List<Tunnel> findNearStart(int x, int z, int radius,
                                       double minConfidence, String dimension) {
@@ -232,13 +229,13 @@ public class TunnelRepository {
         return queryTunnels(sql, dimension, minConfidence, x, radius, z, radius);
     }
 
-    /** Return all known tunnels ordered by database id. */
+    // Return all known tunnels ordered by database id.
     public List<Tunnel> findAll() {
         if (!db.isInitialized()) return List.of();
         return queryTunnels("SELECT * FROM tunnels ORDER BY id ASC");
     }
 
-    /** Get a specific tunnel by database id. */
+    // Get a specific tunnel by database id.
     public Optional<Tunnel> findById(long id) {
         if (!db.isInitialized()) return Optional.empty();
         String sql = "SELECT * FROM tunnels WHERE id = ?";
@@ -258,7 +255,7 @@ public class TunnelRepository {
         return Optional.empty();
     }
 
-    /** Total number of known tunnels. */
+    // Total number of known tunnels.
     public int count() {
         if (!db.isInitialized()) return 0;
         try (Connection conn = db.getConnection();
@@ -271,8 +268,7 @@ public class TunnelRepository {
         return 0;
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
+    // Helpers
     private List<Tunnel> queryTunnels(String sql, Object... params) {
         List<Tunnel> results = new ArrayList<>();
         try (Connection conn = db.getConnection();

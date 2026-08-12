@@ -16,38 +16,33 @@ public final class TunnelBuilder {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/TunnelBuilder");
 
-    /** Ticks (20 TPS) to wait before declaring a phase stuck. ~5 minutes. */
+    // Ticks (20 TPS) to wait before declaring a phase stuck. ~5 minutes.
     private static final int STUCK_TIMEOUT_TICKS = 6_000;
 
-    /** Y coordinate all horizontal tunnels run along. */
+    // Y coordinate all horizontal tunnels run along.
     public static final int TUNNEL_Y = 8;
 
-    // ── State ──────────────────────────────────────────────────────────────────
-
+    // State
     private TunnelBuildPhase phase = TunnelBuildPhase.IDLE;
     private int phaseTickCount = 0;
     private String failReason = null;
 
     private final TravelBaritoneBridge bridge;
 
-    // ── Origin / destination ─────────────────────────────────────────────────
-
+    // Origin / destination
     private int originX, originZ;
     private int destX, destZ;
     private int surfaceDestY;
 
-    // ── Result ────────────────────────────────────────────────────────────────
-
+    // Result
     private Tunnel builtTunnel = null;
 
-    // ── Construction ──────────────────────────────────────────────────────────
-
+    // Construction
     public TunnelBuilder(TravelBaritoneBridge bridge) {
         this.bridge = bridge;
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
-
+    // Public API
     // Throws if already active.
     public void start(int originX, int originZ, int destX, int destZ, int surfaceDestY) {
         if (phase != TunnelBuildPhase.IDLE) {
@@ -65,9 +60,7 @@ public final class TunnelBuilder {
         enterDescend();
     }
 
-    /**
-     * Cancel an in-progress build and release Baritone.
-     */
+    // Cancel the build and release Baritone.
     public void cancel() {
         if (phase == TunnelBuildPhase.IDLE || phase == TunnelBuildPhase.COMPLETE
                 || phase == TunnelBuildPhase.FAILED) return;
@@ -86,7 +79,7 @@ public final class TunnelBuilder {
             case DESCENDING  -> tickDescending();
             case TRAVERSING  -> tickTraversing();
             case ASCENDING   -> tickAscending();
-            default          -> { /* terminal */ }
+            default          -> { }
         }
     }
 
@@ -102,11 +95,10 @@ public final class TunnelBuilder {
     public TunnelBuildPhase getPhase() { return phase; }
     public String getFailReason() { return failReason; }
 
-    /** Returns the completed tunnel once isComplete(). Null otherwise. */
+    // Returns the completed tunnel once isComplete(). Null otherwise.
     public Tunnel getBuiltTunnel() { return builtTunnel; }
 
-    // ── Phase entry ──────────────────────────────────────────────────────────
-
+    // Phase entry
     private void enterDescend() {
         LOGGER.info("TunnelBuilder DESCENDING: pathTo({},{},{})", originX, TUNNEL_Y, originZ);
         bridge.walkToExact(new int[]{originX, TUNNEL_Y, originZ});
@@ -128,8 +120,7 @@ public final class TunnelBuilder {
         phaseTickCount = 0;
     }
 
-    // ── Phase tick handlers ───────────────────────────────────────────────────
-
+    // Phase tick handlers
     private void tickDescending() {
         if (stuckTimeout()) {
             fail("stuck during DESCENDING after " + phaseTickCount + " ticks");
@@ -163,8 +154,7 @@ public final class TunnelBuilder {
         }
     }
 
-    // ── Helpers ──────────────────────────────────────────────────────────────
-
+    // Helpers
     private boolean stuckTimeout() {
         if (phaseTickCount > STUCK_TIMEOUT_TICKS) {
             return true;
@@ -197,9 +187,8 @@ public final class TunnelBuilder {
         bridge.cancelAll();
     }
 
-    // ── Progress reporting ────────────────────────────────────────────────────
-
-    /** Approximate 0.0–1.0 progress through the whole build. */
+    // Progress reporting
+    // Approximate 0.0–1.0 progress through the whole build.
     public double progressFraction() {
         return switch (phase) {
             case IDLE       -> 0.0;

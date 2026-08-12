@@ -48,19 +48,19 @@ public class StashManagerConfig {
 
     // Bedrock-floor tunnel travel system
     public boolean tunnelsEnabled = true;
-    /** Y level at which horizontal tunnels run (above bedrock, below lava lakes). */
+    // Y level at which horizontal tunnels run (above bedrock, below lava lakes).
     public int tunnelFloorY = 8;
-    /** Automatically scan loaded chunks for pre-existing tunnels. */
+    // Automatically scan loaded chunks for pre-existing tunnels.
     public boolean tunnelScanLoadedChunks = true;
-    /** Dig a new tunnel when no existing route is found. */
+    // Dig a new tunnel when no existing route is found.
     public boolean tunnelBuildWhenNoExisting = true;
-    /** Maximum extra blocks the bot will walk to reach an existing tunnel entry. */
+    // Maximum extra blocks the bot will walk to reach an existing tunnel entry.
     public int tunnelMaxEntryDetour = 500;
 
     // Tunnel network API (generic — targets any compatible REST backend)
     public boolean tunnelNetworkEnabled = false;
     public String tunnelNetworkEndpointUrl = "";
-    /** Auth method: "none", "bearer_token", "api_key", "hmac". */
+    // Auth method: "none", "bearer_token", "api_key", "hmac".
     public String tunnelNetworkAuthMethod = "bearer_token";
     public String tunnelNetworkAuthCredential = "";
     public int tunnelNetworkSyncIntervalMinutes = 30;

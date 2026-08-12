@@ -11,60 +11,47 @@ import java.util.List;
 // Waypoints describe turns; empty list means straight tunnel.
 public final class Tunnel {
 
-    // ── Identity ─────────────────────────────────────────────────────────────
-
-    /** Database row id. -1 for unsaved instances. */
+    // Identity
+    // Database row id. -1 for unsaved instances.
     public long id = -1;
 
-    /** The nether dimension key (always "minecraft:the_nether" for now). */
+    // The nether dimension key (always "minecraft:the_nether" for now).
     public String dimension = "minecraft:the_nether";
 
-    // ── Geometry ─────────────────────────────────────────────────────────────
-
+    // Geometry
     public int startX;
     public int startZ;
     public int endX;
     public int endZ;
 
-    /** Y level of the tunnel floor (typically 8 — above bedrock, below lava). */
+    // Y level of the tunnel floor (typically 8 — above bedrock, below lava).
     public int floorY = 8;
 
-    /**
-     * Ordered intermediate waypoints. Empty for simple point-to-point tunnels.
-     * The full path is: start → waypoints[0] → … → waypoints[n] → end.
-     */
+    // Store intermediate waypoints in traversal order.
     public final List<TunnelWaypoint> waypoints = new ArrayList<>();
 
-    // ── Discovery ────────────────────────────────────────────────────────────
-
+    // Discovery
     public TunnelDiscovery discovery = TunnelDiscovery.SELF_BUILT;
     public Instant discoveredAt = Instant.now();
 
-    // ── Quality ──────────────────────────────────────────────────────────────
-
+    // Quality
     public TunnelStatus status = TunnelStatus.UNVERIFIED;
 
-    /**
-     * 0.0–1.0 confidence that the tunnel is passable.
-     * Self-built tunnels start at 1.0; scanned/shared tunnels start lower.
-     */
+    // Estimate passability from 0.0 to 1.0.
     public double confidence = 1.0;
 
-    // ── Usage tracking ────────────────────────────────────────────────────────
-
+    // Usage tracking
     public @Nullable Instant lastVerifiedAt = null;
     public @Nullable Instant lastUsedAt     = null;
     public int timesUsed = 0;
 
-    // ── Network sync ─────────────────────────────────────────────────────────
-
-    /** Opaque ID assigned by an external backend, null if not yet synced. */
+    // Network sync
+    // Opaque ID assigned by an external backend, null if not yet synced.
     public @Nullable String networkId = null;
     public boolean sharedToNetwork = false;
 
-    // ── Derived helpers ──────────────────────────────────────────────────────
-
-    /** Total horizontal length in blocks (sum of all segments). */
+    // Derived helpers
+    // Total horizontal length in blocks (sum of all segments).
     public double totalLength() {
         double len = 0;
         int prevX = startX, prevZ = startZ;
@@ -81,19 +68,12 @@ public final class Tunnel {
         return len;
     }
 
-    /**
-     * Horizontal distance from origin to start of this tunnel.
-     * Used to select the closest entry point.
-     */
     public double entryDistanceFrom(int x, int z) {
         int dx = startX - x;
         int dz = startZ - z;
         return Math.sqrt(dx * (double) dx + dz * (double) dz);
     }
 
-    /**
-     * Horizontal distance from origin to end of this tunnel.
-     */
     public double exitDistanceFrom(int x, int z) {
         int dx = endX - x;
         int dz = endZ - z;
@@ -111,7 +91,7 @@ public final class Tunnel {
         return Collections.unmodifiableList(pts);
     }
 
-    /** Mark a successful use: update counters and status. */
+    // Mark a successful use: update counters and status.
     public void recordUse() {
         timesUsed++;
         lastUsedAt = Instant.now();

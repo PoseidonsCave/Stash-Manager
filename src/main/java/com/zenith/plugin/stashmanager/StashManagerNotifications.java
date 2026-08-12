@@ -5,10 +5,7 @@ import org.jspecify.annotations.Nullable;
 
 import static com.zenith.Globals.DISCORD;
 
-/**
- * Builds Discord notifications for long-running stash jobs that finish
- * asynchronously after the original command response has already been sent.
- */
+// Sends completion notifications for asynchronous stash jobs.
 public final class StashManagerNotifications {
 
     public void sendScanFinished(int found, int indexed, int failed) {
@@ -82,8 +79,7 @@ public final class StashManagerNotifications {
         DISCORD.sendEmbedMessage(embed);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
+    // Helpers
     private String formatPosition(double x, double y, double z) {
         return String.format("%.1f, %.1f, %.1f", x, y, z);
     }

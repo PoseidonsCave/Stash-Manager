@@ -7,7 +7,7 @@ import com.zenith.plugin.stashmanager.travel.tunnel.storage.TunnelRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/** Owns the shared tunnel manager lifecycle. */
+// Owns the shared tunnel manager lifecycle.
 public final class TravelManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/Travel");

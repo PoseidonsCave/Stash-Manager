@@ -39,10 +39,7 @@ import static com.zenith.Globals.BARITONE;
 import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.INVENTORY;
 
-/**
- * Lightweight retrieval state machine used by /stash get and /stash get kit.
- * Walks to candidate containers and shift-clicks matching items into player inventory.
- */
+// Retrieves requested items from candidate containers.
 public final class StashRetriever {
 
     public enum State {
@@ -1031,13 +1028,8 @@ public final class StashRetriever {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    // ── Split-Take (Partial Stack Retrieval) ───────────────────────────
-
-    /**
-     * Drives one tick of an in-progress partial-take split. Returns true if a
-     * click was issued (caller should set its cooldown and stop). Returns
-     * false when the split is complete (state cleared, recordTaken called).
-     */
+    // Split-Take (Partial Stack Retrieval)
+    // Return true when this tick sends an inventory click.
     private boolean tickSplitTake() {
         if (serverSession == null || openContainerId < 0) {
             resetSplit();
@@ -1144,7 +1136,7 @@ public final class StashRetriever {
         return true;
     }
 
-    /** Begin a partial-take split for a slot whose stack exceeds what we need. */
+    // Begin a partial-take split for a slot whose stack exceeds what we need.
     private void beginSplitTake(int srcSlot, String itemId, int stackCount, int needed) {
         splitInProgress = true;
         splitSrcSlot = srcSlot;
@@ -1171,13 +1163,8 @@ public final class StashRetriever {
         consecutiveFailures = 0; // reset on successful take
     }
 
-    // ── Owned Shulker Tracking ──────────────────────────────────────────
-
-    /**
-     * Begin tracking a shulker taken from a container for its contents.
-     * Records the shulker's fingerprint and candidate slots so we can identify
-     * which inventory slot receives it when the container is closed.
-     */
+    // Owned Shulker Tracking
+    // Track where a borrowed shulker lands in player inventory.
     private void beginTrackingOwnedShulker(ItemStack stack, int chestSlots) {
         pendingOwnedShulkerFingerprint = shulkerFingerprint(stack);
         pendingOwnedShulkerCandidateSlots.clear();
@@ -1195,10 +1182,7 @@ public final class StashRetriever {
         }
     }
 
-    /**
-     * Resolve pending owned shulker by finding which candidate slot now contains
-     * a shulker matching the fingerprint.
-     */
+    // Match the borrowed shulker against its candidate slots.
     private void resolvePendingOwnedShulker() {
         if (pendingOwnedShulkerFingerprint == null || pendingOwnedShulkerCandidateSlots.isEmpty()) return;
 
@@ -1222,9 +1206,7 @@ public final class StashRetriever {
         }
     }
 
-    /**
-     * Swap owned shulker slot tracking when inventory slots are swapped.
-     */
+    // Keep ownership aligned with inventory swaps.
     private void swapOwnedShulkerSlots(int slotA, int slotB) {
         boolean ownedA = ownedShulkerSlots.remove(slotA);
         boolean ownedB = ownedShulkerSlots.remove(slotB);
@@ -1232,20 +1214,12 @@ public final class StashRetriever {
         if (ownedB) ownedShulkerSlots.add(slotA);
     }
 
-    /**
-     * Create a fingerprint of a shulker box based on its item ID and contents.
-     * Used to track the same shulker across container interactions.
-     */
     private String shulkerFingerprint(ItemStack stack) {
         String itemId = ItemIdentifier.getItemId(stack);
-        // Include NBT hash or contents if available
-        // Simplified for now - would need proper NBT reading
+        // TODO: Derive a stable fingerprint from item components.
         return itemId + "|" + stack.hashCode();
     }
 
-    /**
-     * Convert container slot index to player inventory slot index.
-     */
     private static int playerInventorySlotFromContainerSlot(int chestSlots, int slot) {
         int relative = slot - chestSlots;
         if (relative < 27) return relative + 9; // Main inventory
@@ -1289,10 +1263,7 @@ public final class StashRetriever {
         return false;
     }
 
-    /**
-     * Find a shulker in player inventory that contains items we still need.
-     * Returns the inventory slot, or -1 if none found.
-     */
+    // Return the matching inventory slot, or -1 when none exists.
     private int findShulkerWithNeededItems() {
         resolvePendingOwnedShulker();
         

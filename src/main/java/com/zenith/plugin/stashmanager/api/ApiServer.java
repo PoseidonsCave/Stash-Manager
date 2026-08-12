@@ -10,20 +10,7 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.concurrent.Executors;
 
-/**
- * Lightweight embedded HTTP API server for external integrations
- * (Grafana, n8n, custom dashboards, etc.).
- *
- * Endpoints:
- *   GET  /api/v1/status       — Scanner state and statistics
- *   GET  /api/v1/containers   — Paginated container list (?page=1&size=50)
- *   GET  /api/v1/search       — Search by item name (?item=diamond)
- *   GET  /api/v1/stats        — Aggregate statistics (JSON)
- *   GET  /api/v1/metrics      — Prometheus-compatible metrics
- *   GET  /api/v1/organizer    — Organizer state and progress
- *   GET  /api/v1/regions      — Saved region list
- *   POST /api/v1/webhook/test — Webhook connectivity test
- */
+// Serves the stash integration API.
 public class ApiServer implements AutoCloseable {
 
     private HttpServer server;

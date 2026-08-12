@@ -32,14 +32,10 @@ import java.util.stream.Collectors;
 
 import static com.zenith.Globals.*;
 
-/**
- * Plans and executes item-sorting moves across containers in a defined region.
- * State machine: PLANNING → WALKING → OPENING → TAKING → DEPOSITING (repeat).
- */
+// Sorts items across containers in the configured region.
 public final class StashOrganizer {
 
-    // ── State Machine ───────────────────────────────────────────────────
-
+    // State Machine
     public enum State {
         IDLE,
         PLANNING,
@@ -85,15 +81,13 @@ public final class StashOrganizer {
     private State state = State.IDLE;
     private TargetRole currentRole = TargetRole.SOURCE;
 
-    // ── Column Detection ────────────────────────────────────────────────
-
+    // Column Detection
     record Column(int id, List<int[]> chests) {
         int[] bottom() { return chests.get(chests.size() - 1); }
         int[] top()    { return chests.get(0); }
     }
 
-    // ── Move Tasks ──────────────────────────────────────────────────────
-
+    // Move Tasks
     record MoveTask(int[] source, int[] destination, String itemId, String shulkerContentFilter) {
         MoveTask(int[] source, int[] destination, String itemId) {
             this(source, destination, itemId, null);
@@ -102,15 +96,13 @@ public final class StashOrganizer {
 
     private record ItemLocation(int[] pos, int quantity) {}
 
-    // ── Configuration / References ──────────────────────────────────────
-
+    // Configuration / References
     private final StashManagerConfig config;
     private final ContainerIndex index;
     private InfoCallback infoCallback;
     private BiConsumer<String, Map<String, Object>> eventCallback;
 
-    // ── Task Queue ──────────────────────────────────────────────────────
-
+    // Task Queue
     private final Deque<MoveTask> taskQueue = new ArrayDeque<>();
     private final Deque<MoveTask> consolidationQueue = new ArrayDeque<>();
     private MoveTask currentTask;
@@ -118,8 +110,7 @@ public final class StashOrganizer {
     private Map<String, Column> columnAssignment = new LinkedHashMap<>();
     private int depositColumnIndex;
 
-    // ── Timing ──────────────────────────────────────────────────────────
-
+    // Timing
     private static final int OPEN_TIMEOUT_TICKS = 60;
     private static final int HOTBAR_SIZE = 9;
     private static final int CLICK_COOLDOWN_TICKS = 3;
@@ -128,8 +119,7 @@ public final class StashOrganizer {
     private static final int CONDENSE_MIN_ITEMS = 1;
     private static final int SHULKER_HOTBAR_SLOT = 6;
 
-    // ── Runtime State ───────────────────────────────────────────────────
-
+    // Runtime State
     private int[] walkTarget;
     private long trackedWalkTargetKey = Long.MIN_VALUE;
     private int walkingTicks;
@@ -142,8 +132,7 @@ public final class StashOrganizer {
 
     private boolean consolidationMode = false;
 
-    // ── Shulker Packing State ───────────────────────────────────────────
-
+    // Shulker Packing State
     private String packItemId;
     private int[] packDestination;
     private int[] shulkerPlacePos;
@@ -154,8 +143,7 @@ public final class StashOrganizer {
     private int shulkerTicks;
     private int shulkerPlaceRetries;
 
-    // ── Crafting State ──────────────────────────────────────────────────
-
+    // Crafting State
     private int[] craftingTablePos;
     private int shulkersToCraft;
     private int craftTicks;
@@ -163,8 +151,7 @@ public final class StashOrganizer {
     private int shellsNeeded;
     private int chestsNeeded;
 
-    // ── Container Interaction State ─────────────────────────────────────
-
+    // Container Interaction State
     // Set by module packet handler on container open
     private volatile boolean containerDataReceived = false;
     private volatile int openContainerId = -1;
@@ -172,20 +159,17 @@ public final class StashOrganizer {
     private volatile ItemStack[] containerSlots;
     private volatile Session serverSession;
 
-    // ── Overflow ────────────────────────────────────────────────────────
-
+    // Overflow
     private int[] overflowChestPos;
     private final Map<String, Integer> overflowItems = new LinkedHashMap<>();
 
-    // ── Callback Interface ──────────────────────────────────────────────
-
+    // Callback Interface
     @FunctionalInterface
     public interface InfoCallback {
         void info(String message);
     }
 
-    // ── Constructor ─────────────────────────────────────────────────────
-
+    // Constructor
     public StashOrganizer(StashManagerConfig config, ContainerIndex index) {
         this.config = config;
         this.index = index;
@@ -199,8 +183,7 @@ public final class StashOrganizer {
         this.eventCallback = callback;
     }
 
-    // ── Public API ──────────────────────────────────────────────────────
-
+    // Public API
     public State getState() { return state; }
     public boolean isActive() { return state != State.IDLE && state != State.DONE; }
     public int getTotalTasks() { return totalTasks; }
@@ -274,8 +257,7 @@ public final class StashOrganizer {
         this.containerDataReceived = true;
     }
 
-    // ── Tick ────────────────────────────────────────────────────────────
-
+    // Tick
     public void tick() {
         if (state == State.IDLE || state == State.DONE) return;
 
@@ -315,8 +297,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── PLANNING ────────────────────────────────────────────────────────
-
+    // PLANNING
     private void tickPlanning() {
         List<ContainerEntry> regionContainers = index.getInRegion(config.pos1, config.pos2);
 
@@ -553,8 +534,7 @@ public final class StashOrganizer {
         advanceToNextTask();
     }
 
-    // ── Column Detection ────────────────────────────────────────────────
-
+    // Column Detection
     static List<Column> detectColumns(Set<int[]> positions) {
         // Build a list for safe iteration
         List<int[]> remaining = new ArrayList<>(positions);
@@ -594,8 +574,7 @@ public final class StashOrganizer {
         return columns;
     }
 
-    // ── WALKING ─────────────────────────────────────────────────────────
-
+    // WALKING
     private void tickWalking() {
         if (walkTarget == null) {
             advanceToNextTask();
@@ -661,8 +640,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── OPENING ─────────────────────────────────────────────────────────
-
+    // OPENING
     private void tickOpening() {
         openWaitTicks++;
 
@@ -680,8 +658,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── TAKING (container → player inventory via shift-click) ───────────
-
+    // TAKING (container → player inventory via shift-click)
     private void tickTaking() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
@@ -731,8 +708,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── DEPOSITING (player inventory → container via shift-click) ───────
-
+    // DEPOSITING (player inventory → container via shift-click)
     private void tickDepositing() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
@@ -814,8 +790,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── SHULKER FETCH — take an empty shulker from a region container ───
-
+    // SHULKER FETCH — take an empty shulker from a region container
     private void tickShulkerFetchOpen() {
         openWaitTicks++;
 
@@ -869,8 +844,7 @@ public final class StashOrganizer {
         startOverflow();
     }
 
-    // ── SHULKER STORE — deposit filled shulker into destination ─────────
-
+    // SHULKER STORE — deposit filled shulker into destination
     private void tickShulkerStoreOpen() {
         openWaitTicks++;
 
@@ -943,8 +917,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── SHULKER PACKING CYCLE ───────────────────────────────────────────
-
+    // SHULKER PACKING CYCLE
     private void startShulkerPacking(String itemId, int[] destination) {
         this.packItemId = itemId;
         this.packDestination = destination;
@@ -1210,8 +1183,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── CRAFTING SHULKER BOXES ──────────────────────────────────────────
-
+    // CRAFTING SHULKER BOXES
     private void startCrafting() {
         craftingTablePos = findCraftingTable();
         if (craftingTablePos == null) {
@@ -1333,8 +1305,7 @@ public final class StashOrganizer {
         startOverflow();
     }
 
-    // ── OVERFLOW ────────────────────────────────────────────────────────
-
+    // OVERFLOW
     private void startOverflow() {
         overflowChestPos = findOverflowChest();
         if (overflowChestPos == null) {
@@ -1409,8 +1380,7 @@ public final class StashOrganizer {
         advanceToNextTask();
     }
 
-    // ── Consolidation ───────────────────────────────────────────────────
-
+    // Consolidation
     private void advanceConsolidation() {
         // All collected → done
         if (consolidationQueue.isEmpty()) {
@@ -1428,8 +1398,7 @@ public final class StashOrganizer {
         state = State.WALKING;
     }
 
-    // ── Navigation ──────────────────────────────────────────────────────
-
+    // Navigation
     private void transitionToDestination() {
         if (currentTask == null) {
             advanceToNextTask();
@@ -1487,8 +1456,7 @@ public final class StashOrganizer {
         info("Run /stash scan to refresh the index.");
     }
 
-    // ── Container Interaction ───────────────────────────────────────────
-
+    // Container Interaction
     private void interactWithBlock(int[] pos) {
         try {
             BARITONE.rightClickBlock(pos[0], pos[1], pos[2]);
@@ -1541,8 +1509,7 @@ public final class StashOrganizer {
         }
     }
 
-    // ── Inventory Helpers ───────────────────────────────────────────────
-
+    // Inventory Helpers
     private boolean hasInventoryRoom() {
         var invCache = CACHE.getPlayerCache().getInventoryCache();
         var playerContainer = invCache.getPlayerInventory();
@@ -1565,10 +1532,7 @@ public final class StashOrganizer {
         return false;
     }
 
-    /**
-     * When a destination chest is full, try the next chest down in the same column.
-     * Returns true if a cascade target was found (will walk there).
-     */
+    // Return true after selecting the next chest in the column.
     private boolean cascadeToNextInColumn() {
         if (currentTask == null) return false;
         Column col = columnAssignment.get(currentTask.itemId());
@@ -1587,8 +1551,7 @@ public final class StashOrganizer {
         return false;
     }
 
-    // ── Item Helpers ────────────────────────────────────────────────────
-
+    // Item Helpers
     private static String itemIdFromStack(ItemStack stack) {
         return ItemIdentifier.getItemId(stack);
     }
@@ -1615,8 +1578,7 @@ public final class StashOrganizer {
         return region.isEmpty() ? null : new int[]{region.get(0).x(), region.get(0).y(), region.get(0).z()};
     }
 
-    // ── Position Helpers ────────────────────────────────────────────────
-
+    // Position Helpers
     private static long posKey(int x, int y, int z) {
         return ((long) x & 0x3FFFFFFL) << 38 | ((long) y & 0xFFFL) << 26 | ((long) z & 0x3FFFFFFL);
     }
@@ -1657,8 +1619,7 @@ public final class StashOrganizer {
         eventCallback.accept(event, payload);
     }
 
-    // ── Status ──────────────────────────────────────────────────────────
-
+    // Status
     public String getStatus() {
         String detail = switch (state) {
             case IDLE              -> "Idle";
@@ -1690,8 +1651,7 @@ public final class StashOrganizer {
         return detail;
     }
 
-    // ── Helper Methods ──────────────────────────────────────────────────
-
+    // Helper Methods
     private int findEmptyShulkerInInventory() {
         var invCache = CACHE.getPlayerCache().getInventoryCache();
         var playerContainer = invCache.getPlayerInventory();

@@ -3,7 +3,7 @@ package com.zenith.plugin.stashmanager.travel.tunnel.network.auth;
 import java.net.URI;
 import java.net.http.HttpRequest;
 
-/** Adds an X-API-Key header. */
+// Adds an X-API-Key header.
 public final class ApiKeyAuth implements AuthProvider {
 
     private final String apiKey;

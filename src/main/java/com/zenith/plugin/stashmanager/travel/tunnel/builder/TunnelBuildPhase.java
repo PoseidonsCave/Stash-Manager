@@ -1,17 +1,17 @@
 package com.zenith.plugin.stashmanager.travel.tunnel.builder;
 
-/** Three-phase tunnel dig states. */
+// Three-phase tunnel dig states.
 public enum TunnelBuildPhase {
-    /** Not yet started. */
+    // Not yet started.
     IDLE,
-    /** Digging down to floorY. */
+    // Digging down to floorY.
     DESCENDING,
-    /** Mining horizontally to destination. */
+    // Mining horizontally to destination.
     TRAVERSING,
-    /** Digging up to surface at destination. */
+    // Digging up to surface at destination.
     ASCENDING,
-    /** Build completed successfully. */
+    // Build completed successfully.
     COMPLETE,
-    /** Build failed (stuck, timeout, or error). */
+    // Build failed (stuck, timeout, or error).
     FAILED
 }

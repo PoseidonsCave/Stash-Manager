@@ -189,8 +189,7 @@ public class StashManagerModule extends Module {
         info("StashManager module disabled");
     }
 
-    // ── Public API ──────────────────────────────────────────────────────
-
+    // Public API
     public ScanState getState() {
         return state;
     }
@@ -476,8 +475,7 @@ public class StashManagerModule extends Module {
         };
     }
 
-    // ── Tick Handlers ───────────────────────────────────────────────────
-
+    // Tick Handlers
     private void onTickStarting(ClientBotTick.Starting event) {
         // Re-init on reconnect
         if (state != ScanState.IDLE && state != ScanState.DONE) {
@@ -532,8 +530,7 @@ public class StashManagerModule extends Module {
         }
     }
 
-    // ── State Implementations ───────────────────────────────────────────
-
+    // State Implementations
     private void tickZoneScanning() {
         List<ContainerLocation> found = regionScanner.scanRegion(
             config.pos1, config.pos2, config.maxContainers, getReservedContainerKeys());
@@ -727,8 +724,7 @@ public class StashManagerModule extends Module {
         }
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────
-
+    // Helpers
     private void advanceToNextContainer() {
         currentContainerIndex++;
 

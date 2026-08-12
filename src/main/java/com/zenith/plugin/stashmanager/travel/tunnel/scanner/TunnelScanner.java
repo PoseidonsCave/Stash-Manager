@@ -22,14 +22,14 @@ public final class TunnelScanner {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/TunnelScanner");
 
-    /** Floor block Y. */
+    // Floor block Y.
     static final int SCAN_Y = 8;
-    /** Feet level. */
+    // Feet level.
     static final int SCAN_Y_FEET = SCAN_Y + 1;
-    /** Head level. */
+    // Head level.
     static final int SCAN_Y_HEAD = SCAN_Y + 2;
 
-    /** Minimum run of contiguous air blocks to be worth recording as a tunnel candidate. */
+    // Minimum run of contiguous air blocks to be worth recording as a tunnel candidate.
     private static final int MIN_RUN_BLOCKS = 16;
 
     // Scans loaded chunks; returns candidates without persisting them.
@@ -61,11 +61,7 @@ public final class TunnelScanner {
         return results;
     }
 
-    /**
-     * Collect all block positions at SCAN_Y+1 and SCAN_Y+2 that are air AND
-     * have a solid block at SCAN_Y (floor present), indicating a carved passage.
-     *
-     */
+    // Collect two-block-high air columns over a solid tunnel floor.
     private List<int[]> collectAirPositions(int playerX, int playerZ) {
         List<int[]> positions = new ArrayList<>();
 
@@ -87,9 +83,6 @@ public final class TunnelScanner {
         return positions;
     }
 
-    /**
-     * Scan a single 16×16 chunk column for tunnel air positions.
-     */
     private void scanChunkColumn(int chunkX, int chunkZ, List<int[]> out) {
         int baseX = chunkX << 4;
         int baseZ = chunkZ << 4;
@@ -106,12 +99,7 @@ public final class TunnelScanner {
         }
     }
 
-    /**
-     * Check if a column at (x, z) has the tunnel signature:
-     * - SCAN_Y is solid (floor)
-     * - SCAN_Y_FEET is air (feet level)
-     * - SCAN_Y_HEAD is air (head level)
-     */
+    // Require a solid floor with two air blocks above it.
     private boolean isTunnelAir(int x, int z) {
         try {
             var chunkCache = CACHE.getChunkCache();
@@ -143,9 +131,8 @@ public final class TunnelScanner {
         }
     }
 
-    // ── Run extraction ────────────────────────────────────────────────────────
-
-    /** Extract tunnels running along the X axis (constant Z). */
+    // Run extraction
+    // Extract tunnels running along the X axis (constant Z).
     private List<Tunnel> extractXAxisRuns(List<int[]> positions) {
         // Group by Z coordinate
         java.util.Map<Integer, List<Integer>> byZ = new java.util.TreeMap<>();
@@ -163,7 +150,7 @@ public final class TunnelScanner {
         return tunnels;
     }
 
-    /** Extract tunnels running along the Z axis (constant X). */
+    // Extract tunnels running along the Z axis (constant X).
     private List<Tunnel> extractZAxisRuns(List<int[]> positions) {
         // Group by X coordinate
         java.util.Map<Integer, List<Integer>> byX = new java.util.TreeMap<>();

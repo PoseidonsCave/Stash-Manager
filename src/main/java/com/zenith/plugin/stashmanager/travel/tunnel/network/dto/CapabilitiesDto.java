@@ -1,6 +1,6 @@
 package com.zenith.plugin.stashmanager.travel.tunnel.network.dto;
 
-/** Server capabilities advertised by the tunnel backend. */
+// Server capabilities advertised by the tunnel backend.
 public class CapabilitiesDto {
     public String service = "unknown";
     public String apiVersion = "1";

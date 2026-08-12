@@ -16,10 +16,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-/**
- * HTTP request handlers for the embedded API.
- * All responses are JSON unless otherwise noted (metrics endpoint is Prometheus text format).
- */
+// Handles JSON API requests and Prometheus metrics.
 public class ApiHandler {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -39,8 +36,7 @@ public class ApiHandler {
         this.database = database;
     }
 
-    // ── GET /api/v1/status ──────────────────────────────────────────────
-
+    // GET /api/v1/status
     public void handleStatus(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -71,8 +67,7 @@ public class ApiHandler {
         sendJson(exchange, 200, body);
     }
 
-    // ── GET /api/v1/containers?page=1&size=50 ──────────────────────────
-
+    // GET /api/v1/containers?page=1&size=50
     public void handleContainers(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -108,8 +103,7 @@ public class ApiHandler {
         sendJson(exchange, 200, body);
     }
 
-    // ── GET /api/v1/search?item=diamond ─────────────────────────────────
-
+    // GET /api/v1/search?item=diamond
     public void handleSearch(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -148,8 +142,7 @@ public class ApiHandler {
         sendJson(exchange, 200, body);
     }
 
-    // ── GET /api/v1/stats ───────────────────────────────────────────────
-
+    // GET /api/v1/stats
     public void handleStats(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -199,8 +192,7 @@ public class ApiHandler {
         sendJson(exchange, 200, body);
     }
 
-    // ── GET /api/v1/metrics (Prometheus format) ─────────────────────────
-
+    // GET /api/v1/metrics (Prometheus format)
     public void handleMetrics(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -297,8 +289,7 @@ public class ApiHandler {
         sendText(exchange, 200, sb.toString());
     }
 
-    // ── POST /api/v1/webhook/test ───────────────────────────────────────
-
+    // POST /api/v1/webhook/test
     public void handleWebhookTest(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "POST")) return;
         if (!checkApiKey(exchange)) return;
@@ -311,8 +302,7 @@ public class ApiHandler {
 
         sendJson(exchange, 200, body);
     }
-    // ── GET /api/v1/organizer ──────────────────────────────────────────
-
+    // GET /api/v1/organizer
     public void handleOrganizer(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -332,8 +322,7 @@ public class ApiHandler {
         sendJson(exchange, 200, body);
     }
 
-    // ── GET /api/v1/regions ──────────────────────────────────────────────
-
+    // GET /api/v1/regions
     public void handleRegions(HttpExchange exchange) throws IOException {
         if (!checkMethod(exchange, "GET")) return;
         if (!checkApiKey(exchange)) return;
@@ -362,8 +351,7 @@ public class ApiHandler {
         }
         sendJson(exchange, 200, body);
     }
-    // ── Utility ─────────────────────────────────────────────────────────
-
+    // Utility
     private Map<String, Object> containerToMap(ContainerEntry entry) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("x", entry.x());
