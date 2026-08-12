@@ -12,6 +12,8 @@ import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
+import com.zenith.plugin.stashmanager.util.BaritoneCompat;
+import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import org.geysermc.mcprotocollib.network.Session;
@@ -37,10 +39,7 @@ import static com.zenith.Globals.BARITONE;
 import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.INVENTORY;
 
-/**
- * Lightweight retrieval state machine used by /stash get and /stash get kit.
- * Walks to candidate containers and shift-clicks matching items into player inventory.
- */
+// Retrieves requested items from candidate containers.
 public final class StashRetriever {
 
     public enum State {
@@ -72,6 +71,9 @@ public final class StashRetriever {
     private final Deque<int[]> targetQueue = new ArrayDeque<>();
     private int[] currentTarget;
     private final Map<String, Integer> remaining = new LinkedHashMap<>();
+    private int[] activeRegionMin;
+    private int[] activeRegionMax;
+    private final Set<Long> excludedTargets = new HashSet<>();
 
     private int openWaitTicks;
     private int actionCooldown;
@@ -157,6 +159,15 @@ public final class StashRetriever {
     public boolean startKit(String requestName,
                             Map<String, Integer> kitItems,
                             List<ContainerEntry> candidates) {
+        return startKit(requestName, kitItems, candidates, null, null, Set.of());
+    }
+
+    public boolean startKit(String requestName,
+                            Map<String, Integer> kitItems,
+                            List<ContainerEntry> candidates,
+                            int[] regionPos1,
+                            int[] regionPos2,
+                            Set<Long> excludedPositions) {
         if (kitItems == null || kitItems.isEmpty()) return false;
         if (isActive()) return false;
 
@@ -167,6 +178,7 @@ public final class StashRetriever {
 
         resetState();
         activeRequestName = requestName;
+    setTargetPolicy(regionPos1, regionPos2, excludedPositions);
         kitItems.forEach((k, v) -> {
             if (v != null && v > 0) remaining.put(k, v);
         });
@@ -186,6 +198,7 @@ public final class StashRetriever {
 
         for (ContainerEntry entry : sorted) {
             if (matchScore(entry) <= 0) continue;
+            if (!isAllowedTarget(entry.x(), entry.y(), entry.z())) continue;
             targetQueue.add(new int[]{entry.x(), entry.y(), entry.z()});
         }
 
@@ -324,6 +337,11 @@ public final class StashRetriever {
         }
 
         int chestSlots = getOpenContainerSlotCount();
+        resolvePendingOwnedShulker();
+        if (returnFinishedOwnedShulker(chestSlots)) {
+            actionCooldown = CLICK_COOLDOWN_TICKS;
+            return;
+        }
 
         while (actionSlotIndex < chestSlots) {
             ItemStack stack = containerSlots[actionSlotIndex];
@@ -434,6 +452,8 @@ public final class StashRetriever {
             return;
         }
 
+        resolvePendingOwnedShulker();
+
         if (unloadShulkerSlot < 0) {
             unloadShulkerSlot = findWantedShulkerSlot();
             if (unloadShulkerSlot < 0) {
@@ -499,7 +519,7 @@ public final class StashRetriever {
         }
 
         if (unloadPlaceFuture == null) {
-            unloadPlaceFuture = BARITONE.placeBlock(
+            unloadPlaceFuture = BaritoneCompat.placeBlock(
                 placedShulkerPos[0],
                 placedShulkerPos[1],
                 placedShulkerPos[2],
@@ -567,6 +587,13 @@ public final class StashRetriever {
                 String itemId = itemIdFromStack(stack);
                 Integer needed = remaining.get(itemId);
                 if (needed != null && needed > 0 && hasInventoryRoom()) {
+                    if (stack.getAmount() > needed) {
+                        beginSplitTake(actionSlotIndex, itemId, stack.getAmount(), needed);
+                        actionSlotIndex++;
+                        actionCooldown = CLICK_COOLDOWN_TICKS;
+                        return;
+                    }
+
                     quickMoveSlot(actionSlotIndex);
                     successfulTransfers++;
                     remaining.put(itemId, Math.max(0, needed - stack.getAmount()));
@@ -601,7 +628,7 @@ public final class StashRetriever {
             return;
         }
 
-        if (World.getBlock(placedShulkerPos[0], placedShulkerPos[1], placedShulkerPos[2]).isAir()) {
+        if (BlockCompat.isAir(World.getBlock(placedShulkerPos[0], placedShulkerPos[1], placedShulkerPos[2]))) {
             emit("retrieve_shulker_broken", Map.of(
                 "placed_position", posString(placedShulkerPos)
             ));
@@ -622,7 +649,8 @@ public final class StashRetriever {
         }
 
         if (unloadBreakFuture == null) {
-            unloadBreakFuture = BARITONE.breakBlock(placedShulkerPos[0], placedShulkerPos[1], placedShulkerPos[2], true);
+            unloadBreakFuture = BaritoneCompat.breakBlock(
+                placedShulkerPos[0], placedShulkerPos[1], placedShulkerPos[2], true);
             return;
         }
 
@@ -664,12 +692,17 @@ public final class StashRetriever {
             return;
         }
 
-        if (targetQueue.isEmpty()) {
+        int[] nextTarget;
+        do {
+            nextTarget = targetQueue.poll();
+        } while (nextTarget != null && !isAllowedTarget(nextTarget[0], nextTarget[1], nextTarget[2]));
+
+        if (nextTarget == null) {
             finish(false, "no_more_targets");
             return;
         }
 
-        currentTarget = targetQueue.poll();
+        currentTarget = nextTarget;
         state = State.WALKING;
         openWaitTicks = 0;
         actionCooldown = 0;
@@ -727,6 +760,38 @@ public final class StashRetriever {
         ownedShulkerSlots.clear();
         pendingOwnedShulkerFingerprint = null;
         pendingOwnedShulkerCandidateSlots.clear();
+        activeRegionMin = null;
+        activeRegionMax = null;
+        excludedTargets.clear();
+    }
+
+    private void setTargetPolicy(int[] pos1, int[] pos2, Set<Long> excludedPositions) {
+        if (pos1 != null && pos2 != null) {
+            activeRegionMin = new int[]{
+                Math.min(pos1[0], pos2[0]), Math.min(pos1[1], pos2[1]), Math.min(pos1[2], pos2[2])
+            };
+            activeRegionMax = new int[]{
+                Math.max(pos1[0], pos2[0]), Math.max(pos1[1], pos2[1]), Math.max(pos1[2], pos2[2])
+            };
+        }
+        if (excludedPositions != null) {
+            excludedTargets.addAll(excludedPositions);
+        }
+    }
+
+    private boolean isAllowedTarget(int x, int y, int z) {
+        if (activeRegionMin != null && (x < activeRegionMin[0] || x > activeRegionMax[0]
+                || y < activeRegionMin[1] || y > activeRegionMax[1]
+                || z < activeRegionMin[2] || z > activeRegionMax[2])) {
+            return false;
+        }
+        return !excludedTargets.contains(posKey(x, y, z));
+    }
+
+    private static long posKey(int x, int y, int z) {
+        return ((long) x & 0x3FFFFFFL) << 38
+            | ((long) y & 0xFFFL) << 26
+            | ((long) z & 0x3FFFFFFL);
     }
 
     private void resetUnloadState() {
@@ -884,6 +949,7 @@ public final class StashRetriever {
                     new MoveToHotbarSlot(slot, MoveToHotbarAction.SLOT_7),
                     new SetHeldItem(SHULKER_HOTBAR_SLOT)
                 );
+                swapOwnedShulkerSlots(slot, 36 + SHULKER_HOTBAR_SLOT);
             }
             INVENTORY.submit(builder.build());
         } catch (Exception ignored) {
@@ -916,10 +982,10 @@ public final class StashRetriever {
             var targetBlock = World.getBlock(x, y, z);
             var aboveBlock = World.getBlock(x, y + 1, z);
             var belowBlock = World.getBlock(x, y - 1, z);
-            if ((!targetBlock.isAir() && !targetBlock.replaceable())
-                || (!aboveBlock.isAir() && !aboveBlock.replaceable())
-                || belowBlock.isAir()
-                || !belowBlock.solidBlock()) {
+            if (!BlockCompat.canReplace(targetBlock)
+                || !BlockCompat.canReplace(aboveBlock)
+                || BlockCompat.isAir(belowBlock)
+                || !BlockCompat.isSolid(x, y - 1, z)) {
                 continue;
             }
             return new int[]{x, y, z};
@@ -962,13 +1028,8 @@ public final class StashRetriever {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    // ── Split-Take (Partial Stack Retrieval) ───────────────────────────
-
-    /**
-     * Drives one tick of an in-progress partial-take split. Returns true if a
-     * click was issued (caller should set its cooldown and stop). Returns
-     * false when the split is complete (state cleared, recordTaken called).
-     */
+    // Split-Take (Partial Stack Retrieval)
+    // Return true when this tick sends an inventory click.
     private boolean tickSplitTake() {
         if (serverSession == null || openContainerId < 0) {
             resetSplit();
@@ -1075,7 +1136,7 @@ public final class StashRetriever {
         return true;
     }
 
-    /** Begin a partial-take split for a slot whose stack exceeds what we need. */
+    // Begin a partial-take split for a slot whose stack exceeds what we need.
     private void beginSplitTake(int srcSlot, String itemId, int stackCount, int needed) {
         splitInProgress = true;
         splitSrcSlot = srcSlot;
@@ -1102,13 +1163,8 @@ public final class StashRetriever {
         consecutiveFailures = 0; // reset on successful take
     }
 
-    // ── Owned Shulker Tracking ──────────────────────────────────────────
-
-    /**
-     * Begin tracking a shulker taken from a container for its contents.
-     * Records the shulker's fingerprint and candidate slots so we can identify
-     * which inventory slot receives it when the container is closed.
-     */
+    // Owned Shulker Tracking
+    // Track where a borrowed shulker lands in player inventory.
     private void beginTrackingOwnedShulker(ItemStack stack, int chestSlots) {
         pendingOwnedShulkerFingerprint = shulkerFingerprint(stack);
         pendingOwnedShulkerCandidateSlots.clear();
@@ -1126,10 +1182,7 @@ public final class StashRetriever {
         }
     }
 
-    /**
-     * Resolve pending owned shulker by finding which candidate slot now contains
-     * a shulker matching the fingerprint.
-     */
+    // Match the borrowed shulker against its candidate slots.
     private void resolvePendingOwnedShulker() {
         if (pendingOwnedShulkerFingerprint == null || pendingOwnedShulkerCandidateSlots.isEmpty()) return;
 
@@ -1153,9 +1206,7 @@ public final class StashRetriever {
         }
     }
 
-    /**
-     * Swap owned shulker slot tracking when inventory slots are swapped.
-     */
+    // Keep ownership aligned with inventory swaps.
     private void swapOwnedShulkerSlots(int slotA, int slotB) {
         boolean ownedA = ownedShulkerSlots.remove(slotA);
         boolean ownedB = ownedShulkerSlots.remove(slotB);
@@ -1163,30 +1214,56 @@ public final class StashRetriever {
         if (ownedB) ownedShulkerSlots.add(slotA);
     }
 
-    /**
-     * Create a fingerprint of a shulker box based on its item ID and contents.
-     * Used to track the same shulker across container interactions.
-     */
     private String shulkerFingerprint(ItemStack stack) {
         String itemId = ItemIdentifier.getItemId(stack);
-        // Include NBT hash or contents if available
-        // Simplified for now - would need proper NBT reading
+        // TODO: Derive a stable fingerprint from item components.
         return itemId + "|" + stack.hashCode();
     }
 
-    /**
-     * Convert container slot index to player inventory slot index.
-     */
     private static int playerInventorySlotFromContainerSlot(int chestSlots, int slot) {
         int relative = slot - chestSlots;
         if (relative < 27) return relative + 9; // Main inventory
-        return relative - 27; // Hotbar
+        return relative + 9; // Hotbar (container slots 36-44)
     }
 
-    /**
-     * Find a shulker in player inventory that contains items we still need.
-     * Returns the inventory slot, or -1 if none found.
-     */
+    private static int containerSlotFromPlayerInventorySlot(int chestSlots, int slot) {
+        if (slot >= 9 && slot <= 35) return chestSlots + slot - 9;
+        if (slot >= 36 && slot <= 44) return chestSlots + 27 + slot - 36;
+        return -1;
+    }
+
+    private boolean returnFinishedOwnedShulker(int chestSlots) {
+        var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (playerContainer == null) return false;
+
+        var iterator = ownedShulkerSlots.iterator();
+        while (iterator.hasNext()) {
+            int inventorySlot = iterator.next();
+            ItemStack stack = playerContainer.getItemStack(inventorySlot);
+            if (stack == null || stack.getAmount() <= 0 || !isShulkerBoxItem(itemIdFromStack(stack))) {
+                iterator.remove();
+                continue;
+            }
+
+            boolean stillNeeded = ItemIdentifier.readShulkerContents(stack).keySet().stream()
+                .anyMatch(this::isWanted);
+            if (stillNeeded) continue;
+
+            int containerSlot = containerSlotFromPlayerInventorySlot(chestSlots, inventorySlot);
+            if (containerSlot < 0) {
+                iterator.remove();
+                continue;
+            }
+
+            quickMoveSlot(containerSlot);
+            iterator.remove();
+            emit("retrieve_owned_shulker_returned", Map.of());
+            return true;
+        }
+        return false;
+    }
+
+    // Return the matching inventory slot, or -1 when none exists.
     private int findShulkerWithNeededItems() {
         resolvePendingOwnedShulker();
         

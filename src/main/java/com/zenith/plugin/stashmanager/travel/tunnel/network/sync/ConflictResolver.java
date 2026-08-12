@@ -6,7 +6,7 @@ import com.zenith.plugin.stashmanager.travel.tunnel.core.TunnelWaypoint;
 
 import java.time.Instant;
 
-/** Conservative conflict resolver for local vs remote tunnel data. */
+// Conservative conflict resolver for local vs remote tunnel data.
 public final class ConflictResolver {
 
     public String key(Tunnel tunnel) {

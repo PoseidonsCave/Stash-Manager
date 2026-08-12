@@ -2,7 +2,7 @@ package com.zenith.plugin.stashmanager.travel.tunnel.network.dto;
 
 import com.zenith.plugin.stashmanager.travel.tunnel.core.TunnelWaypoint;
 
-/** Transport form of a tunnel waypoint. */
+// Transport form of a tunnel waypoint.
 public class TunnelWaypointDto {
     public int x;
     public int y;

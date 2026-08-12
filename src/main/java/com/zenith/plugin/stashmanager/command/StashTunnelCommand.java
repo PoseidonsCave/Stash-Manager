@@ -50,42 +50,41 @@ public class StashTunnelCommand extends Command {
     @Override
     public LiteralArgumentBuilder<CommandContext> register() {
         return command("stashtunnel")
-            // ── list ──────────────────────────────────────────────────────────
+            // List
             .then(literal("list")
                 .executes(c -> { return handleList(c.getSource(), 1); })
                 .then(argument("page", longArg(1))
                     .executes(c -> { return handleList(c.getSource(),
                             (int) LongArgumentType.getLong(c, "page")); })))
 
-            // ── status ────────────────────────────────────────────────────────
+            // Status
             .then(literal("status")
                 .executes(c -> { return handleStatus(c.getSource()); }))
 
-            // ── scan ──────────────────────────────────────────────────────────
+            // Scan
             .then(literal("scan")
                 .executes(c -> { return handleScan(c.getSource()); }))
 
-            // ── verify ────────────────────────────────────────────────────────
+            // Verify
             .then(literal("verify")
                 .executes(c -> { return handleVerify(c.getSource()); }))
 
-            // ── delete <id> ───────────────────────────────────────────────────
+            // Delete
             .then(literal("delete")
                 .then(argument("id", longArg(1))
                     .executes(c -> { return handleDelete(c.getSource(),
                             LongArgumentType.getLong(c, "id")); })))
 
-            // ── clear ─────────────────────────────────────────────────────────
+            // Clear
             .then(literal("clear")
                 .executes(c -> { return handleClear(c.getSource()); }))
 
-            // ── count ─────────────────────────────────────────────────────────
+            // Count
             .then(literal("count")
                 .executes(c -> { return handleCount(c.getSource()); }));
     }
 
-    // ── Handlers ──────────────────────────────────────────────────────────────
-
+    // Handlers
     private int handleList(CommandContext ctx, int page) {
         TunnelRepository repo = getRepo();
         if (repo == null) {
@@ -135,8 +134,6 @@ public class StashTunnelCommand extends Command {
             sb.append("State: **BUILDING**\n");
             sb.append("Phase: ").append(tm.getBuildPhase()).append("\n");
             sb.append("Progress: ").append(String.format("%.1f%%", tm.getBuildProgress() * 100));
-        } else if (tm.isTraversing()) {
-            sb.append("State: **TRAVERSING**");
         } else if (tm.isBuildFailed()) {
             sb.append("State: **FAILED** — ").append(tm.getFailReason());
         } else {
@@ -230,15 +227,14 @@ public class StashTunnelCommand extends Command {
         return OK;
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
+    // Helpers
     private TunnelRepository getRepo() {
         DatabaseManager db = StashManagerPlugin.getDatabase();
         if (db == null || !db.isInitialized()) return null;
         return new TunnelRepository(db);
     }
 
-    /** Fetch a page of tunnels ordered by most-recently-used. */
+    // Fetch a page of tunnels ordered by most-recently-used.
     private List<Tunnel> fetchPage(TunnelRepository repo, int offset, int limit) {
         DatabaseManager db = StashManagerPlugin.getDatabase();
         if (db == null || !db.isInitialized()) return List.of();

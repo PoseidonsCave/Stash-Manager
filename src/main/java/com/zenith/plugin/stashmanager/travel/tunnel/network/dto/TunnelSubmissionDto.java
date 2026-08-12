@@ -4,7 +4,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
-/** Upload payload for a batch of tunnel discoveries. */
+// Upload payload for a batch of tunnel discoveries.
 public class TunnelSubmissionDto {
     public String client = "stash-manager";
     public String uploadedAt = Instant.now().toString();

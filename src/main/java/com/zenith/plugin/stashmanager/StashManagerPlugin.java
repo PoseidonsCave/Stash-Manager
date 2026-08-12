@@ -5,7 +5,6 @@ import com.zenith.plugin.api.PluginAPI;
 import com.zenith.plugin.api.ZenithProxyPlugin;
 import com.zenith.plugin.stashmanager.api.ApiServer;
 import com.zenith.plugin.stashmanager.command.StashCommand;
-import com.zenith.plugin.stashmanager.command.StashDeliverCommand;
 import com.zenith.plugin.stashmanager.command.StashSearchCommand;
 import com.zenith.plugin.stashmanager.command.StashSupplyCommand;
 import com.zenith.plugin.stashmanager.command.StashTunnelCommand;
@@ -78,7 +77,6 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
         pluginAPI.registerCommand(new StashSearchCommand(sharedIndex, sharedDatabase));
         pluginAPI.registerCommand(new StashSupplyCommand(config));
         pluginAPI.registerCommand(new StashTunnelCommand());
-        pluginAPI.registerCommand(new StashDeliverCommand());
         sharedUpdateService.scheduleStartupCheck();
     }
 

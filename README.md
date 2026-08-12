@@ -28,18 +28,20 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 ## Installation
 
 1. Build the plugin JAR (or download from [Releases](https://github.com/PoseidonsCave/Stash-Management/releases))
-2. Place `stash-manager-2.0.1.jar` in ZenithProxy's `plugins/` directory
+2. Choose the JAR whose `+<target>` suffix exactly matches your ZenithProxy Minecraft target and place it in ZenithProxy's `plugins/` directory
 3. Restart ZenithProxy
+
+Supported targets are `1.21.4`, `1.21.8`, `1.21.11`, `26.1.2` (the 26.1 family), and `26.2.0` (the 26.2 family).
 
 ## Building
 
-Requires Java 21+.
+Requires Java 25. Builds for older targets still emit Java 21 bytecode.
 
 ```sh
-./gradlew build
+./gradlew test collectVersionJars
 ```
 
-The output JAR will be in `build/libs/`.
+Stonecutter builds all five targets and collects the target-qualified JARs in `build/libs/`. To build one target, run a task such as `./gradlew :1.21.4:shadowJar`.
 
 ### CI Notes
 
@@ -220,6 +222,8 @@ Saved automatically via ZenithProxy's plugin config system.
 | `webhookUrl` | *(empty)* | URL to POST scan-completion payloads to |
 
 ### Plugin Updates
+
+The updater reads ZenithProxy's native Minecraft codec version at runtime, then only stages a release asset whose `+<target>.jar` suffix and embedded plugin metadata match that target. If the installed plugin was built for a different target, an equal-version compatible JAR can replace it on restart.
 
 | Setting | Default | Description |
 |---------|---------|-------------|

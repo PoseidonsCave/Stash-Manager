@@ -20,7 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
-/** Periodic background sync between local tunnel storage and a remote backend. */
+// Periodic background sync between local tunnel storage and a remote backend.
 public final class SyncWorker {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/TunnelSync");

@@ -27,7 +27,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-/** Generic HTTP client for tunnel network backends. */
+// Generic HTTP client for tunnel network backends.
 public final class TunnelNetworkClient {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/TunnelNetworkClient");

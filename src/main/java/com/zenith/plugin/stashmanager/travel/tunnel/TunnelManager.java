@@ -1,7 +1,6 @@
 package com.zenith.plugin.stashmanager.travel.tunnel;
 
 import com.zenith.plugin.stashmanager.travel.bridge.TravelBaritoneBridge;
-import com.zenith.plugin.stashmanager.travel.delivery.DimensionHelper;
 import com.zenith.plugin.stashmanager.travel.tunnel.builder.TunnelBuildPhase;
 import com.zenith.plugin.stashmanager.travel.tunnel.builder.TunnelBuilder;
 import com.zenith.plugin.stashmanager.travel.tunnel.core.Tunnel;
@@ -15,44 +14,36 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 
-import static com.zenith.Globals.CACHE;
-
 // Coordinates tunnel route lookup, scanning, building, persistence, and traversal.
 public final class TunnelManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/TunnelManager");
 
-    /** Maximum distance (blocks) from the player's position to an existing tunnel entry. */
+    // Maximum distance (blocks) from the player's position to an existing tunnel entry.
     private static final int MAX_ENTRY_DETOUR = 500;
 
-    /** Minimum confidence required to reuse a stored tunnel. */
+    // Minimum confidence required to reuse a stored tunnel.
     private static final double MIN_CONFIDENCE = 0.5;
 
-    private enum State { IDLE, SCANNING, ROUTING, BUILDING, TRAVERSING, DONE, FAILED }
+    private enum State { IDLE, SCANNING, ROUTING, BUILDING, DONE, FAILED }
 
-    // ── Dependencies ──────────────────────────────────────────────────────────
-
+    // Dependencies
     private final TravelBaritoneBridge bridge;
     private final TunnelRepository     repository;
     private final TunnelScanner        scanner;
     private final TunnelBuilder        builder;
 
-    // ── Mission ───────────────────────────────────────────────────────────────
-
+    // Mission
     private State       state       = State.IDLE;
     private int         destX, destZ;
     private int         surfaceY;
     private Tunnel      activeTunnel = null;
     private String      failReason   = null;
 
-    /** Ticks spent in BUILDING or TRAVERSING. For progress display. */
-    private int stateTicks = 0;
-
-    /** Y to resurface to at the destination. Defaults to ~112 (typical nether surface). */
+    // Y to resurface to at the destination. Defaults to ~112 (typical nether surface).
     private static final int DEFAULT_SURFACE_Y = 112;
 
-    // ── Construction ─────────────────────────────────────────────────────────
-
+    // Construction
     public TunnelManager(TravelBaritoneBridge bridge, TunnelRepository repository) {
         this.bridge     = bridge;
         this.repository = repository;
@@ -60,8 +51,7 @@ public final class TunnelManager {
         this.builder    = new TunnelBuilder(bridge);
     }
 
-    // ── Public API ────────────────────────────────────────────────────────────
-
+    // Public API
     // Returns immediately; poll tick() then check isReady() / isBuildFailed().
     public void requestRoute(int destX, int destZ) {
         requestRoute(destX, destZ, DEFAULT_SURFACE_Y);
@@ -78,7 +68,6 @@ public final class TunnelManager {
         this.surfaceY = surfaceY;
         this.activeTunnel = null;
         this.failReason   = null;
-        this.stateTicks   = 0;
 
         LOGGER.info("TunnelManager: route requested to [{},{}]", destX, destZ);
         transition(State.SCANNING);
@@ -86,56 +75,37 @@ public final class TunnelManager {
 
     // Call every game tick while a route is pending or a build is active.
     public void tick() {
-        stateTicks++;
         switch (state) {
             case SCANNING    -> tickScanning();
             case ROUTING     -> tickRouting();
             case BUILDING    -> tickBuilding();
-            case TRAVERSING  -> tickTraversing();
-            default          -> { /* IDLE / DONE / FAILED — nothing to do */ }
+            default          -> { }
         }
     }
 
     public boolean isIdle()        { return state == State.IDLE;       }
     public boolean isReady()       { return state == State.DONE;       }
     public boolean isBuilding()    { return state == State.BUILDING;   }
-    public boolean isTraversing()  { return state == State.TRAVERSING; }
     public boolean isBuildFailed() { return state == State.FAILED;     }
 
-    /** The tunnel selected or built for the current request. Null until ready. */
+    // The tunnel selected or built for the current request. Null until ready.
     public Tunnel getActiveTunnel() { return activeTunnel; }
-    /** Fail reason. Null unless isBuildFailed(). */
+    // Fail reason. Null unless isBuildFailed().
     public String getFailReason()   { return failReason;   }
 
-    /** 0.0–1.0 progress fraction during a build. */
+    // 0.0–1.0 progress fraction during a build.
     public double getBuildProgress() {
         if (state == State.BUILDING) return builder.progressFraction();
         if (state == State.DONE)     return 1.0;
         return 0.0;
     }
 
-    /** Current builder phase (IDLE when not building). */
+    // Current builder phase (IDLE when not building).
     public TunnelBuildPhase getBuildPhase() {
         return builder.getPhase();
     }
 
-    /**
-     * Notify TunnelManager that the active tunnel was successfully traversed.
-     * Updates statistics in the repository.
-     */
-    public void notifyTraversalComplete() {
-        if (activeTunnel == null) return;
-        activeTunnel.recordUse();
-        if (activeTunnel.id > 0) {
-            repository.recordUse(activeTunnel.id);
-        }
-        LOGGER.info("Traversal complete for tunnel id={}", activeTunnel.id);
-        transition(State.IDLE);
-    }
-
-    /**
-     * Reset state machine to IDLE, cancelling any in-progress build.
-     */
+    // Cancel active work and return to idle.
     public void cancel() {
         if (state == State.BUILDING) {
             builder.cancel();
@@ -143,14 +113,8 @@ public final class TunnelManager {
         transition(State.IDLE);
     }
 
-    // ── Tick handlers ─────────────────────────────────────────────────────────
-
-    /**
-     * SCANNING: Run TunnelScanner on loaded chunks, persist any new tunnels,
-     * then immediately proceed to ROUTING.
-     *
-     * Scanning is done once (synchronous) then we move on.
-     */
+    // Tick handlers
+    // Scan once, persist candidates, then route.
     private void tickScanning() {
         int[] playerPos = bridge.getPlayerPos();
         if (playerPos == null) {
@@ -175,10 +139,7 @@ public final class TunnelManager {
         transition(State.ROUTING);
     }
 
-    /**
-     * ROUTING: Search the database for an existing tunnel that can be used.
-     * If found, we're DONE (tunnel is ready). If not found, start BUILDING.
-     */
+    // Reuse the best route or start a build.
     private void tickRouting() {
         int[] playerPos = bridge.getPlayerPos();
         if (playerPos == null) {
@@ -211,14 +172,7 @@ public final class TunnelManager {
         }
     }
 
-    private void tickTraversing() {
-        // Traversal is driven externally by TravelManager (Baritone is active).
-        // TunnelManager only tracks progress — TravelManager calls
-        // notifyTraversalComplete() when Baritone arrives at the destination.
-    }
-
-    // ── Route selection ───────────────────────────────────────────────────────
-
+    // Route selection
     // Ranks candidates by confidence × (1 / detour); checks forward and reversed direction.
     private Optional<Tunnel> findBestExistingTunnel(int ox, int oz) {
         String dim = DimensionHelper.currentDimName();
@@ -251,8 +205,7 @@ public final class TunnelManager {
         return dist <= MAX_ENTRY_DETOUR;
     }
 
-    // ── Build launch ──────────────────────────────────────────────────────────
-
+    // Build launch
     private void startBuild(int originX, int originZ) {
         try {
             builder.start(originX, originZ, destX, destZ, surfaceY);
@@ -262,12 +215,10 @@ public final class TunnelManager {
         }
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
+    // Helpers
     private void transition(State next) {
         LOGGER.info("TunnelManager: {} → {}", state, next);
         state = next;
-        stateTicks = 0;
     }
 
     private void fail(String reason) {
@@ -276,10 +227,7 @@ public final class TunnelManager {
         state = State.FAILED;
     }
 
-    /**
-     * Quick verification of the active tunnel's endpoints using the scanner.
-     * Updates the repository if confidence changed significantly.
-     */
+    // Persist verification changes above the confidence threshold.
     public void verifyActiveTunnel() {
         if (activeTunnel == null) return;
         double newConfidence = scanner.verifyTunnel(activeTunnel);

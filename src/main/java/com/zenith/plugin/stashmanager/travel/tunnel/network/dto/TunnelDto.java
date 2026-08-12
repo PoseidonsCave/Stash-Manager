@@ -9,7 +9,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 
-/** JSON transport model for tunnel routes. */
+// JSON transport model for tunnel routes.
 public class TunnelDto {
     public long id = -1;
     public String dimension;

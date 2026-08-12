@@ -21,6 +21,7 @@ public class StashManagerConfig {
     public boolean organizerEnabled = true;
     public int organizerClickCooldownTicks = 3;
     public int organizerOpenTimeoutTicks = 60;
+    public int organizerWalkTimeoutTicks = 400;
     // Minimum loose item count to justify packing into a shulker box
     public int condenseMinItems = 1;
 
@@ -47,30 +48,22 @@ public class StashManagerConfig {
 
     // Bedrock-floor tunnel travel system
     public boolean tunnelsEnabled = true;
-    /** Y level at which horizontal tunnels run (above bedrock, below lava lakes). */
+    // Y level at which horizontal tunnels run (above bedrock, below lava lakes).
     public int tunnelFloorY = 8;
-    /** Automatically scan loaded chunks for pre-existing tunnels. */
+    // Automatically scan loaded chunks for pre-existing tunnels.
     public boolean tunnelScanLoadedChunks = true;
-    /** Dig a new tunnel when no existing route is found. */
+    // Dig a new tunnel when no existing route is found.
     public boolean tunnelBuildWhenNoExisting = true;
-    /** Maximum extra blocks the bot will walk to reach an existing tunnel entry. */
+    // Maximum extra blocks the bot will walk to reach an existing tunnel entry.
     public int tunnelMaxEntryDetour = 500;
 
     // Tunnel network API (generic — targets any compatible REST backend)
     public boolean tunnelNetworkEnabled = false;
     public String tunnelNetworkEndpointUrl = "";
-    /** Auth method: "none", "bearer_token", "api_key", "hmac". */
+    // Auth method: "none", "bearer_token", "api_key", "hmac".
     public String tunnelNetworkAuthMethod = "bearer_token";
     public String tunnelNetworkAuthCredential = "";
     public int tunnelNetworkSyncIntervalMinutes = 30;
     public boolean tunnelNetworkUploadDiscoveries = true;
     public boolean tunnelNetworkDownloadRoutes = true;
-
-    // ── Stealth / operation timing ────────────────────────────────────────────
-    /** Minimum random delay (ticks) added between successive inventory-click operations. */
-    public int stealthClickDelayMinTicks = 1;
-    /** Maximum random delay (ticks) added between successive inventory-click operations. */
-    public int stealthClickDelayMaxTicks = 4;
-    /** Extra pause (ticks) between opening successive containers in a deposit run. 0 = no gap. */
-    public int stealthChestGapTicks = 5;
 }

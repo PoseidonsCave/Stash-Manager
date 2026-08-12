@@ -30,6 +30,11 @@ public class RegionScanner {
 
     // Scan loaded chunks in the pos1-to-pos2 bounding box. Returns containers sorted by distance.
     public List<ContainerLocation> scanRegion(int[] pos1, int[] pos2, int maxContainers) {
+        return scanRegion(pos1, pos2, maxContainers, Set.of());
+    }
+
+    public List<ContainerLocation> scanRegion(int[] pos1, int[] pos2, int maxContainers,
+                                              Set<Long> excludedPositions) {
         int minX = Math.min(pos1[0], pos2[0]);
         int maxX = Math.max(pos1[0], pos2[0]);
         int minY = Math.min(pos1[1], pos2[1]);
@@ -71,6 +76,7 @@ public class RegionScanner {
                         | ((long) worldY & 0xFFFL) << 26
                         | ((long) worldZ & 0x3FFFFFFL);
 
+                    if (excludedPositions != null && excludedPositions.contains(posKey)) continue;
                     if (!seenPositions.add(posKey)) continue;
 
                     containers.add(new ContainerLocation(worldX, worldY, worldZ, be.getType(), cx, cz));

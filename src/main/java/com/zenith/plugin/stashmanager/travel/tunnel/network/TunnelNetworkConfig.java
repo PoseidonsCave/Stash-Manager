@@ -4,7 +4,7 @@ import com.zenith.plugin.stashmanager.StashManagerConfig;
 
 import java.net.URI;
 
-/** Configuration snapshot for the tunnel network sync client. */
+// Configuration snapshot for the tunnel network sync client.
 public final class TunnelNetworkConfig {
 
     public final boolean enabled;

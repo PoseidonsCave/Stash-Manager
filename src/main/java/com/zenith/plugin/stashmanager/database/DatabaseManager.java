@@ -9,10 +9,7 @@ import com.zenith.plugin.stashmanager.travel.tunnel.storage.TunnelRepository;
 import java.sql.*;
 import java.util.*;
 
-/**
- * PostgreSQL persistence layer for container scan data.
- * Uses HikariCP connection pooling for thread-safe, efficient DB access.
- */
+// Persists stash data through a PostgreSQL connection pool.
 public class DatabaseManager implements AutoCloseable {
 
     private HikariDataSource dataSource;
@@ -169,7 +166,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    /** Expose a pooled connection to other repository classes in this package. */
+    // Expose a pooled connection to other repository classes in this package.
     public Connection getConnection() throws SQLException {
         return dataSource.getConnection();
     }
@@ -189,12 +186,8 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Container CRUD ──────────────────────────────────────────────────
-
-    /**
-     * Upsert a container entry. Updates existing entry at the same position,
-     * or inserts a new one.
-     */
+    // Container CRUD
+    // Replace the container at this position atomically.
     public void upsertContainer(ContainerEntry entry) throws SQLException {
         if (!initialized) return;
 
@@ -279,8 +272,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Queries ─────────────────────────────────────────────────────────
-
+    // Queries
     public List<ContainerEntry> getAllContainers() throws SQLException {
         if (!initialized) return Collections.emptyList();
 
@@ -371,10 +363,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    /**
-     * Returns aggregate statistics: total containers, total items, unique item types,
-     * containers by block type, and last scan timestamp.
-     */
+    // Return aggregate container, item, type, and scan statistics.
     public Map<String, Object> getStatistics() throws SQLException {
         Map<String, Object> stats = new LinkedHashMap<>();
         if (!initialized) return stats;
@@ -439,8 +428,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Named Regions ───────────────────────────────────────────────────
-
+    // Named Regions
     public void saveRegion(String name, int[] pos1, int[] pos2) throws SQLException {
         if (!initialized) return;
 
@@ -509,8 +497,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Container Labels ────────────────────────────────────────────────
-
+    // Container Labels
     public void updateLabel(int x, int y, int z, String label) throws SQLException {
         if (!initialized) return;
 
@@ -555,8 +542,7 @@ public class DatabaseManager implements AutoCloseable {
         return labels;
     }
 
-    // ── Config Key-Value Store ──────────────────────────────────────────
-
+    // Config Key-Value Store
     public void setConfig(String key, String value) throws SQLException {
         if (!initialized) return;
 
@@ -591,8 +577,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Storage Chests (Sorting Config) ─────────────────────────────────
-
+    // Storage Chests (Sorting Config)
     public record StorageChestConfig(
         List<int[]> chests,
         Map<String, String> chestTypes,
@@ -652,8 +637,7 @@ public class DatabaseManager implements AutoCloseable {
         return new StorageChestConfig(chests, types, overflow);
     }
 
-    // ── Keep Items ──────────────────────────────────────────────────────
-
+    // Keep Items
     public void saveKeepItems(Collection<String> itemIds) throws SQLException {
         if (!initialized) return;
 
@@ -687,8 +671,7 @@ public class DatabaseManager implements AutoCloseable {
         return result;
     }
 
-    // ── Kits ───────────────────────────────────────────────────────────
-
+    // Kits
     public static final int KIT_MAX_SLOTS = 27;
 
     public static Map<String, Integer> truncateKitItems(Map<String, Integer> items) {
@@ -861,8 +844,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Scan History ────────────────────────────────────────────────────
-
+    // Scan History
     public long recordScanStart(int[] pos1, int[] pos2) throws SQLException {
         if (!initialized) return -1;
 
@@ -906,8 +888,7 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    // ── Helpers ─────────────────────────────────────────────────────────
-
+    // Helpers
     private ContainerEntry buildContainerEntry(Connection conn, ResultSet rs, long containerId) throws SQLException {
         int x = rs.getInt("x");
         int y = rs.getInt("y");

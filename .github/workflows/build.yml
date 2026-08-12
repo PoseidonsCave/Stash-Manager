@@ -57,31 +57,34 @@ jobs:
         uses: gradle/actions/setup-gradle@0723195856401067f7a2779048b490ace7a47d7c # v5
 
       - name: Build Plugin
-        run: ./gradlew --no-daemon build
-
-      - name: Resolve build artifact path
-        run: |
-          jar_path="$(find build/libs -maxdepth 1 -type f -name '*.jar' | head -n 1)"
-          jar_name="$(basename "${jar_path}")"
-          echo "JAR_PATH=${jar_path}" >> "$GITHUB_ENV"
-          echo "JAR_NAME=${jar_name}" >> "$GITHUB_ENV"
+        run: ./gradlew --no-daemon test collectVersionJars
 
       - name: Generate SHA-256 checksum
         working-directory: build/libs
-        run: sha256sum "${{ env.JAR_NAME }}" > "${{ env.JAR_NAME }}.sha256"
+        run: |
+          shopt -s nullglob
+          jars=(./*.jar)
+          if [ "${#jars[@]}" -ne 5 ]; then
+            echo "Expected 5 plugin JARs, found ${#jars[@]}" >&2
+            exit 1
+          fi
+          for jar in "${jars[@]}"; do
+            sha256sum "${jar}" > "${jar}.sha256"
+          done
 
       - name: Attest build provenance
+        if: github.event_name != 'pull_request'
         uses: actions/attest@281a49d4cbb0a72c9575a50d18f6deb515a11deb # v4
         with:
-          subject-path: ${{ env.JAR_PATH }}
+          subject-path: build/libs/*.jar
 
       - name: Upload Plugin Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: stash-manager
           path: |
-            ${{ env.JAR_PATH }}
-            build/libs/${{ env.JAR_NAME }}.sha256
+            build/libs/*.jar
+            build/libs/*.jar.sha256
           if-no-files-found: error
 
   release:
@@ -103,7 +106,17 @@ jobs:
           path: build/libs
 
       - name: Get plugin version
-        run: echo "PLUGIN_VERSION=$(grep '^plugin_version=' gradle.properties | cut -d'=' -f2)" >> $GITHUB_ENV
+        run: echo "PLUGIN_VERSION=$(grep '^plugin_version=' gradle.properties | cut -d'=' -f2)" >> "$GITHUB_ENV"
+
+      - name: Validate manual release source
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "Manual releases must run from the default branch (${DEFAULT_BRANCH})." >&2
+            exit 1
+          fi
 
       - name: Verify tag matches plugin version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -125,7 +138,11 @@ jobs:
           tag="v${PLUGIN_VERSION}"
           assets=(build/libs/*.jar build/libs/*.jar.sha256)
           if gh release view "$tag" >/dev/null 2>&1; then
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              echo "Release ${tag} already exists; manual dispatch will not overwrite it." >&2
+              exit 1
+            fi
             gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" "${assets[@]}" --generate-notes
+            gh release create "$tag" "${assets[@]}" --target "${GITHUB_SHA}" --generate-notes
           fi

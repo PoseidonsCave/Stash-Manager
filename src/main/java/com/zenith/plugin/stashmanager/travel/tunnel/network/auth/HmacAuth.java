@@ -8,7 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Base64;
 
-/** Adds timestamped HMAC headers for request signing. */
+// Adds timestamped HMAC headers for request signing.
 public final class HmacAuth implements AuthProvider {
 
     private final String secret;
