@@ -518,6 +518,8 @@ public class StashManagerModule extends Module {
 
         if (state == ScanState.IDLE || state == ScanState.DONE) return;
 
+        enforceBaritoneBreakingDisabled();
+
         switch (state) {
             case ZONE_SCANNING -> tickZoneScanning();
             case WALKING -> tickWalking();
@@ -553,6 +555,7 @@ public class StashManagerModule extends Module {
         }
 
         if (pendingContainers.isEmpty()) {
+            restoreBaritoneBreaking();
             state = ScanState.DONE;
             info("No containers found in region");
             fireWebhookEvent("scan_empty");
@@ -760,6 +763,7 @@ public class StashManagerModule extends Module {
 
         ContainerLocation next = currentContainer();
         if (next == null) {
+            restoreBaritoneBreaking();
             state = ScanState.DONE;
             return;
         }
@@ -1093,9 +1097,15 @@ public class StashManagerModule extends Module {
     private void saveAndDisableBaritoneBreaking() {
         var pathfinderConfig = CONFIG.client.extra.pathfinder;
         savedAllowBreak = pathfinderConfig.allowBreak;
-        pathfinderConfig.allowBreak = false;
         baritoneConfigSaved = true;
+        enforceBaritoneBreakingDisabled();
         info("Baritone block breaking disabled for scan (was={})", savedAllowBreak);
+    }
+
+    private void enforceBaritoneBreakingDisabled() {
+        if (baritoneConfigSaved) {
+            CONFIG.client.extra.pathfinder.allowBreak = false;
+        }
     }
 
     // Restore Baritone allowBreak.
