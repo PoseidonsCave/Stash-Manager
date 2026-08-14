@@ -2,9 +2,11 @@ package com.zenith.plugin.stashmanager.retriever;
 
 import com.zenith.Proxy;
 import com.zenith.feature.inventory.InventoryActionRequest;
+import com.zenith.feature.inventory.actions.ClickItem;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.inventory.actions.SetHeldItem;
+import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.player.World;
@@ -12,22 +14,24 @@ import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
+import com.zenith.plugin.stashmanager.organizer.lane.FifoLane;
+import com.zenith.plugin.stashmanager.organizer.lane.LaneDetector;
 import com.zenith.plugin.stashmanager.util.BaritoneCompat;
 import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import com.zenith.plugin.stashmanager.util.PathfinderCompat;
 import org.geysermc.mcprotocollib.network.Session;
-import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerActionType;
+import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
-import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClickPacket;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -52,7 +56,10 @@ public final class StashRetriever {
     }
 
     private static final int OPEN_TIMEOUT_TICKS = 60;
-    private static final int CLICK_COOLDOWN_TICKS = 3;
+    // Zenith's own InventoryManager only executes a queued action every actionDelayTicks (5
+    // by default) — submitting faster than that gets silently rejected, so this must stay
+    // at or above that value.
+    private static final int CLICK_COOLDOWN_TICKS = 6;
     private static final int WALK_TIMEOUT_TICKS = 400;
     private static final int MAX_CONSECUTIVE_FAILURES = 4;
 
@@ -85,7 +92,6 @@ public final class StashRetriever {
 
     private volatile boolean containerDataReceived = false;
     private volatile int openContainerId = -1;
-    private volatile int containerStateId = 0;
     private volatile ItemStack[] containerSlots;
     private volatile Session serverSession;
 
@@ -95,6 +101,8 @@ public final class StashRetriever {
     private int unloadShulkerSlot = -1;
     private int unloadChestSlot = -1;
     private int[] placedShulkerPos;
+    private boolean savedPlaceBlockSneak = false;
+    private boolean placeSneakGuardActive = false;
     private ItemData unloadShulkerItemData;
     private PathingRequestFuture unloadPlaceFuture;
     private PathingRequestFuture unloadBreakFuture;
@@ -191,9 +199,17 @@ public final class StashRetriever {
 
         initialRequestedTotal = getRemainingTotal();
 
+        // Prefer a FIFO lane's output chest (oldest stock) over its input chest.
+        Set<Long> laneOutputKeys = new HashSet<>();
+        for (FifoLane lane : LaneDetector.detectLanes(candidates)) {
+            laneOutputKeys.add(posKey(lane.outputPos()[0], lane.outputPos()[1], lane.outputPos()[2]));
+        }
+
         List<ContainerEntry> sorted = new ArrayList<>(candidates);
         sorted.sort(Comparator
             .comparingInt((ContainerEntry e) -> -matchScore(e))
+            .thenComparingInt(e -> directMatchScore(e) > 0 ? 0 : 1)
+            .thenComparingInt(e -> laneOutputKeys.contains(posKey(e.x(), e.y(), e.z())) ? 0 : 1)
             .thenComparingDouble(e -> distanceTo(e.x(), e.y(), e.z())));
 
         for (ContainerEntry entry : sorted) {
@@ -242,7 +258,6 @@ public final class StashRetriever {
     public void onContainerData(Session session, ClientboundContainerSetContentPacket packet) {
         this.serverSession = session;
         this.openContainerId = packet.getContainerId();
-        this.containerStateId = packet.getStateId();
         this.containerSlots = packet.getItems();
         this.containerDataReceived = true;
     }
@@ -313,6 +328,13 @@ public final class StashRetriever {
         if (openWaitTicks > OPEN_TIMEOUT_TICKS) {
             consecutiveFailures++;
             advanceToNextTarget("open_timeout");
+            return;
+        }
+
+        // A single missed right-click (rotation not settled, brief lag, etc.) should not
+        // doom the whole target — retry periodically like tickUnloadOpen does.
+        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+            interactWithTarget();
         }
     }
 
@@ -361,7 +383,10 @@ public final class StashRetriever {
                         return;
                     }
 
-                    quickMoveSlot(actionSlotIndex);
+                    if (!quickMoveSlot(actionSlotIndex)) {
+                        actionCooldown = CLICK_COOLDOWN_TICKS;
+                        return;
+                    }
                     successfulTransfers++;
                     actionSlotIndex++;
                     actionCooldown = CLICK_COOLDOWN_TICKS;
@@ -432,6 +457,10 @@ public final class StashRetriever {
             return;
         }
 
+        // Sneak while placing so the right-click places the shulker instead of opening
+        // whatever interactive block (chest, barrel, etc.) happens to be nearby.
+        setPlaceBlockSneak(unloadPhase == 1);
+
         switch (unloadPhase) {
             case 0 -> tickUnloadLocateAndPrepare();
             case 1 -> tickUnloadPlace();
@@ -444,6 +473,20 @@ public final class StashRetriever {
                 finish(false, "invalid_shulker_phase");
             }
         }
+    }
+
+    private void setPlaceBlockSneak(boolean sneak) {
+        if (!placeSneakGuardActive) {
+            savedPlaceBlockSneak = PathfinderCompat.getPlaceBlockSneak();
+            placeSneakGuardActive = true;
+        }
+        PathfinderCompat.setPlaceBlockSneak(sneak);
+    }
+
+    private void restorePlaceBlockSneak() {
+        if (!placeSneakGuardActive) return;
+        PathfinderCompat.setPlaceBlockSneak(savedPlaceBlockSneak);
+        placeSneakGuardActive = false;
     }
 
     private void tickUnloadLocateAndPrepare() {
@@ -594,7 +637,10 @@ public final class StashRetriever {
                         return;
                     }
 
-                    quickMoveSlot(actionSlotIndex);
+                    if (!quickMoveSlot(actionSlotIndex)) {
+                        actionCooldown = CLICK_COOLDOWN_TICKS;
+                        return;
+                    }
                     successfulTransfers++;
                     remaining.put(itemId, Math.max(0, needed - stack.getAmount()));
                     actionSlotIndex++;
@@ -719,6 +765,7 @@ public final class StashRetriever {
     private void finish(boolean completed, String reason) {
         BARITONE.stop();
         closeCurrentContainer();
+        restorePlaceBlockSneak();
         state = State.DONE;
         resetUnloadState();
         if (completed) {
@@ -748,7 +795,6 @@ public final class StashRetriever {
         successfulTransfers = 0;
         containerDataReceived = false;
         openContainerId = -1;
-        containerStateId = 0;
         containerSlots = null;
         serverSession = null;
         activeRequestName = null;
@@ -821,13 +867,43 @@ public final class StashRetriever {
         return score;
     }
 
+    // Like matchScore, but only counts quantities available loose in the
+    // container itself — not merged-in shulker contents, which require an
+    // extra take-and-unload step. Used to prefer quick direct grabs when
+    // otherwise tied (e.g. a lane's input vs. output chest).
+    private int directMatchScore(ContainerEntry entry) {
+        Map<String, Integer> direct = new HashMap<>(entry.items());
+        for (ContainerEntry.ShulkerDetail sd : entry.shulkerDetails()) {
+            for (var sdEntry : sd.items().entrySet()) {
+                direct.computeIfPresent(sdEntry.getKey(), (k, v) -> {
+                    int remainingAmount = v - sdEntry.getValue();
+                    return remainingAmount > 0 ? remainingAmount : null;
+                });
+            }
+        }
+
+        int score = 0;
+        for (var kv : remaining.entrySet()) {
+            int need = kv.getValue();
+            if (need <= 0) continue;
+            int have = direct.getOrDefault(kv.getKey(), 0);
+            if (have > 0) {
+                score += Math.min(need, have);
+            }
+        }
+        return score;
+    }
+
     private boolean containsWantedContents(ItemStack stack) {
         if (stack == null || stack.getAmount() <= 0) return false;
         String itemId = itemIdFromStack(stack);
         if (!isShulkerBoxItem(itemId)) return false;
 
         for (var entry : ItemIdentifier.readShulkerContents(stack).entrySet()) {
+            // Match by base item id too — a shulker holding an enchanted tool (e.g.
+            // "diamond_pickaxe[fortune]") should still satisfy a plain "diamond_pickaxe" request.
             Integer needed = remaining.get(entry.getKey());
+            if (needed == null) needed = remaining.get(ItemIdentifier.baseItemId(entry.getKey()));
             if (needed != null && needed > 0 && entry.getValue() > 0) {
                 return true;
             }
@@ -887,24 +963,28 @@ public final class StashRetriever {
         return Math.max(0, containerSlots.length - 36);
     }
 
-    private void quickMoveSlot(int slot) {
-        if (serverSession == null || openContainerId < 0) return;
+    // Goes through Zenith's own InventoryManager queue (ShiftClick action) instead of
+    // hand-rolling the raw packet ourselves — that queue builds the packet fresh at actual
+    // execution time (correct action/state id, no off-by-one) and verifies the container id
+    // still matches what's currently open before sending, which our own raw send never did.
+    // Returns false if InventoryManager rejected the submission outright (e.g. a previous
+    // action from this or another owner is still pending) — callers must NOT treat the slot
+    // as handled when this returns false, or progress gets reported without anything moving.
+    private boolean quickMoveSlot(int slot) {
+        if (openContainerId < 0) return false;
 
         try {
-            var packet = new ServerboundContainerClickPacket(
-                openContainerId,
-                containerStateId,
-                slot,
-                ContainerActionType.SHIFT_CLICK_ITEM,
-                ShiftClickItemAction.LEFT_CLICK,
-                null,
-                new Int2ObjectOpenHashMap<>()
-            );
-            serverSession.send(packet);
-            containerStateId++;
+            var future = INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(this)
+                .priority(6000)
+                .actions(new ShiftClick(openContainerId, slot, ShiftClickItemAction.LEFT_CLICK))
+                .build());
+            return !(future.isDone() && !future.isAccepted());
         } catch (Exception ignored) {
+            return false;
         }
     }
+
 
     private boolean hasInventoryRoom() {
         var invCache = CACHE.getPlayerCache().getInventoryCache();
@@ -962,36 +1042,59 @@ public final class StashRetriever {
         return playerContainer.getItemStack(slot);
     }
 
+    // Searches a wide area around the player rather than a small fixed ring, so a spot
+    // further down a packed shelving aisle can still be found even if the immediate
+    // neighbors are all chests; picks the closest valid spot rather than the first found.
     private int[] findShulkerPlaceSpot() {
         int baseX = (int) Math.floor(CACHE.getPlayerCache().getX());
         int baseY = (int) Math.floor(CACHE.getPlayerCache().getY());
         int baseZ = (int) Math.floor(CACHE.getPlayerCache().getZ());
 
-        int[][] offsets = {
-            {1, 0}, {-1, 0}, {0, 1}, {0, -1},
-            {1, 1}, {-1, 1}, {1, -1}, {-1, -1},
-            {2, 0}, {-2, 0}, {0, 2}, {0, -2}
-        };
+        int[] best = null;
+        double bestDistSq = Double.MAX_VALUE;
 
-        for (int[] offset : offsets) {
-            int x = baseX + offset[0];
-            int y = baseY;
-            int z = baseZ + offset[1];
-            if (!World.isInWorldBounds(x, y, z)) continue;
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    if (dx == 0 && dz == 0) continue; // player's own column — never place under/on self
+                    int x = baseX + dx;
+                    int y = baseY + dy;
+                    int z = baseZ + dz;
+                    if (!World.isInWorldBounds(x, y, z)) continue;
 
-            var targetBlock = World.getBlock(x, y, z);
-            var aboveBlock = World.getBlock(x, y + 1, z);
-            var belowBlock = World.getBlock(x, y - 1, z);
-            if (!BlockCompat.canReplace(targetBlock)
-                || !BlockCompat.canReplace(aboveBlock)
-                || BlockCompat.isAir(belowBlock)
-                || !BlockCompat.isSolid(x, y - 1, z)) {
-                continue;
+                    var targetBlock = World.getBlock(x, y, z);
+                    var aboveBlock = World.getBlock(x, y + 1, z);
+                    var belowBlock = World.getBlock(x, y - 1, z);
+                    // Baritone tries every neighboring face (down/south/east/north/west/up) to place
+                    // against, not just the one below — any of them being a container/GUI block
+                    // means a right-click there opens it instead of placing the shulker.
+                    var northBlock = World.getBlock(x, y, z - 1);
+                    var southBlock = World.getBlock(x, y, z + 1);
+                    var eastBlock = World.getBlock(x + 1, y, z);
+                    var westBlock = World.getBlock(x - 1, y, z);
+                    if (!BlockCompat.canReplace(targetBlock)
+                        || !BlockCompat.canReplace(aboveBlock)
+                        || BlockCompat.isAir(belowBlock)
+                        || BlockCompat.isInteractable(belowBlock)
+                        || BlockCompat.isInteractable(northBlock)
+                        || BlockCompat.isInteractable(southBlock)
+                        || BlockCompat.isInteractable(eastBlock)
+                        || BlockCompat.isInteractable(westBlock)
+                        || BlockCompat.isInteractable(aboveBlock)
+                        || !BlockCompat.isSolid(x, y - 1, z)) {
+                        continue;
+                    }
+
+                    double distSq = (double) dx * dx + (double) dy * dy + (double) dz * dz;
+                    if (distSq < bestDistSq) {
+                        bestDistSq = distSq;
+                        best = new int[]{x, y, z};
+                    }
+                }
             }
-            return new int[]{x, y, z};
         }
 
-        return null;
+        return best;
     }
 
     private boolean isShulkerBoxItem(String itemId) {
@@ -1038,21 +1141,8 @@ public final class StashRetriever {
 
         // Step 1: pick up the source stack to cursor
         if (!splitCursorReady) {
-            try {
-                var packet = new ServerboundContainerClickPacket(
-                    openContainerId,
-                    containerStateId,
-                    splitSrcSlot,
-                    ContainerActionType.CLICK_ITEM,
-                    org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.LEFT_CLICK,
-                    null,
-                    new Int2ObjectOpenHashMap<>()
-                );
-                serverSession.send(packet);
-                containerStateId++;
-            } catch (Exception e) {
-                resetSplit();
-                return false;
+            if (!submitClickItem(splitSrcSlot, ClickItemAction.LEFT_CLICK)) {
+                return true;
             }
             splitCursorReady = true;
             return true;
@@ -1060,21 +1150,8 @@ public final class StashRetriever {
 
         // Step 2: right-click source to drop excess back, one item per tick
         if (splitPutbacksLeft > 0) {
-            try {
-                var packet = new ServerboundContainerClickPacket(
-                    openContainerId,
-                    containerStateId,
-                    splitSrcSlot,
-                    ContainerActionType.CLICK_ITEM,
-                    org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.RIGHT_CLICK,
-                    null,
-                    new Int2ObjectOpenHashMap<>()
-                );
-                serverSession.send(packet);
-                containerStateId++;
-            } catch (Exception e) {
-                resetSplit();
-                return false;
+            if (!submitClickItem(splitSrcSlot, ClickItemAction.RIGHT_CLICK)) {
+                return true;
             }
             splitPutbacksLeft--;
             return true;
@@ -1096,44 +1173,36 @@ public final class StashRetriever {
 
         if (dropSlot == -1) {
             // No room. Put cursor back at source as fallback and bail
-            try {
-                var packet = new ServerboundContainerClickPacket(
-                    openContainerId,
-                    containerStateId,
-                    splitSrcSlot,
-                    ContainerActionType.CLICK_ITEM,
-                    org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.LEFT_CLICK,
-                    null,
-                    new Int2ObjectOpenHashMap<>()
-                );
-                serverSession.send(packet);
-                containerStateId++;
-            } catch (Exception ignored) {}
+            submitClickItem(splitSrcSlot, ClickItemAction.LEFT_CLICK);
             resetSplit();
             return true;
         }
 
-        try {
-            var packet = new ServerboundContainerClickPacket(
-                openContainerId,
-                containerStateId,
-                dropSlot,
-                ContainerActionType.CLICK_ITEM,
-                org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction.LEFT_CLICK,
-                null,
-                new Int2ObjectOpenHashMap<>()
-            );
-            serverSession.send(packet);
-            containerStateId++;
-        } catch (Exception e) {
-            resetSplit();
-            return false;
+        if (!submitClickItem(dropSlot, ClickItemAction.LEFT_CLICK)) {
+            return true;
         }
 
         // Record that we took the needed amount
         recordTaken(splitItemId, splitNeeded);
         resetSplit();
         return true;
+    }
+
+    // Submit a CLICK_ITEM action for the split-take state machine and report whether
+    // InventoryManager actually accepted it — a rejected submission must not be treated
+    // as having happened, or the split-take steps advance past clicks that never landed.
+    private boolean submitClickItem(int slot, ClickItemAction action) {
+        try {
+            var future = INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(this)
+                .priority(6000)
+                .actions(new ClickItem(openContainerId, slot, action))
+                .build());
+            return !(future.isDone() && !future.isAccepted());
+        } catch (Exception e) {
+            resetSplit();
+            return false;
+        }
     }
 
     // Begin a partial-take split for a slot whose stack exceeds what we need.
@@ -1255,7 +1324,7 @@ public final class StashRetriever {
                 continue;
             }
 
-            quickMoveSlot(containerSlot);
+            if (!quickMoveSlot(containerSlot)) return true;
             iterator.remove();
             emit("retrieve_owned_shulker_returned", Map.of());
             return true;

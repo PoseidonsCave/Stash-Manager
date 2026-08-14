@@ -3,6 +3,7 @@ package com.zenith.plugin.stashmanager.command;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
+import com.zenith.command.brigadier.ItemArgument;
 import com.zenith.Proxy;
 import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandContext;
@@ -22,13 +23,18 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
 import static com.mojang.brigadier.arguments.StringArgumentType.greedyString;
 import static com.mojang.brigadier.arguments.StringArgumentType.string;
 import static com.zenith.Globals.CACHE;
+import static com.zenith.Globals.DISCORD;
 
 // Main /stash command tree: pos1, pos2, scan, stop, status, list, export, clear, db, config.
 public class StashCommand extends Command {
@@ -66,58 +72,24 @@ public class StashCommand extends Command {
             .usageLines(
                 "pos1 [x y z]",
                 "pos2 [x y z]",
-                "scan",
-                "stop",
-                "return",
-                "status",
-                "summary",
-                "update",
-                "update check",
-                "list [page]",
-                "export",
-                "clear",
-                "clearall",
-                "label <x> <y> <z> <label>",
-                "labels",
-                "region save <name>",
-                "region load <name>",
-                "region list",
-                "region delete <name>",
-                "kit list",
-                "kit show <name>",
-                "kit snapshot <name>",
-                "kit add <name> <item_id> <count>",
-                "kit remove <name> <item_id>",
-                "kit delete <name>",
-                "get <item_id> [count]",
-                "get kit <name>",
-                "get status",
-                "get stop",
-                "organize",
-                "organize stop",
-                "organize status",
-                "db status",
-                "db clear",
-                "config",
-                "config scanDelay <ticks>",
-                "config openTimeout <ticks>",
-                "config maxContainers <count>",
+                "scan / stop / return / status / summary",
+                "update / update check",
+                "list [page] / export / clear / clearall",
+                "debug <recent [count]|clear|export>",
+                "keep <add|remove|list> [count]",
+                "label <x> <y> <z> <label> / labels",
+                "region <save|load|list|delete> [name]",
+                "kit <list|show|snap|delete|add|remove> <name>",
+                "get <item_id> [count] / kit <name> / status / stop",
+                "organize [stop|status]",
+                "db status / db clear",
+                "config <scanDelay|openTimeout|maxContainers|walkTimeout> <value>",
                 "config returnToStart <on|off>",
-                "config db enable/disable",
-                "config db url <jdbc-url>",
-                "config db user <username>",
-                "config db password <password>",
-                "config db poolSize <size>",
-                "config db connect",
-                "config api enable/disable",
-                "config api port <port>",
-                "config api bind <address>",
-                "config api key <key>",
-                "config api start/stop",
-                "config webhook <url>",
-                "config updates",
-                "config updates checkOnLoad <on|off>",
-                "config updates autoDownload <on|off>"
+                "config db <enable|disable|connect>",
+                "config db <url|user|password|poolSize> <value>",
+                "config api <enable|disable|start|stop>",
+                "config api <port|bind|key> <value>",
+                "config updates [checkOnLoad|autoDownload <on|off>]"
             )
             .aliases("sm")
             .build();
@@ -368,6 +340,135 @@ public class StashCommand extends Command {
                         .successColor();
                     return OK;
                 })
+            )
+            .then(literal("debug")
+                .then(literal("recent")
+                    .executes(c -> {
+                        sendRecentDebugEvents(c.getSource(), 20);
+                        return OK;
+                    })
+                    .then(argument("count", integer(1, 100))
+                        .executes(c -> {
+                            sendRecentDebugEvents(c.getSource(), IntegerArgumentType.getInteger(c, "count"));
+                            return OK;
+                        })))
+                .then(literal("clear")
+                    .executes(c -> {
+                        int count = module.getDebugRecorder().size();
+                        module.getDebugRecorder().clear();
+                        c.getSource().getEmbed()
+                            .title("Debug Log Cleared")
+                            .description("Removed " + count + " recorded debug event(s).")
+                            .successColor();
+                        return OK;
+                    }))
+                .then(literal("export")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed();
+                        var recorder = module.getDebugRecorder();
+                        int count = recorder.size();
+                        if (count == 0) {
+                            embed.title("Debug Export Failed")
+                                .description("No debug events recorded — nothing to export.")
+                                .errorColor();
+                            return OK;
+                        }
+                        byte[] text = recorder.exportText();
+                        embed.title("Debug Log Export")
+                            .description("Exported " + count + " debug event(s).")
+                            .successColor()
+                            .fileAttachment(new com.zenith.discord.Embed.FileAttachment("stash_debug.log", text));
+                        return OK;
+                    }))
+            )
+            .then(literal("keep")
+                .then(literal("add")
+                    .then(argument("item_id", ItemArgument.item())
+                        .executes(c -> {
+                            String itemId = ItemArgument.getItem(c, "item_id").name();
+                            var embed = c.getSource().getEmbed();
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Keep Item Failed").description("Database not connected.").errorColor();
+                                return OK;
+                            }
+                            try {
+                                var keepItems = new LinkedHashMap<>(database.loadKeepItems());
+                                boolean added = !keepItems.containsKey(itemId);
+                                keepItems.put(itemId, null);
+                                database.saveKeepItems(keepItems);
+                                embed.title(added ? "Keep Item Added" : "Already Kept")
+                                    .description("**" + itemId + "** — all of it will stay in the bot's inventory during organize.")
+                                    .successColor();
+                            } catch (Exception e) {
+                                embed.title("Keep Item Failed").description("Error: " + e.getMessage()).errorColor();
+                            }
+                            return OK;
+                        })
+                        .then(argument("count", integer(1, 10000))
+                            .executes(c -> {
+                                String itemId = ItemArgument.getItem(c, "item_id").name();
+                                int count = IntegerArgumentType.getInteger(c, "count");
+                                var embed = c.getSource().getEmbed();
+                                if (database == null || !database.isInitialized()) {
+                                    embed.title("Keep Item Failed").description("Database not connected.").errorColor();
+                                    return OK;
+                                }
+                                try {
+                                    var keepItems = new LinkedHashMap<>(database.loadKeepItems());
+                                    boolean added = !keepItems.containsKey(itemId);
+                                    keepItems.put(itemId, count);
+                                    database.saveKeepItems(keepItems);
+                                    embed.title(added ? "Keep Item Added" : "Keep Quantity Updated")
+                                        .description("Up to **" + count + "x " + itemId + "** will stay in the bot's inventory during organize — any excess gets deposited.")
+                                        .successColor();
+                                } catch (Exception e) {
+                                    embed.title("Keep Item Failed").description("Error: " + e.getMessage()).errorColor();
+                                }
+                                return OK;
+                            }))))
+                .then(literal("remove")
+                    .then(argument("item_id", ItemArgument.item())
+                        .executes(c -> {
+                            String itemId = ItemArgument.getItem(c, "item_id").name();
+                            var embed = c.getSource().getEmbed();
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Keep Item Failed").description("Database not connected.").errorColor();
+                                return OK;
+                            }
+                            try {
+                                var keepItems = new LinkedHashMap<>(database.loadKeepItems());
+                                boolean removed = keepItems.containsKey(itemId);
+                                keepItems.remove(itemId);
+                                database.saveKeepItems(keepItems);
+                                embed.title(removed ? "Keep Item Removed" : "Not Kept")
+                                    .description("**" + itemId + "** " + (removed ? "will now be eligible to deposit during organize." : "wasn't on the keep list."))
+                                    .successColor();
+                            } catch (Exception e) {
+                                embed.title("Keep Item Failed").description("Error: " + e.getMessage()).errorColor();
+                            }
+                            return OK;
+                        })))
+                .then(literal("list")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed();
+                        if (database == null || !database.isInitialized()) {
+                            embed.title("Keep List Failed").description("Database not connected.").errorColor();
+                            return OK;
+                        }
+                        try {
+                            var keepItems = database.loadKeepItems();
+                            embed.title("Keep List")
+                                .description(keepItems.isEmpty()
+                                    ? "No items configured — organize will deposit everything from inventory."
+                                    : keepItems.entrySet().stream()
+                                        .map(e -> e.getValue() == null ? e.getKey() + " (all)" : e.getKey() + " (up to " + e.getValue() + ")")
+                                        .collect(Collectors.joining("\n")))
+                                .primaryColor();
+                        } catch (Exception e) {
+                            embed.title("Keep List Failed").description("Error: " + e.getMessage()).errorColor();
+                        }
+                        return OK;
+                    }))
             )
             .then(literal("summary")
                 .executes(c -> {
@@ -1185,6 +1286,44 @@ public class StashCommand extends Command {
         return pos[0] + ", " + pos[1] + ", " + pos[2];
     }
 
+    // Discord embed descriptions have a real size limit far beyond Zenith's own
+    // 1024-char help threshold, but a wall of debug events can still exceed it —
+    // split across multiple messages instead of cramming everything into one.
+    private static final int DEBUG_CHUNK_CHAR_BUDGET = 3800;
+
+    private void sendRecentDebugEvents(CommandContext source, int limit) {
+        var recent = module.getDebugRecorder().recent(limit);
+        if (recent.isEmpty()) {
+            source.getEmbed().title("Recent Debug Events").description("No recent debug events.");
+            return;
+        }
+
+        List<String> chunks = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        for (var event : recent) {
+            String line = event.timestamp() + " | " + event.stage() + " | " + event.detail();
+            if (!current.isEmpty() && current.length() + line.length() + 1 > DEBUG_CHUNK_CHAR_BUDGET) {
+                chunks.add(current.toString());
+                current = new StringBuilder();
+            }
+            if (!current.isEmpty()) current.append('\n');
+            current.append(line);
+        }
+        if (!current.isEmpty()) chunks.add(current.toString());
+
+        for (int i = 0; i < chunks.size(); i++) {
+            String title = chunks.size() > 1
+                ? "Recent Debug Events (" + (i + 1) + "/" + chunks.size() + ")"
+                : "Recent Debug Events";
+            if (i == 0) {
+                source.getEmbed().title(title).description(chunks.get(i));
+            } else {
+                var embed = com.zenith.discord.Embed.builder().title(title).description(chunks.get(i));
+                DISCORD.sendEmbedMessage(embed);
+            }
+        }
+    }
+
     // Config Subtree
     private LiteralArgumentBuilder<CommandContext> buildConfigSubtree() {
         return literal("config")
@@ -1198,6 +1337,8 @@ public class StashCommand extends Command {
                 embed.addField("Scan Delay", config.scanDelayTicks + " ticks", true);
                 embed.addField("Open Timeout", config.openTimeoutTicks + " ticks", true);
                 embed.addField("Max Containers", String.valueOf(config.maxContainers), true);
+                embed.addField("Organizer Walk Timeout", config.organizerWalkTimeoutTicks + " ticks ("
+                    + (config.organizerWalkTimeoutTicks / 20) + "s)", true);
                 embed.addField("Waypoint Distance", String.valueOf(config.waypointDistance), true);
                 embed.addField("Return to Start", config.returnToStart ? "Enabled" : "Disabled", true);
 
@@ -1214,9 +1355,6 @@ public class StashCommand extends Command {
                 embed.addField("API Threads", String.valueOf(config.apiThreads), true);
                 embed.addField("API Key", config.apiKey.isBlank() ? "(none)" : "****" + config.apiKey.substring(Math.max(0, config.apiKey.length() - 4)), true);
                 embed.addField("API Running", String.valueOf(apiServer != null && apiServer.isRunning()), true);
-
-                // Webhook
-                embed.addField("Webhook URL", config.webhookUrl.isBlank() ? "(none)" : config.webhookUrl, false);
 
                 // Updates
                 embed.addField("Update Check On Load", String.valueOf(config.updateCheckOnLoad), true);
@@ -1269,6 +1407,19 @@ public class StashCommand extends Command {
                         c.getSource().getEmbed()
                             .title("Config Updated")
                             .description("maxContainers = " + config.maxContainers)
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("walkTimeout")
+                .then(argument("ticks", integer(20, 12000))
+                    .executes(c -> {
+                        config.organizerWalkTimeoutTicks = IntegerArgumentType.getInteger(c, "ticks");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("organizerWalkTimeoutTicks = " + config.organizerWalkTimeoutTicks
+                                + " (" + (config.organizerWalkTimeoutTicks / 20) + "s)")
                             .successColor();
                         return OK;
                     })
@@ -1513,35 +1664,6 @@ public class StashCommand extends Command {
                         c.getSource().getEmbed()
                             .title("API Server Stopped")
                             .successColor();
-                        return OK;
-                    })
-                )
-            )
-            // Webhook settings
-            .then(literal("webhook")
-                .executes(c -> {
-                    c.getSource().getEmbed()
-                        .title("Webhook Configuration")
-                        .addField("URL", config.webhookUrl.isBlank() ? "(none)" : config.webhookUrl, false)
-                        .primaryColor();
-                    return OK;
-                })
-                .then(argument("url", greedyString())
-                    .executes(c -> {
-                        String url = StringArgumentType.getString(c, "url");
-                        if (url.equalsIgnoreCase("off") || url.equalsIgnoreCase("none") || url.equalsIgnoreCase("clear")) {
-                            config.webhookUrl = "";
-                            c.getSource().getEmbed()
-                                .title("Config Updated")
-                                .description("Webhook URL cleared.")
-                                .successColor();
-                        } else {
-                            config.webhookUrl = url;
-                            c.getSource().getEmbed()
-                                .title("Config Updated")
-                                .description("Webhook URL = " + config.webhookUrl)
-                                .successColor();
-                        }
                         return OK;
                     })
                 )

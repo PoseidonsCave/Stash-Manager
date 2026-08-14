@@ -310,6 +310,11 @@ This shows the connection state and how many containers/items are stored.
 - **Faster searches** — `stashsearch` queries the database instead of scanning memory
 - **History** — `scan_history` table tracks every scan run with timestamps and counts
 - **Bulk export** — `stash export` pulls from the database for complete CSV dumps
+- **Stable organize layout** — once the database is enabled, the organizer remembers which
+  column each item type was assigned to and reuses it on future `stash organize` runs instead
+  of recomputing (and potentially reshuffling) assignments from scratch. Without a configured
+  database this falls back to in-memory-only assignment for that session, so persistent stash
+  organization is on the end user to set up (see Database Setup below) if you want it.
 
 ### Database tables (created automatically)
 
@@ -322,6 +327,7 @@ This shows the connection state and how many containers/items are stored.
 | `config` | Key-value plugin configuration pairs |
 | `storage_chests` | Registered supply chest positions |
 | `keep_items` | Items the organizer should leave in place |
+| `column_assignments` | Item type -> assigned organize column (top chest position), kept stable across runs |
 
 ---
 

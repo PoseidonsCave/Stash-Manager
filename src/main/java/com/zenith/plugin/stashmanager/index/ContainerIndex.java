@@ -1,6 +1,8 @@
 package com.zenith.plugin.stashmanager.index;
 
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
+import com.zenith.plugin.stashmanager.organizer.lane.FifoLane;
+import com.zenith.plugin.stashmanager.organizer.lane.LaneDetector;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -18,6 +20,15 @@ public class ContainerIndex {
     }
 
     public void put(ContainerEntry entry) {
+        // Rescans never carry a label of their own — preserve whatever label
+        // (manual or auto-assigned) was already set for this position.
+        if (entry.label() == null) {
+            ContainerEntry existing = entries.get(entry.posKey());
+            if (existing != null && existing.label() != null) {
+                entry = entry.withLabel(existing.label());
+            }
+        }
+
         entries.put(entry.posKey(), entry);
         lastScanTimestamp = System.currentTimeMillis();
 
@@ -155,11 +166,18 @@ public class ContainerIndex {
             .mapToInt(ContainerEntry::shulkerCount).sum();
         int doubleChests = (int) entries.values().stream()
             .filter(ContainerEntry::isDouble).count();
+        int fifoLanes = detectFifoLanes().size();
 
         return entries.size() + " containers (" + doubleChests + " double chests), "
             + totalItems + " items, "
             + totalTypes + " types, "
-            + totalShulkers + " shulker boxes";
+            + totalShulkers + " shulker boxes, "
+            + fifoLanes + " FIFO lanes";
+    }
+
+    // Detect chest -> hopper -> chest FIFO lanes from the current index contents.
+    public List<FifoLane> detectFifoLanes() {
+        return LaneDetector.detectLanes(entries.values());
     }
 
     // Time since last scan as a human-readable string.

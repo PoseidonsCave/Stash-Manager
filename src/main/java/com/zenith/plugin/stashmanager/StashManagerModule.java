@@ -2,15 +2,18 @@ package com.zenith.plugin.stashmanager;
 
 import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
+import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
+import com.zenith.plugin.stashmanager.debug.DebugRecorder;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
 import com.zenith.plugin.stashmanager.retriever.StashRetriever;
@@ -23,11 +26,6 @@ import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
 import org.jspecify.annotations.Nullable;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -96,6 +94,9 @@ public class StashManagerModule extends Module {
     // Tunnel network sync
     private final SyncWorker tunnelNetworkSyncWorker;
 
+    // Exportable troubleshooting log (see /stash debug)
+    private final DebugRecorder debugRecorder = new DebugRecorder();
+
     public StashManagerModule(StashManagerConfig config, ContainerIndex index) {
         this.config = config;
         this.index = index;
@@ -124,6 +125,10 @@ public class StashManagerModule extends Module {
 
     public StashRetriever getRetriever() {
         return retriever;
+    }
+
+    public DebugRecorder getDebugRecorder() {
+        return debugRecorder;
     }
 
     @Override
@@ -287,6 +292,7 @@ public class StashManagerModule extends Module {
             entries = database.getAllContainers();
         } catch (Exception e) {
             warn("Cannot start retrieval: failed to load containers from database: {}", e.getMessage());
+            debugRecorder.record("retrieve_start_db_error", "Failed to load containers from database", e);
             fireWebhookEvent("retrieve_start_db_error", Map.of(
                 "request_name", requestName,
                 "message", e.getMessage()
@@ -322,6 +328,7 @@ public class StashManagerModule extends Module {
                 }
             } catch (Exception e) {
                 warn("Failed to load reserved storage chests: {}", e.getMessage());
+                debugRecorder.record("reserved_chests_load_failed", "Failed to load reserved storage chests", e);
             }
         }
         return reserved;
@@ -344,8 +351,7 @@ public class StashManagerModule extends Module {
         String blocker = getScanStartBlocker();
         if (blocker != null) {
             warn("Cannot start scan: {}", blocker);
-            fireWebhookEvent("scan_start_blocked",
-                "\"reason\":" + jsonString(blocker));
+            fireWebhookEvent("scan_start_blocked", Map.of("reason", blocker));
             return false;
         }
 
@@ -372,8 +378,8 @@ public class StashManagerModule extends Module {
                 currentScanId = database.recordScanStart(config.pos1, config.pos2);
             } catch (Exception e) {
                 warn("Failed to record scan start in database: {}", e.getMessage());
-                fireWebhookEvent("scan_start_db_error",
-                    "\"message\":" + jsonString(e.getMessage()));
+                debugRecorder.record("scan_start_db_error", "Failed to record scan start", e);
+                fireWebhookEvent("scan_start_db_error", Map.of("message", e.getMessage()));
             }
         }
 
@@ -398,11 +404,22 @@ public class StashManagerModule extends Module {
         restoreBaritoneBreaking();
         finishScanAfterReturn = false;
 
+        // Close out the scan_history row with partial counts so it doesn't stay
+        // stuck at completed_at=NULL forever (a rescan will still safely
+        // overwrite any already-indexed containers via ON CONFLICT upsert).
+        if (database != null && database.isInitialized() && currentScanId >= 0) {
+            try {
+                database.recordScanComplete(currentScanId, containersFound, containersIndexed, containersFailed);
+            } catch (Exception e) {
+                warn("Failed to record scan abort in database: {}", e.getMessage());
+                debugRecorder.record("scan_abort_db_error", "Failed to record scan abort", e);
+            }
+        }
+
         state = ScanState.IDLE;
         info("Scan aborted. Found={}, Indexed={}, Failed={}",
             containersFound, containersIndexed, containersFailed);
-        fireWebhookEvent("scan_aborted",
-            "\"reason\":" + jsonString(reason));
+        fireWebhookEvent("scan_aborted", Map.of("reason", reason));
     }
 
     // Return to recorded start position. Returns true if nav started.
@@ -410,8 +427,7 @@ public class StashManagerModule extends Module {
         String blocker = getReturnToStartBlocker();
         if (blocker != null) {
             warn("Cannot return to start: {}", blocker);
-            fireWebhookEvent("return_to_start_blocked",
-                "\"reason\":" + jsonString(blocker));
+            fireWebhookEvent("return_to_start_blocked", Map.of("reason", blocker));
             return false;
         }
         info("Returning to starting position: {}, {}, {}",
@@ -419,8 +435,8 @@ public class StashManagerModule extends Module {
         BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
         state = ScanState.RETURNING;
         finishScanAfterReturn = false;
-        fireWebhookEvent("return_to_start_started",
-            "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+        fireWebhookEvent("return_to_start_started", Map.of("start_position",
+            String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
         return true;
     }
 
@@ -594,9 +610,9 @@ public class StashManagerModule extends Module {
         if (walkingTickCount >= WALK_TIMEOUT_TICKS) {
             warn("Walking timeout for container at {} (dist={})",
                 currentContainerPos(), String.format("%.1f", dist));
-            fireWebhookEvent("container_walk_timeout",
-                "\"container\":" + jsonString(currentContainerPos())
-                    + ",\"distance\":" + jsonString(String.format("%.1f", dist)));
+            fireWebhookEvent("container_walk_timeout", Map.of(
+                "container", currentContainerPos(),
+                "distance", String.format("%.1f", dist)));
             BARITONE.stop();
             containersFailed++;
             advanceToNextContainer();
@@ -614,10 +630,10 @@ public class StashManagerModule extends Module {
             } else {
                 warn("Failed to reach container at {}, {}, {} after {} attempts (dist={})",
                     target.x(), target.y(), target.z(), MAX_WALK_RETRIES, String.format("%.1f", dist));
-                fireWebhookEvent("container_unreachable",
-                    "\"container\":" + jsonString(target.x() + ", " + target.y() + ", " + target.z())
-                        + ",\"distance\":" + jsonString(String.format("%.1f", dist))
-                        + ",\"attempts\":" + MAX_WALK_RETRIES);
+                fireWebhookEvent("container_unreachable", Map.of(
+                    "container", target.x() + ", " + target.y() + ", " + target.z(),
+                    "distance", String.format("%.1f", dist),
+                    "attempts", MAX_WALK_RETRIES));
                 containersFailed++;
                 advanceToNextContainer();
             }
@@ -636,9 +652,9 @@ public class StashManagerModule extends Module {
 
         if (openTimeoutCounter >= config.openTimeoutTicks) {
             warn("Timeout waiting for container open at {}", currentContainerPos());
-            fireWebhookEvent("container_open_timeout",
-                "\"container\":" + jsonString(currentContainerPos())
-                    + ",\"timeout_ticks\":" + config.openTimeoutTicks);
+            fireWebhookEvent("container_open_timeout", Map.of(
+                "container", currentContainerPos(),
+                "timeout_ticks", config.openTimeoutTicks));
             containersFailed++;
             closeCurrentContainer();
             advanceToNextContainer();
@@ -665,8 +681,7 @@ public class StashManagerModule extends Module {
         } else {
             containersFailed++;
             warn("Failed to read container at {}", currentContainerPos());
-            fireWebhookEvent("container_read_failed",
-                "\"container\":" + jsonString(currentContainerPos()));
+            fireWebhookEvent("container_read_failed", Map.of("container", currentContainerPos()));
         }
 
         state = ScanState.CLOSING;
@@ -705,17 +720,17 @@ public class StashManagerModule extends Module {
                 info("Returned to starting position: {}, {}, {}",
                     String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
                 inGameAlert("<green>Returned to starting position.</green>");
-                fireWebhookEvent("returned_to_start",
-                    "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+                fireWebhookEvent("returned_to_start", Map.of("start_position",
+                    String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 notifications.sendReturnToStartCompleted(startX, startY, startZ);
             } else {
                 warn("Could not reach starting position (dist={}). Finishing scan.",
                     String.format("%.1f", dist));
                 inGameAlert("<yellow>Could not reach starting position</yellow> <gray>(dist="
                     + String.format("%.1f", dist) + "). Finishing scan.</gray>");
-                fireWebhookEvent("return_to_start_failed",
-                    "\"distance\":" + jsonString(String.format("%.1f", dist))
-                        + ",\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+                fireWebhookEvent("return_to_start_failed", Map.of(
+                    "distance", String.format("%.1f", dist),
+                    "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 notifications.sendReturnToStartFailed(startX, startY, startZ, dist);
             }
 
@@ -752,8 +767,8 @@ public class StashManagerModule extends Module {
                 BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
                 state = ScanState.RETURNING;
                 finishScanAfterReturn = true;
-                fireWebhookEvent("return_to_start_started",
-                    "\"start_position\":" + jsonString(String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+                fireWebhookEvent("return_to_start_started", Map.of("start_position",
+                    String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 return;
             }
 
@@ -923,12 +938,18 @@ public class StashManagerModule extends Module {
                 database.recordScanComplete(currentScanId, containersFound, containersIndexed, containersFailed);
             } catch (Exception e) {
                 warn("Failed to record scan completion in database: {}", e.getMessage());
+                debugRecorder.record("scan_complete_db_error", "Failed to record scan completion", e);
             }
         }
 
         // Fire webhook notification
         fireWebhookEvent("scan_complete");
         notifications.sendScanFinished(containersFound, containersIndexed, containersFailed);
+
+        int fifoLanes = index.detectFifoLanes().size();
+        if (fifoLanes > 0) {
+            info("Detected {} FIFO lane(s) (chest -> hopper -> chest).", fifoLanes);
+        }
 
         state = ScanState.DONE;
         info("Scan complete. Found={}, Indexed={}, Failed={}",
@@ -942,78 +963,51 @@ public class StashManagerModule extends Module {
     }
 
     public void fireWebhookEvent(String event, @Nullable Map<String, Object> extraFields) {
-        if (extraFields == null || extraFields.isEmpty()) {
-            fireWebhookEvent(event, (String) null);
-            return;
-        }
+        var embed = Embed.builder()
+            .title(formatEventTitle(event));
+        if (isFailureEvent(event)) embed.errorColor();
+        else if (isSuccessEvent(event)) embed.successColor();
+        else embed.primaryColor();
 
-        StringBuilder extraJson = new StringBuilder();
-        boolean first = true;
-        for (var entry : extraFields.entrySet()) {
-            if (!first) extraJson.append(',');
-            first = false;
-            extraJson.append(jsonString(entry.getKey())).append(':').append(toJsonValue(entry.getValue()));
-        }
-        fireWebhookEvent(event, extraJson.toString());
-    }
-
-    private void fireWebhookEvent(String event, @Nullable String extraJsonFields) {
-        if (config.webhookUrl == null || config.webhookUrl.isBlank()) return;
-
-        try {
-            StringBuilder json = new StringBuilder("{")
-                .append("\"event\":").append(jsonString(event)).append(',')
-                .append("\"scan_state\":").append(jsonString(state.name())).append(',')
-                .append("\"containers_found\":").append(containersFound).append(',')
-                .append("\"containers_indexed\":").append(containersIndexed).append(',')
-                .append("\"containers_failed\":").append(containersFailed);
-
-            if (extraJsonFields != null && !extraJsonFields.isBlank()) {
-                json.append(',').append(extraJsonFields);
+        if (extraFields != null) {
+            for (var entry : extraFields.entrySet()) {
+                embed.addField(formatEventTitle(entry.getKey()), String.valueOf(entry.getValue()), true);
             }
-
-            json.append(',')
-                .append("\"timestamp\":").append(System.currentTimeMillis())
-                .append('}');
-
-            HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .build();
-
-            HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(config.webhookUrl))
-                .header("Content-Type", "application/json")
-                .timeout(Duration.ofSeconds(10))
-                .POST(HttpRequest.BodyPublishers.ofString(json.toString()))
-                .build();
-
-            client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                .thenAccept(resp -> debug("Webhook response: {} {}", resp.statusCode(), resp.body()))
-                .exceptionally(e -> {
-                    warn("Webhook failed: {}", e.getMessage());
-                    return null;
-                });
-        } catch (Exception e) {
-            warn("Failed to fire webhook: {}", e.getMessage());
         }
+        DISCORD.sendEmbedMessage(embed);
     }
 
-    private String toJsonValue(@org.jspecify.annotations.Nullable Object value) {
-        if (value == null) return "null";
-        if (value instanceof Number || value instanceof Boolean) return String.valueOf(value);
-        return jsonString(String.valueOf(value));
+    private static boolean isFailureEvent(String event) {
+        return event.endsWith("_failed") || event.endsWith("_blocked") || event.endsWith("_error")
+            || event.endsWith("_timeout") || event.endsWith("_miss") || event.endsWith("_rejected")
+            || event.endsWith("_aborted") || event.contains("unreachable");
     }
 
-    private String jsonString(String value) {
-        return "\"" + escapeJson(value) + "\"";
+    private static boolean isSuccessEvent(String event) {
+        return event.endsWith("_complete") || event.endsWith("_completed") || event.endsWith("_started")
+            || event.endsWith("_saved") || event.endsWith("_updated") || event.endsWith("_removed")
+            || event.endsWith("_deleted") || event.startsWith("returned_");
     }
 
-    private String escapeJson(String value) {
-        return value
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r");
+    private static String formatEventTitle(String event) {
+        String[] parts = event.split("_");
+        StringBuilder sb = new StringBuilder();
+        for (String part : parts) {
+            if (part.isEmpty()) continue;
+            if (!sb.isEmpty()) sb.append(' ');
+            sb.append(Character.toUpperCase(part.charAt(0))).append(part.substring(1));
+        }
+        return sb.toString();
+    }
+
+    private static String formatPayloadDetail(@Nullable Map<String, Object> payload) {
+        if (payload == null || payload.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (var entry : payload.entrySet()) {
+            if (!sb.isEmpty()) sb.append(", ");
+            sb.append(entry.getKey()).append('=').append(entry.getValue());
+        }
+        return sb.toString();
     }
 
     private void resetScanState() {
@@ -1035,6 +1029,11 @@ public class StashManagerModule extends Module {
 
     private void handleAutomationEvent(String event, Map<String, Object> payload) {
         fireWebhookEvent(event, payload);
+        // Organizer/retriever failures (pathfinding, shulker open/close/break, etc.) only ever
+        // reached Discord via fireWebhookEvent above — the debug recorder never saw them.
+        if (isFailureEvent(event)) {
+            debugRecorder.record(event, formatPayloadDetail(payload));
+        }
         switch (event) {
             case "retrieve_completed" -> notifications.sendRetrievalFinished(
                 stringValue(payload, "request_name"),

@@ -19,9 +19,14 @@ public class StashManagerConfig {
 
     // Organizer
     public boolean organizerEnabled = true;
-    public int organizerClickCooldownTicks = 3;
+    // Zenith's own InventoryManager only executes a queued action every actionDelayTicks (5
+    // by default) — submitting faster than that gets silently rejected, so this must stay
+    // at or above that value.
+    public int organizerClickCooldownTicks = 6;
     public int organizerOpenTimeoutTicks = 60;
-    public int organizerWalkTimeoutTicks = 400;
+    // Dense shelving/silo layouts can need well over 20s for Baritone to compute+execute a
+    // path without block-breaking rights — raised from 400 after repeated real-world timeouts.
+    public int organizerWalkTimeoutTicks = 1200;
     // Minimum loose item count to justify packing into a shulker box
     public int condenseMinItems = 1;
 
@@ -38,9 +43,6 @@ public class StashManagerConfig {
     public int apiPort = 8585;
     public int apiThreads = 2;
     public String apiKey = "";
-
-    // Webhook (n8n, etc.) — POST JSON on scan completion
-    public String webhookUrl = "";
 
     // Plugin updates
     public boolean updateCheckOnLoad = true;

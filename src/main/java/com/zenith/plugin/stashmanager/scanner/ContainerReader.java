@@ -32,12 +32,15 @@ public class ContainerReader {
         }
 
         int size = open.getSize();
+        // The open window includes the player's own 36 inventory+hotbar slots appended
+        // after the container's own slots — exclude them or every scan attributes
+        // whatever the bot happens to be carrying to every container it opens.
+        int containerSlotCount = Math.max(0, size - 36);
         Map<String, Integer> items = new LinkedHashMap<>();
         int shulkerCount = 0;
         var shulkerDetails = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
 
-        // Read each slot in the container (excluding player inventory slots)
-        for (int slot = 0; slot < size; slot++) {
+        for (int slot = 0; slot < containerSlotCount; slot++) {
             ItemStack stack = open.getItemStack(slot);
             if (stack == null || stack.getId() == 0 || stack.getAmount() <= 0) continue;
 
@@ -59,6 +62,7 @@ public class ContainerReader {
         }
 
         String blockType = blockEntityTypeToId(location.type());
+        String hopperFacing = location.hopperFacing() != null ? location.hopperFacing().name() : null;
 
         ContainerEntry containerEntry = new ContainerEntry(
             location.x(), location.y(), location.z(),
@@ -67,7 +71,9 @@ public class ContainerReader {
             items,
             shulkerCount,
             shulkerDetails,
-            System.currentTimeMillis()
+            System.currentTimeMillis(),
+            null,
+            hopperFacing
         );
 
         index.put(containerEntry);

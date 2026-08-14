@@ -1,7 +1,11 @@
 package com.zenith.plugin.stashmanager.scanner;
 
 import com.zenith.cache.data.chunk.Chunk;
+import com.zenith.feature.player.World;
+import com.zenith.mc.block.Direction;
+import com.zenith.mc.block.properties.api.BlockStateProperties;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
+import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -21,7 +25,8 @@ public class RegionScanner {
     public record ContainerLocation(
         int x, int y, int z,
         BlockEntityType type,
-        int chunkX, int chunkZ
+        int chunkX, int chunkZ,
+        @Nullable Direction hopperFacing
     ) {
         public long posKey() {
             return ((long) x & 0x3FFFFFFL) << 38 | ((long) y & 0xFFFL) << 26 | ((long) z & 0x3FFFFFFL);
@@ -79,7 +84,11 @@ public class RegionScanner {
                     if (excludedPositions != null && excludedPositions.contains(posKey)) continue;
                     if (!seenPositions.add(posKey)) continue;
 
-                    containers.add(new ContainerLocation(worldX, worldY, worldZ, be.getType(), cx, cz));
+                    Direction hopperFacing = be.getType() == BlockEntityType.HOPPER
+                        ? World.getBlockState(worldX, worldY, worldZ).getProperty(BlockStateProperties.FACING_HOPPER)
+                        : null;
+
+                    containers.add(new ContainerLocation(worldX, worldY, worldZ, be.getType(), cx, cz, hopperFacing));
 
                     if (containers.size() >= maxContainers) {
                         return sortByPlayerDistance(containers);

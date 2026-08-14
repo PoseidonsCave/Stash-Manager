@@ -5,6 +5,7 @@ import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.inventory.actions.SetHeldItem;
+import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.player.World;
@@ -12,20 +13,20 @@ import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
+import com.zenith.plugin.stashmanager.StashManagerPlugin;
 import com.zenith.plugin.stashmanager.util.BaritoneCompat;
 import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.util.PathfinderCompat;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
-import org.geysermc.mcprotocollib.protocol.data.game.inventory.ContainerActionType;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
-import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClickPacket;
 import org.geysermc.mcprotocollib.network.Session;
 
+import java.sql.SQLException;
 import java.util.*;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
@@ -88,9 +89,12 @@ public final class StashOrganizer {
     }
 
     // Move Tasks
-    record MoveTask(int[] source, int[] destination, String itemId, String shulkerContentFilter) {
+    record MoveTask(int[] source, int[] destination, String itemId, String shulkerContentFilter, boolean alreadyInInventory) {
         MoveTask(int[] source, int[] destination, String itemId) {
-            this(source, destination, itemId, null);
+            this(source, destination, itemId, null, false);
+        }
+        MoveTask(int[] source, int[] destination, String itemId, String shulkerContentFilter) {
+            this(source, destination, itemId, shulkerContentFilter, false);
         }
     }
 
@@ -133,6 +137,8 @@ public final class StashOrganizer {
     private boolean consolidationMode = false;
     private boolean savedAllowBreak = true;
     private boolean baritoneBreakingGuardActive = false;
+    private boolean savedPlaceBlockSneak = false;
+    private boolean placeSneakGuardActive = false;
 
     // Shulker Packing State
     private String packItemId;
@@ -157,7 +163,6 @@ public final class StashOrganizer {
     // Set by module packet handler on container open
     private volatile boolean containerDataReceived = false;
     private volatile int openContainerId = -1;
-    private volatile int containerStateId = 0;
     private volatile ItemStack[] containerSlots;
     private volatile Session serverSession;
 
@@ -216,6 +221,7 @@ public final class StashOrganizer {
 
         BARITONE.stop();
         saveAndDisableBaritoneBreaking();
+        saveAndGuardPlaceBlockSneak();
         taskQueue.clear();
         consolidationQueue.clear();
         overflowItems.clear();
@@ -241,6 +247,7 @@ public final class StashOrganizer {
         BARITONE.stop();
         closeCurrentContainer();
         restoreBaritoneBreaking();
+        restorePlaceBlockSneak();
         state = State.IDLE;
         taskQueue.clear();
         consolidationQueue.clear();
@@ -256,7 +263,6 @@ public final class StashOrganizer {
     public void onContainerData(Session session, ClientboundContainerSetContentPacket packet) {
         this.serverSession = session;
         this.openContainerId = packet.getContainerId();
-        this.containerStateId = packet.getStateId();
         this.containerSlots = packet.getItems();
         this.containerDataReceived = true;
     }
@@ -266,6 +272,9 @@ public final class StashOrganizer {
         if (state == State.IDLE || state == State.DONE) return;
 
         setBaritoneBreakingAllowed(state == State.SHULKER_BREAKING);
+        // Sneak while placing so the right-click places the shulker instead of opening
+        // whatever interactive block (chest, barrel, etc.) happens to be nearby.
+        setPlaceBlockSneak(state == State.SHULKER_PLACING || state == State.SHULKER_WAIT_PLACE);
 
         switch (state) {
             case PLANNING            -> tickPlanning();
@@ -312,6 +321,7 @@ public final class StashOrganizer {
                     + " containers total. Check that pos1/pos2 cover the scanned area.");
             emit("organize_failed", Map.of("reason", "no_containers_in_region"));
             restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
             state = State.DONE;
             return;
         }
@@ -325,17 +335,23 @@ public final class StashOrganizer {
         }
 
         // Step 1: Detect columns (connected-component grouping)
+        // Hoppers are excluded here: they're FIFO funnels, not deposit/cascade
+        // targets, and must never be shift-clicked into as if they were storage.
         Set<int[]> positions = regionContainers.stream()
+                .filter(e -> !"minecraft:hopper".equals(e.blockType()))
                 .map(e -> new int[]{e.x(), e.y(), e.z()})
                 .collect(Collectors.toCollection(LinkedHashSet::new));
         List<Column> columns = detectColumns(positions);
 
         // Build lookup: posKey → column
         Map<Long, Column> posToColumn = new HashMap<>();
+        Map<Long, Column> topPosToColumn = new HashMap<>();
         for (Column col : columns) {
             for (int[] p : col.chests()) {
                 posToColumn.put(posKey(p[0], p[1], p[2]), col);
             }
+            int[] top = col.top();
+            topPosToColumn.put(posKey(top[0], top[1], top[2]), col);
         }
 
         // Step 2: Map items to locations (accessible items only)
@@ -396,10 +412,30 @@ public final class StashOrganizer {
             return Integer.compare(totalB, totalA);
         });
 
+        // Pass 1: honor previously-persisted column assignments first, so items keep landing
+        // in the same column across organize runs instead of being reshuffled by the greedy
+        // pass below. Only items with no valid persisted column fall through to that pass.
+        Map<String, int[]> persistedAssignments;
+        try {
+            var db = StashManagerPlugin.getDatabase();
+            persistedAssignments = db != null ? db.loadColumnAssignments() : Map.of();
+        } catch (SQLException e) {
+            persistedAssignments = Map.of();
+        }
+        for (var itemEntry : persistedAssignments.entrySet()) {
+            if (!itemLocations.containsKey(itemEntry.getKey())) continue;
+            int[] top = itemEntry.getValue();
+            Column col = topPosToColumn.get(posKey(top[0], top[1], top[2]));
+            if (col == null || assignedColumnIds.contains(col.id())) continue;
+            columnAssignment.put(itemEntry.getKey(), col);
+            assignedColumnIds.add(col.id());
+        }
+
         int shared = 0;
         Set<String> sharedItemIds = new HashSet<>();
         for (var entry : sortedItems) {
             String itemId = entry.getKey();
+            if (columnAssignment.containsKey(itemId)) continue; // already reserved by persisted pass
             List<ItemLocation> locations = entry.getValue();
             locations.sort(Comparator.comparingInt(ItemLocation::quantity).reversed());
 
@@ -438,6 +474,21 @@ public final class StashOrganizer {
                 columnAssignment.put(itemId, assigned);
                 assignedColumnIds.add(assigned.id());
             }
+        }
+
+        // Persist the final assignment so future organize runs reuse the same columns rather
+        // than recomputing (and potentially reshuffling) them from scratch. Best-effort only —
+        // requires the plugin's own Postgres connection to be configured (see README).
+        try {
+            var db = StashManagerPlugin.getDatabase();
+            if (db != null) {
+                Map<String, int[]> toSave = new LinkedHashMap<>();
+                for (var entry : columnAssignment.entrySet()) {
+                    toSave.put(entry.getKey(), entry.getValue().top());
+                }
+                db.saveColumnAssignments(toSave);
+            }
+        } catch (SQLException ignored) {
         }
 
         // Step 4: Generate move tasks
@@ -497,11 +548,16 @@ public final class StashOrganizer {
             for (ShulkerLoc sl : entry.getValue()) {
                 if (!columnChestKeys.contains(posKey(sl.pos()[0], sl.pos()[1], sl.pos()[2]))) {
                     taskQueue.add(new MoveTask(sl.pos(), col.top(),
-                            "minecraft:" + sl.shulkerType() + "_shulker_box", contentType));
+                            shulkerItemId(sl.shulkerType()), contentType));
                     shulkerMoves++;
                 }
             }
         }
+
+        // Empty the bot's own inventory into the stash first — anything not on the
+        // keep list (tools/weapons/totems/elytra the bot should always carry) gets
+        // queued ahead of every other task so the inventory frees up immediately.
+        queueInventoryDepositTasks();
 
         totalTasks = taskQueue.size();
         completedTasks = 0;
@@ -510,6 +566,7 @@ public final class StashOrganizer {
             info("Stash is already organized! (" + regionContainers.size() + " containers in "
                     + columns.size() + " columns, " + itemLocations.size() + " item types)");
             restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
             state = State.DONE;
             emit("organize_completed", Map.of(
                 "overflow_types", 0
@@ -540,6 +597,92 @@ public final class StashOrganizer {
         }
 
         advanceToNextTask();
+    }
+
+    // Deposits everything currently in the bot's own inventory into the stash, ahead of
+    // any other task, so the inventory is freed up for other functions (kit management,
+    // etc). Anything on the keep list (tools/weapons/totems/elytra) is left alone up to its
+    // configured quantity cap (null = keep all) — any excess beyond the cap still gets
+    // deposited, guarding against loose duplicates piling up in inventory during
+    // reconciliation. Everything else is routed to whatever column already matches its item
+    // type (or its shulker's primary content, for a filled shulker held in inventory). Items
+    // with no matching column yet are left in inventory rather than inventing a destination.
+    private void queueInventoryDepositTasks() {
+        var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (playerContainer == null) return;
+
+        Map<String, Integer> keepItems;
+        try {
+            var db = StashManagerPlugin.getDatabase();
+            keepItems = db != null ? db.loadKeepItems() : Map.of();
+        } catch (SQLException e) {
+            keepItems = Map.of();
+        }
+
+        int[] currentPos = {
+            (int) Math.floor(CACHE.getPlayerCache().getX()),
+            (int) Math.floor(CACHE.getPlayerCache().getY()),
+            (int) Math.floor(CACHE.getPlayerCache().getZ())
+        };
+
+        Map<String, Integer> keptSoFar = new HashMap<>();
+        List<MoveTask> inventoryTasks = new ArrayList<>();
+        int skippedNoColumn = 0;
+        for (int slot = 0; slot < 36; slot++) {
+            ItemStack stack = playerContainer.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0) continue;
+
+            String itemId = itemIdFromStack(stack);
+            if (keepItems.containsKey(itemId)) {
+                Integer cap = keepItems.get(itemId);
+                if (cap == null) continue; // keep all of this item
+                int already = keptSoFar.getOrDefault(itemId, 0);
+                if (already + stack.getAmount() <= cap) {
+                    keptSoFar.put(itemId, already + stack.getAmount());
+                    continue; // whole stack still within the cap — keep it
+                }
+                if (already >= cap) {
+                    // cap already met by earlier slots — deposit this whole stack
+                } else {
+                    keptSoFar.put(itemId, cap);
+                }
+            }
+
+            String contentFilter = null;
+            String columnKey = itemId;
+            if (isShulkerBoxItem(itemId)) {
+                String primary = getPrimaryContent(ItemIdentifier.readShulkerContents(stack));
+                if (primary != null) {
+                    contentFilter = primary;
+                    columnKey = primary;
+                }
+            }
+
+            Column col = columnAssignment.get(columnKey);
+            if (col == null) {
+                // No column exists for this content yet — dump it into overflow storage
+                // instead of leaving it stuck in inventory forever, which would eventually
+                // fill every slot and block the organizer from taking anything else at all.
+                int[] overflow = findOverflowChest();
+                if (overflow == null) {
+                    skippedNoColumn++;
+                    continue;
+                }
+                inventoryTasks.add(new MoveTask(currentPos, overflow, itemId, null, true));
+                continue;
+            }
+            inventoryTasks.add(new MoveTask(currentPos, col.top(), itemId, contentFilter, true));
+        }
+
+        if (!inventoryTasks.isEmpty()) {
+            for (int i = inventoryTasks.size() - 1; i >= 0; i--) {
+                taskQueue.addFirst(inventoryTasks.get(i));
+            }
+            info("Queued " + inventoryTasks.size() + " item(s) from the bot's own inventory to deposit first.");
+        }
+        if (skippedNoColumn > 0) {
+            info(skippedNoColumn + " inventory item(s) left in inventory — no matching stash column yet.");
+        }
     }
 
     // Column Detection
@@ -664,6 +807,13 @@ public final class StashOrganizer {
             info("Timeout opening container, skipping.");
             emit("organize_failed", Map.of("reason", "open_timeout"));
             advanceToNextTask();
+            return;
+        }
+
+        // A single missed right-click (rotation not settled, brief lag, etc.) should not
+        // doom the whole task — retry periodically like tickShulkerOpening does.
+        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+            BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
 
@@ -677,25 +827,41 @@ public final class StashOrganizer {
         }
 
         int chestSlots = getOpenContainerSlotCount();
+        boolean inventoryFull = false;
+        int idCandidates = 0;
+        java.util.Set<String> actualPrimaries = new java.util.LinkedHashSet<>();
 
         while (actionSlotIndex < chestSlots) {
             ItemStack stack = containerSlots[actionSlotIndex];
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
                 if (currentTask != null && itemId.equals(currentTask.itemId())) {
-                    // Skip non-shulker items when content-filtering
-                    if (currentTask.shulkerContentFilter() != null
-                            && !isShulkerBoxItem(itemId)) {
-                        actionSlotIndex++;
-                        continue;
+                    idCandidates++;
+                    // Same-colored shulkers can hold different contents — verify
+                    // this specific shulker's contents match the task before
+                    // taking it, not just its color/id.
+                    if (currentTask.shulkerContentFilter() != null) {
+                        if (!isShulkerBoxItem(itemId)) {
+                            actionSlotIndex++;
+                            continue;
+                        }
+                        String primary = getPrimaryContent(ItemIdentifier.readShulkerContents(stack));
+                        actualPrimaries.add(String.valueOf(primary));
+                        if (!ItemIdentifier.baseItemId(currentTask.shulkerContentFilter()).equals(ItemIdentifier.baseItemId(primary))) {
+                            actionSlotIndex++;
+                            continue;
+                        }
                     }
 
                     if (!hasInventoryRoom()) {
+                        inventoryFull = true;
+                        emit("organize_target_failed", Map.of("reason", "inventory_full_cannot_take"));
                         break;
                     }
 
-                    quickMoveSlot(actionSlotIndex);
-                    actionSlotIndex++;
+                    if (quickMoveSlot(actionSlotIndex)) {
+                        actionSlotIndex++;
+                    }
                     actionCooldown = config.organizerClickCooldownTicks;
                     return;
                 }
@@ -703,6 +869,13 @@ public final class StashOrganizer {
             actionSlotIndex++;
         }
 
+        if (!inventoryFull) {
+            emit("organize_target_failed", Map.of(
+                "reason", "item_not_found_at_source",
+                "id_candidates_seen", idCandidates,
+                "actual_primary_contents_seen", actualPrimaries.toString()
+            ));
+        }
         state = State.CLOSING_SOURCE;
         closeCurrentContainer();
     }
@@ -741,10 +914,20 @@ public final class StashOrganizer {
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
                 if (currentTask != null && itemId.equals(currentTask.itemId())) {
-                    if (currentTask.shulkerContentFilter() != null
-                            && !isShulkerBoxItem(itemId)) {
-                        playerSlot++;
-                        continue;
+                    // Same-colored shulkers can hold different contents — verify
+                    // this specific shulker's contents match the task before
+                    // depositing it, so a stray shulker already in inventory
+                    // doesn't get shipped to the wrong column.
+                    if (currentTask.shulkerContentFilter() != null) {
+                        if (!isShulkerBoxItem(itemId)) {
+                            playerSlot++;
+                            continue;
+                        }
+                        String primary = getPrimaryContent(ItemIdentifier.readShulkerContents(stack));
+                        if (!ItemIdentifier.baseItemId(currentTask.shulkerContentFilter()).equals(ItemIdentifier.baseItemId(primary))) {
+                            playerSlot++;
+                            continue;
+                        }
                     }
 
                     // Check if chest has room before depositing
@@ -767,8 +950,9 @@ public final class StashOrganizer {
                         containerSlotIndex = chestSlots + playerSlot - 9; // main inventory
                     }
 
-                    quickMoveSlot(containerSlotIndex);
-                    playerSlot++;
+                    if (quickMoveSlot(containerSlotIndex)) {
+                        playerSlot++;
+                    }
                     actionCooldown = config.organizerClickCooldownTicks;
                     // Resume from this slot next tick
                     actionSlotIndex = playerSlot;
@@ -779,6 +963,7 @@ public final class StashOrganizer {
         }
 
         // Done depositing
+        emit("organize_target_failed", Map.of("reason", "nothing_to_deposit"));
         state = State.CLOSING_DEST;
         closeCurrentContainer();
         actionCooldown = 0;
@@ -814,6 +999,11 @@ public final class StashOrganizer {
             info("Timeout opening container for shulker fetch.");
             emit("organize_failed", Map.of("reason", "shulker_fetch_open_timeout"));
             startOverflow();
+            return;
+        }
+
+        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+            BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
 
@@ -833,7 +1023,10 @@ public final class StashOrganizer {
                 String itemId = itemIdFromStack(stack);
                 if (isShulkerBoxItem(itemId)) {
                     // Take the shulker
-                    quickMoveSlot(actionSlotIndex);
+                    if (!quickMoveSlot(actionSlotIndex)) {
+                        actionCooldown = config.organizerClickCooldownTicks;
+                        return;
+                    }
                     actionCooldown = config.organizerClickCooldownTicks;
                     closeCurrentContainer();
 
@@ -868,6 +1061,11 @@ public final class StashOrganizer {
             info("Timeout opening destination for shulker deposit.");
             emit("organize_failed", Map.of("reason", "shulker_store_open_timeout"));
             advanceToNextTask();
+            return;
+        }
+
+        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+            BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
 
@@ -902,8 +1100,9 @@ public final class StashOrganizer {
                         containerSlotIndex = chestSlots + actionSlotIndex - 9;
                     }
 
-                    quickMoveSlot(containerSlotIndex);
-                    actionSlotIndex++;
+                    if (quickMoveSlot(containerSlotIndex)) {
+                        actionSlotIndex++;
+                    }
                     actionCooldown = config.organizerClickCooldownTicks;
                     return;
                 }
@@ -1126,6 +1325,7 @@ public final class StashOrganizer {
             actionSlotIndex++;
         }
 
+
         // No more items to pack
         closeCurrentContainer();
         state = State.SHULKER_CLOSING;
@@ -1202,10 +1402,10 @@ public final class StashOrganizer {
         }
 
         // Count materials
-        int shellsInRegion = countItemInRegion("minecraft:shulker_shell");
-        int chestsInRegion = countItemInRegion("minecraft:chest");
-        int shellsInInv = countItemInInventory("minecraft:shulker_shell");
-        int chestsInInv = countItemInInventory("minecraft:chest");
+        int shellsInRegion = countItemInRegion("shulker_shell");
+        int chestsInRegion = countItemInRegion("chest");
+        int shellsInInv = countItemInInventory("shulker_shell");
+        int chestsInInv = countItemInInventory("chest");
         int totalShells = shellsInRegion + shellsInInv;
         int totalChests = chestsInRegion + chestsInInv;
         shulkersToCraft = Math.min(totalShells / 2, totalChests);
@@ -1232,8 +1432,8 @@ public final class StashOrganizer {
         materialSources.clear();
         for (ContainerEntry container : index.getAll()) {
             if (isInRegion(container.x(), container.y(), container.z())) {
-                if (container.items().containsKey("minecraft:shulker_shell")
-                        || container.items().containsKey("minecraft:chest")) {
+                if (container.items().containsKey("shulker_shell")
+                        || container.items().containsKey("chest")) {
                     materialSources.add(new int[]{container.x(), container.y(), container.z()});
                 }
             }
@@ -1274,8 +1474,8 @@ public final class StashOrganizer {
 
         // Check if we have enough for at least one
         if (hasShulkerMaterialsInInventory()) {
-            int shellsHave = countItemInInventory("minecraft:shulker_shell");
-            int chestsHave = countItemInInventory("minecraft:chest");
+            int shellsHave = countItemInInventory("shulker_shell");
+            int chestsHave = countItemInInventory("chest");
             shulkersToCraft = Math.min(shellsHave / 2, chestsHave);
             walkTarget = craftingTablePos;
             state = State.CRAFT_WALKING;
@@ -1316,6 +1516,10 @@ public final class StashOrganizer {
 
     // OVERFLOW
     private void startOverflow() {
+        // Same reasoning as advanceToNextTask() — a container (e.g. a temp placed shulker)
+        // may still be open when a failure path routes here.
+        closeCurrentContainer();
+
         overflowChestPos = findOverflowChest();
         if (overflowChestPos == null) {
             info("No chest available for overflow items!");
@@ -1377,8 +1581,9 @@ public final class StashOrganizer {
                     containerSlotIndex = chestSlots + actionSlotIndex - 9;
                 }
 
-                quickMoveSlot(containerSlotIndex);
-                actionSlotIndex++;
+                if (quickMoveSlot(containerSlotIndex)) {
+                    actionSlotIndex++;
+                }
                 actionCooldown = config.organizerClickCooldownTicks;
                 return;
             }
@@ -1422,6 +1627,11 @@ public final class StashOrganizer {
     }
 
     private void advanceToNextTask() {
+        // A failure/timeout path may bail out here while a container is still open server-side
+        // (e.g. containerDataReceived arrived just after the timeout fired) — always close first
+        // so a stale window never lingers into the next task's WALKING phase.
+        closeCurrentContainer();
+
         // If in consolidation mode, advance within consolidation queue
         if (consolidationMode) {
             advanceConsolidation();
@@ -1440,6 +1650,12 @@ public final class StashOrganizer {
         }
 
         currentTask = taskQueue.poll();
+        if (currentTask.alreadyInInventory()) {
+            // Item is already in hand (deposited from the bot's own inventory) — no need
+            // to walk to/open a source container, go straight to the destination.
+            transitionToDestination();
+            return;
+        }
         currentRole = TargetRole.SOURCE;
         walkTarget = currentTask.source();
         actionSlotIndex = 0;
@@ -1450,6 +1666,7 @@ public final class StashOrganizer {
     private void finishOrganization() {
         BARITONE.stop();
         restoreBaritoneBreaking();
+        restorePlaceBlockSneak();
         state = State.DONE;
         emit("organize_completed", Map.of(
             "overflow_types", overflowItems.size()
@@ -1514,29 +1731,53 @@ public final class StashOrganizer {
         info("Baritone block breaking restored to " + savedAllowBreak + ".");
     }
 
+    private void saveAndGuardPlaceBlockSneak() {
+        if (placeSneakGuardActive) return;
+        savedPlaceBlockSneak = PathfinderCompat.getPlaceBlockSneak();
+        placeSneakGuardActive = true;
+        setPlaceBlockSneak(false);
+    }
+
+    private void setPlaceBlockSneak(boolean sneak) {
+        if (placeSneakGuardActive) {
+            PathfinderCompat.setPlaceBlockSneak(sneak);
+        }
+    }
+
+    private void restorePlaceBlockSneak() {
+        if (!placeSneakGuardActive) return;
+        PathfinderCompat.setPlaceBlockSneak(savedPlaceBlockSneak);
+        placeSneakGuardActive = false;
+    }
+
     private int getOpenContainerSlotCount() {
         if (containerSlots == null) return 0;
         return Math.max(0, containerSlots.length - 36);
     }
 
     // Shift-click a slot in the open container.
-    private void quickMoveSlot(int slot) {
-        if (serverSession == null || openContainerId < 0) return;
+    // Goes through Zenith's own InventoryManager queue (ShiftClick action) instead of
+    // hand-rolling the raw packet ourselves — that queue builds the packet fresh at actual
+    // execution time (correct action/state id, no off-by-one) and verifies the container id
+    // still matches what's currently open before sending, which our own raw send never did.
+    // Returns false if InventoryManager rejected the submission outright (e.g. a previous
+    // action from this or another owner is still pending) — callers must NOT treat the slot
+    // as handled when this returns false, or progress gets reported without anything moving.
+    private boolean quickMoveSlot(int slot) {
+        if (openContainerId < 0) return false;
 
         try {
-            var packet = new ServerboundContainerClickPacket(
-                    openContainerId,
-                    containerStateId,
-                    slot,
-                    ContainerActionType.SHIFT_CLICK_ITEM,
-                    ShiftClickItemAction.LEFT_CLICK,
-                    null,
-                    new Int2ObjectOpenHashMap<>()
-            );
-            serverSession.send(packet);
-            containerStateId++; // keep state ID in sync
+            var future = INVENTORY.submit(InventoryActionRequest.builder()
+                    .owner(this)
+                    .priority(6000)
+                    .actions(new ShiftClick(openContainerId, slot, ShiftClickItemAction.LEFT_CLICK))
+                    .build());
+            // submit() rejects synchronously (future already completed as not-accepted)
+            // when another request is still active — don't advance past this slot then.
+            return !(future.isDone() && !future.isAccepted());
         } catch (Exception e) {
             // Container may have closed
+            return false;
         }
     }
 
@@ -1589,6 +1830,13 @@ public final class StashOrganizer {
 
     private static boolean isShulkerBoxItem(String itemId) {
         return itemId != null && itemId.contains("shulker_box");
+    }
+
+    // ShulkerDetail.color() reports "unknown" for a plain undyed shulker box, whose real
+    // item id has no color prefix at all — not "unknown_shulker_box". Item ids in this codebase
+    // are unprefixed (no "minecraft:" namespace), matching ItemIdentifier.getItemId().
+    private static String shulkerItemId(String color) {
+        return "unknown".equals(color) ? "shulker_box" : color + "_shulker_box";
     }
 
     private static String getPrimaryContent(Map<String, Integer> contents) {
@@ -1748,32 +1996,57 @@ public final class StashOrganizer {
         startOverflow();
     }
 
+    // Searches a wide area around the player rather than a small fixed ring, so a spot
+    // further down a packed shelving aisle can still be found even if the immediate
+    // neighbors are all chests; picks the closest valid spot rather than the first found.
     private int[] findShulkerPlaceSpot() {
         var player = CACHE.getPlayerCache();
         int px = (int) Math.floor(player.getX());
         int py = (int) Math.floor(player.getY());
         int pz = (int) Math.floor(player.getZ());
 
-        int[][] offsets = {
-            {1, 0}, {-1, 0}, {0, 1}, {0, -1},
-            {1, 1}, {-1, 1}, {1, -1}, {-1, -1},
-            {2, 0}, {-2, 0}, {0, 2}, {0, -2}
-        };
-        for (int[] offset : offsets) {
-            int x = px + offset[0];
-            int y = py;
-            int z = pz + offset[1];
-            if (!World.isInWorldBounds(x, y, z)) continue;
-            var target = World.getBlock(x, y, z);
-            var above = World.getBlock(x, y + 1, z);
-            var below = World.getBlock(x, y - 1, z);
-                if (!BlockCompat.canReplace(target)
-                    || !BlockCompat.canReplace(above)
-                    || BlockCompat.isAir(below)
-                    || !BlockCompat.isSolid(x, y - 1, z)) continue;
-            return new int[]{x, y, z};
+        int[] best = null;
+        double bestDistSq = Double.MAX_VALUE;
+
+        for (int dx = -3; dx <= 3; dx++) {
+            for (int dz = -3; dz <= 3; dz++) {
+                for (int dy = -1; dy <= 1; dy++) {
+                    if (dx == 0 && dz == 0) continue; // player's own column — never place under/on self
+                    int x = px + dx;
+                    int y = py + dy;
+                    int z = pz + dz;
+                    if (!World.isInWorldBounds(x, y, z)) continue;
+
+                    var target = World.getBlock(x, y, z);
+                    var above = World.getBlock(x, y + 1, z);
+                    var below = World.getBlock(x, y - 1, z);
+                    // Baritone tries every neighboring face (down/south/east/north/west/up) to place
+                    // against, not just the one below — any of them being a container/GUI block
+                    // means a right-click there opens it instead of placing the shulker.
+                    var north = World.getBlock(x, y, z - 1);
+                    var south = World.getBlock(x, y, z + 1);
+                    var east = World.getBlock(x + 1, y, z);
+                    var west = World.getBlock(x - 1, y, z);
+                    if (!BlockCompat.canReplace(target)
+                        || !BlockCompat.canReplace(above)
+                        || BlockCompat.isAir(below)
+                        || BlockCompat.isInteractable(below)
+                        || BlockCompat.isInteractable(north)
+                        || BlockCompat.isInteractable(south)
+                        || BlockCompat.isInteractable(east)
+                        || BlockCompat.isInteractable(west)
+                        || BlockCompat.isInteractable(above)
+                        || !BlockCompat.isSolid(x, y - 1, z)) continue;
+
+                    double distSq = (double) dx * dx + (double) dy * dy + (double) dz * dz;
+                    if (distSq < bestDistSq) {
+                        bestDistSq = distSq;
+                        best = new int[]{x, y, z};
+                    }
+                }
+            }
         }
-        return null;
+        return best;
     }
 
     private boolean isShulkerAtPosition(int[] pos) {
@@ -1806,8 +2079,8 @@ public final class StashOrganizer {
         // Check if we have crafting table and materials available in region
         if (findCraftingTable() == null) return false;
 
-        int shells = countItemInRegion("minecraft:shulker_shell") + countItemInInventory("minecraft:shulker_shell");
-        int chests = countItemInRegion("minecraft:chest") + countItemInInventory("minecraft:chest");
+        int shells = countItemInRegion("shulker_shell") + countItemInInventory("shulker_shell");
+        int chests = countItemInRegion("chest") + countItemInInventory("chest");
 
         return shells >= 2 && chests >= 1;
     }
@@ -1853,8 +2126,8 @@ public final class StashOrganizer {
     }
 
     private boolean hasShulkerMaterialsInInventory() {
-        int shells = countItemInInventory("minecraft:shulker_shell");
-        int chests = countItemInInventory("minecraft:chest");
+        int shells = countItemInInventory("shulker_shell");
+        int chests = countItemInInventory("chest");
         return shells >= 2 && chests >= 1;
     }
 

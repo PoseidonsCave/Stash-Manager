@@ -18,12 +18,12 @@ import java.util.Set;
 public final class ItemIdentifier {
 
     private static final Set<String> PICKAXE_IDS = Set.of(
-        "minecraft:wooden_pickaxe",
-        "minecraft:stone_pickaxe",
-        "minecraft:iron_pickaxe",
-        "minecraft:golden_pickaxe",
-        "minecraft:diamond_pickaxe",
-        "minecraft:netherite_pickaxe"
+        "wooden_pickaxe",
+        "stone_pickaxe",
+        "iron_pickaxe",
+        "golden_pickaxe",
+        "diamond_pickaxe",
+        "netherite_pickaxe"
     );
 
     private ItemIdentifier() {}
@@ -64,6 +64,16 @@ public final class ItemIdentifier {
         }
 
         return contents;
+    }
+
+    // Strips the enchant suffix (e.g. "diamond_pickaxe[fortune]" -> "diamond_pickaxe") for
+    // content-filter comparisons — grouping/matching by primary content only needs the base
+    // item type, and a stale index entry captured before enchant suffixes existed would
+    // otherwise never match a fresh live read of the same physical item.
+    public static String baseItemId(String itemId) {
+        if (itemId == null) return null;
+        int bracket = itemId.indexOf('[');
+        return bracket >= 0 ? itemId.substring(0, bracket) : itemId;
     }
 
     private static String getPickaxeEnchantSuffix(ItemStack stack) {

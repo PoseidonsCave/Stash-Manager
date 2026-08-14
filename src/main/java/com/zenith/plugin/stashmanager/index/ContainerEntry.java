@@ -14,7 +14,9 @@ public record ContainerEntry(
     int shulkerCount,
     List<ShulkerDetail> shulkerDetails,
     long timestamp,
-    String label
+    String label,
+    // Direction a hopper's spout feeds into (e.g. "NORTH"); null for non-hoppers.
+    String hopperFacing
 ) {
 
     // Per-shulker breakdown: color and items inside.
@@ -36,7 +38,14 @@ public record ContainerEntry(
     public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
                           Map<String, Integer> items, int shulkerCount,
                           List<ShulkerDetail> shulkerDetails, long timestamp) {
-        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, null);
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, null, null);
+    }
+
+    // Convenience constructor without hopperFacing (backwards compatible).
+    public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
+                          Map<String, Integer> items, int shulkerCount,
+                          List<ShulkerDetail> shulkerDetails, long timestamp, String label) {
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, label, null);
     }
 
     // Unique position key for deduplication.
@@ -91,6 +100,6 @@ public record ContainerEntry(
 
     // Create a copy with a new label.
     public ContainerEntry withLabel(String newLabel) {
-        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, newLabel);
+        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, newLabel, hopperFacing);
     }
 }
