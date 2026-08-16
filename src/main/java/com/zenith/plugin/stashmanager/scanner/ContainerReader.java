@@ -38,7 +38,11 @@ public class ContainerReader {
         int containerSlotCount = Math.max(0, size - 36);
         Map<String, Integer> items = new LinkedHashMap<>();
         int shulkerCount = 0;
-        var shulkerDetails = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
+        // Aggregate by color (matching DatabaseManager.buildContainerEntry()'s reconstruction)
+        // rather than one entry per physical shulker slot — otherwise a chest with N identical-
+        // colored shulkers produces N separate ShulkerDetail entries, and organizer planning
+        // then queues N near-duplicate relocation tasks for what should be a single move.
+        Map<String, Map<String, Integer>> shulkerItemsByColor = new LinkedHashMap<>();
 
         for (int slot = 0; slot < containerSlotCount; slot++) {
             ItemStack stack = open.getItemStack(slot);
@@ -52,14 +56,21 @@ public class ContainerReader {
                 shulkerCount++;
                 var shulkerDetail = shulkerIntrospector.introspect(stack);
                 if (shulkerDetail != null) {
-                    shulkerDetails.add(shulkerDetail);
-                    // Also add shulker contents to the container-level items
+                    var colorItems = shulkerItemsByColor.computeIfAbsent(shulkerDetail.color(), k -> new LinkedHashMap<>());
                     for (var entry : shulkerDetail.items().entrySet()) {
+                        colorItems.merge(entry.getKey(), entry.getValue(), Integer::sum);
+                        // Also add shulker contents to the container-level items
                         items.merge(entry.getKey(), entry.getValue(), Integer::sum);
                     }
                 }
             }
         }
+
+        var shulkerDetails = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
+        for (var entry : shulkerItemsByColor.entrySet()) {
+            shulkerDetails.add(new ContainerEntry.ShulkerDetail(entry.getKey(), entry.getValue()));
+        }
+
 
         String blockType = blockEntityTypeToId(location.type());
         String hopperFacing = location.hopperFacing() != null ? location.hopperFacing().name() : null;

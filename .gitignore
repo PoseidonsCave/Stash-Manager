@@ -3,6 +3,7 @@ build/
 bin/
 out/
 *.class
+test/
 
 # Gradle
 .gradle/

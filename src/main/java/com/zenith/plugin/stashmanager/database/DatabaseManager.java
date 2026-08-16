@@ -73,7 +73,18 @@ public class DatabaseManager implements AutoCloseable {
                     item_id VARCHAR(128) NOT NULL,
                     quantity INTEGER NOT NULL,
                     in_shulker BOOLEAN NOT NULL DEFAULT FALSE,
-                    shulker_color VARCHAR(32)
+                    shulker_color VARCHAR(32),
+                    shulker_instance INTEGER
+                )
+                """);
+
+            // One row per physical shulker, including empty boxes that have no content rows.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS container_shulkers (
+                    container_id BIGINT NOT NULL REFERENCES containers(id) ON DELETE CASCADE,
+                    slot INTEGER NOT NULL,
+                    color VARCHAR(32) NOT NULL,
+                    PRIMARY KEY (container_id, slot)
                 )
                 """);
 
@@ -171,6 +182,7 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_kit_items_kit ON kit_items(kit_name)");
 
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_items_item_id ON container_items(item_id)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_shulkers_container ON container_shulkers(container_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_position ON containers(x, y, z)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_block_type ON containers(block_type)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_scan_ts ON containers(scan_timestamp)");
@@ -218,6 +230,32 @@ public class DatabaseManager implements AutoCloseable {
                 try (Statement stmt = conn.createStatement()) {
                     stmt.execute("ALTER TABLE keep_items ADD COLUMN keep_quantity INTEGER");
                 }
+            }
+
+            // Physical shulker identity. Older rows remain NULL and are treated as legacy
+            // aggregate data until a fresh scan replaces them.
+            boolean hasShulkerInstance = false;
+            try (ResultSet rs = conn.getMetaData().getColumns(null, null, "container_items", "shulker_instance")) {
+                hasShulkerInstance = rs.next();
+            }
+            if (!hasShulkerInstance) {
+                try (Statement stmt = conn.createStatement()) {
+                    stmt.execute("ALTER TABLE container_items ADD COLUMN shulker_instance INTEGER");
+                }
+            }
+
+            // Installations upgrading from schemas created before physical shulker persistence
+            // still need the side table that can represent empty boxes.
+            try (Statement stmt = conn.createStatement()) {
+                stmt.execute("""
+                    CREATE TABLE IF NOT EXISTS container_shulkers (
+                        container_id BIGINT NOT NULL REFERENCES containers(id) ON DELETE CASCADE,
+                        slot INTEGER NOT NULL,
+                        color VARCHAR(32) NOT NULL,
+                        PRIMARY KEY (container_id, slot)
+                    )
+                    """);
+                stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_shulkers_container ON container_shulkers(container_id)");
             }
         }
     }
@@ -281,6 +319,24 @@ public class DatabaseManager implements AutoCloseable {
             ps.setLong(1, containerId);
             ps.executeUpdate();
         }
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM container_shulkers WHERE container_id = ?")) {
+            ps.setLong(1, containerId);
+            ps.executeUpdate();
+        }
+
+        // Persist the physical box independently from its contents so empty boxes survive a
+        // database reload. Legacy aggregate details deliberately have no physical slot.
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO container_shulkers (container_id, slot, color) VALUES (?, ?, ?)")) {
+            for (ContainerEntry.ShulkerDetail shulker : entry.shulkerDetails()) {
+                if (!shulker.isPhysicalInstance()) continue;
+                ps.setLong(1, containerId);
+                ps.setInt(2, shulker.slot());
+                ps.setString(3, shulker.color());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
 
         // entry.items() is the merged total (loose items + everything inside shulkers).
         // Subtract out what's already itemized per-shulker below so each unit is only
@@ -294,7 +350,7 @@ public class DatabaseManager implements AutoCloseable {
         directItems.values().removeIf(qty -> qty <= 0);
 
         // Insert direct (non-shulker) container items
-        String insertSql = "INSERT INTO container_items (container_id, item_id, quantity, in_shulker, shulker_color) VALUES (?, ?, ?, ?, ?)";
+        String insertSql = "INSERT INTO container_items (container_id, item_id, quantity, in_shulker, shulker_color, shulker_instance) VALUES (?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
             for (var item : directItems.entrySet()) {
                 ps.setLong(1, containerId);
@@ -302,6 +358,7 @@ public class DatabaseManager implements AutoCloseable {
                 ps.setInt(3, item.getValue());
                 ps.setBoolean(4, false);
                 ps.setNull(5, Types.VARCHAR);
+                ps.setNull(6, Types.INTEGER);
                 ps.addBatch();
             }
 
@@ -313,6 +370,8 @@ public class DatabaseManager implements AutoCloseable {
                     ps.setInt(3, item.getValue());
                     ps.setBoolean(4, true);
                     ps.setString(5, shulker.color());
+                    if (shulker.isPhysicalInstance()) ps.setInt(6, shulker.slot());
+                    else ps.setNull(6, Types.INTEGER);
                     ps.addBatch();
                 }
             }
@@ -1009,10 +1068,24 @@ public class DatabaseManager implements AutoCloseable {
         // Load items
         Map<String, Integer> items = new LinkedHashMap<>();
         List<ContainerEntry.ShulkerDetail> shulkerDetails = new ArrayList<>();
-        Map<String, Map<String, Integer>> shulkerItemsByColor = new LinkedHashMap<>();
+        Map<Integer, String> physicalShulkerColors = new LinkedHashMap<>();
+        Map<Integer, Map<String, Integer>> physicalShulkerItems = new LinkedHashMap<>();
+        Map<String, Map<String, Integer>> legacyShulkerItemsByColor = new LinkedHashMap<>();
+
+        try (PreparedStatement shulkerPs = conn.prepareStatement(
+                "SELECT slot, color FROM container_shulkers WHERE container_id = ? ORDER BY slot")) {
+            shulkerPs.setLong(1, containerId);
+            try (ResultSet shulkerRs = shulkerPs.executeQuery()) {
+                while (shulkerRs.next()) {
+                    int slot = shulkerRs.getInt("slot");
+                    physicalShulkerColors.put(slot, shulkerRs.getString("color"));
+                    physicalShulkerItems.put(slot, new LinkedHashMap<>());
+                }
+            }
+        }
 
         try (PreparedStatement itemPs = conn.prepareStatement(
-                 "SELECT item_id, quantity, in_shulker, shulker_color FROM container_items WHERE container_id = ?")) {
+                 "SELECT item_id, quantity, in_shulker, shulker_color, shulker_instance FROM container_items WHERE container_id = ?")) {
             itemPs.setLong(1, containerId);
 
             try (ResultSet itemRs = itemPs.executeQuery()) {
@@ -1021,10 +1094,18 @@ public class DatabaseManager implements AutoCloseable {
                     int quantity = itemRs.getInt("quantity");
                     boolean inShulker = itemRs.getBoolean("in_shulker");
                     String shulkerColor = itemRs.getString("shulker_color");
+                    int shulkerInstance = itemRs.getInt("shulker_instance");
+                    boolean physicalInstance = !itemRs.wasNull();
 
                     if (inShulker && shulkerColor != null) {
-                        shulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
-                            .merge(itemId, quantity, Integer::sum);
+                        if (physicalInstance) {
+                            physicalShulkerColors.putIfAbsent(shulkerInstance, shulkerColor);
+                            physicalShulkerItems.computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
+                                    .merge(itemId, quantity, Integer::sum);
+                        } else {
+                            legacyShulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
+                                    .merge(itemId, quantity, Integer::sum);
+                        }
                     }
                     // All items go into the main map (same as the in-memory behavior)
                     items.merge(itemId, quantity, Integer::sum);
@@ -1032,7 +1113,11 @@ public class DatabaseManager implements AutoCloseable {
             }
         }
 
-        for (var entry : shulkerItemsByColor.entrySet()) {
+        for (var entry : physicalShulkerItems.entrySet()) {
+            shulkerDetails.add(new ContainerEntry.ShulkerDetail(
+                    entry.getKey(), physicalShulkerColors.get(entry.getKey()), entry.getValue()));
+        }
+        for (var entry : legacyShulkerItemsByColor.entrySet()) {
             shulkerDetails.add(new ContainerEntry.ShulkerDetail(entry.getKey(), entry.getValue()));
         }
 

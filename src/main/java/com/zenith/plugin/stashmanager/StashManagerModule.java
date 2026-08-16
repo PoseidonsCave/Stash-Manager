@@ -1027,8 +1027,19 @@ public class StashManagerModule extends Module {
         walkingTickCount = 0;
     }
 
+    // Reasons that are expected/benign noise in a hopper-fed or actively-changing stash (the
+    // planned target simply isn't there anymore by the time the bot looks) — still worth
+    // recording for /stash debug, but not worth a Discord ping every single occurrence.
+    private static final Set<String> WEBHOOK_SUPPRESSED_REASONS = Set.of(
+        "item_not_found_at_source", "nothing_to_deposit"
+    );
+
     private void handleAutomationEvent(String event, Map<String, Object> payload) {
-        fireWebhookEvent(event, payload);
+        boolean suppressWebhook = payload != null
+            && WEBHOOK_SUPPRESSED_REASONS.contains(String.valueOf(payload.get("reason")));
+        if (!suppressWebhook) {
+            fireWebhookEvent(event, payload);
+        }
         // Organizer/retriever failures (pathfinding, shulker open/close/break, etc.) only ever
         // reached Discord via fireWebhookEvent above — the debug recorder never saw them.
         if (isFailureEvent(event)) {

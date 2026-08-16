@@ -8,6 +8,7 @@ import com.zenith.plugin.stashmanager.StashManagerModule;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
 
 import java.io.IOException;
@@ -52,6 +53,9 @@ public class ApiHandler {
         body.put("scan_processed_ratio", module.getProcessedRatio());
         body.put("scan_success_rate", module.getSuccessRate());
         body.put("scan_failure_rate", module.getFailureRate());
+        body.put("scan_preemptions", module.getScanPreemptionCount());
+        body.put("scan_preemption_cooldown_remaining_seconds",
+            module.getScanPreemptionCooldownRemainingSeconds());
         body.put("last_scan", index.timeSinceLastScan());
         body.put("database_connected", database != null && database.isInitialized());
 
@@ -203,7 +207,7 @@ public class ApiHandler {
         sb.append("# TYPE stash_containers_total gauge\n");
         sb.append("stash_containers_total ").append(index.size()).append('\n');
 
-        sb.append("# HELP stash_scanner_state Current scanner state (0=IDLE,1=SCANNING,2=WALKING,3=OPENING,4=READING,5=CLOSING,6=WALKING_TO_ZONE,7=RETURNING,8=DONE)\n");
+        sb.append("# HELP stash_scanner_state Current scanner state (0=IDLE,1=ZONE_SCANNING,2=WALKING,3=OPENING,4=READING,5=CLOSING,6=WALKING_TO_ZONE,7=RETURNING,8=YIELDED,9=DONE)\n");
         sb.append("# TYPE stash_scanner_state gauge\n");
         sb.append("stash_scanner_state ").append(module.getState().ordinal()).append('\n');
 
@@ -218,6 +222,15 @@ public class ApiHandler {
         sb.append("# HELP stash_scan_containers_failed Containers failed to index in current/last scan\n");
         sb.append("# TYPE stash_scan_containers_failed gauge\n");
         sb.append("stash_scan_containers_failed ").append(module.getContainersFailed()).append('\n');
+
+        sb.append("# HELP stash_scan_preemptions_total Cooperative scanner handoffs in the current or last scan\n");
+        sb.append("# TYPE stash_scan_preemptions_total gauge\n");
+        sb.append("stash_scan_preemptions_total ").append(module.getScanPreemptionCount()).append('\n');
+
+        sb.append("# HELP stash_scan_preemption_cooldown_remaining_seconds Minimum scanner yield hold remaining\n");
+        sb.append("# TYPE stash_scan_preemption_cooldown_remaining_seconds gauge\n");
+        sb.append("stash_scan_preemption_cooldown_remaining_seconds ")
+            .append(module.getScanPreemptionCooldownRemainingSeconds()).append('\n');
 
         sb.append("# HELP stash_scan_containers_pending Containers pending in current scan\n");
         sb.append("# TYPE stash_scan_containers_pending gauge\n");
@@ -286,7 +299,44 @@ public class ApiHandler {
             sb.append("stash_organizer_tasks_total ").append(organizer.getTotalTasks()).append('\n');
         }
 
+        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        sb.append("# HELP stash_lane_capacity_ready Whether the latest scan is trusted and has enough dedicated lanes\n");
+        sb.append("# TYPE stash_lane_capacity_ready gauge\n");
+        sb.append("stash_lane_capacity_ready ").append(capacity.canOrganize() ? 1 : 0).append('\n');
+
+        sb.append("# HELP stash_lane_capacity_status Current lane audit status as a labeled one-hot gauge\n");
+        sb.append("# TYPE stash_lane_capacity_status gauge\n");
+        sb.append("stash_lane_capacity_status{status=\"")
+                .append(capacity.status().name().toLowerCase(Locale.ROOT)).append("\"} 1\n");
+
+        appendGauge(sb, "stash_lanes_detected", "Storage lanes detected in the configured region",
+                capacity.detectedLanes());
+        appendGauge(sb, "stash_lanes_protected", "Storage lanes reserved by mixed, empty, or unclassified shulkers",
+                capacity.protectedLanes());
+        appendGauge(sb, "stash_lanes_assignable", "Storage lanes available for exact bulk item classes",
+                capacity.assignableLanes());
+        appendGauge(sb, "stash_lanes_required", "Unique exact bulk item classes requiring dedicated lanes",
+                capacity.requiredStorageClasses());
+        appendGauge(sb, "stash_lanes_spare", "Assignable lanes remaining after one lane per bulk class",
+                capacity.spareLanes());
+        appendGauge(sb, "stash_lanes_shortfall", "Additional dedicated lanes required before organizing",
+                capacity.laneShortfall());
+        appendGauge(sb, "stash_shulkers_bulk", "Physical homogeneous bulk shulkers in the latest index",
+                capacity.bulkShulkers());
+        appendGauge(sb, "stash_shulkers_empty", "Physical empty shulkers in the latest index",
+                capacity.emptyShulkers());
+        appendGauge(sb, "stash_shulkers_mixed", "Physical mixed-content shulkers preserved from bulk organization",
+                capacity.mixedShulkers());
+        appendGauge(sb, "stash_shulkers_unclassified", "Legacy or incomplete shulkers requiring a fresh scan",
+                capacity.unclassifiedShulkers());
+
         sendText(exchange, 200, sb.toString());
+    }
+
+    private static void appendGauge(StringBuilder output, String name, String help, Number value) {
+        output.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        output.append("# TYPE ").append(name).append(" gauge\n");
+        output.append(name).append(' ').append(value).append('\n');
     }
 
     // POST /api/v1/webhook/test
@@ -319,6 +369,21 @@ public class ApiHandler {
             body.put("total_tasks", organizer.getTotalTasks());
             body.put("status", organizer.getStatus());
         }
+        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        body.put("lane_capacity", Map.ofEntries(
+                Map.entry("status", capacity.status().name()),
+                Map.entry("detected_lanes", capacity.detectedLanes()),
+                Map.entry("protected_lanes", capacity.protectedLanes()),
+                Map.entry("assignable_lanes", capacity.assignableLanes()),
+                Map.entry("required_storage_classes", capacity.requiredStorageClasses()),
+                Map.entry("spare_lanes", capacity.spareLanes()),
+                Map.entry("lane_shortfall", capacity.laneShortfall()),
+                Map.entry("bulk_shulkers", capacity.bulkShulkers()),
+                Map.entry("empty_shulkers", capacity.emptyShulkers()),
+                Map.entry("mixed_shulkers", capacity.mixedShulkers()),
+                Map.entry("unclassified_shulkers", capacity.unclassifiedShulkers()),
+                Map.entry("storage_classes", capacity.storageClasses())
+        ));
         sendJson(exchange, 200, body);
     }
 

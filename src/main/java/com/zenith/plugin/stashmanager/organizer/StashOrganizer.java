@@ -1,6 +1,7 @@
 package com.zenith.plugin.stashmanager.organizer;
 
 import com.zenith.Proxy;
+import com.zenith.cache.data.inventory.Container;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
@@ -10,6 +11,9 @@ import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
+import com.zenith.mc.block.Direction;
+import com.zenith.mc.block.properties.ChestType;
+import com.zenith.mc.block.properties.api.BlockStateProperties;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
@@ -59,6 +63,7 @@ public final class StashOrganizer {
         SHULKER_FETCH_WALK,
         SHULKER_FETCH_OPEN,
         SHULKER_FETCH_TAKE,
+        SHULKER_FETCH_CLOSING,
         SHULKER_STORE_WALK,
         SHULKER_STORE_OPEN,
         SHULKER_STORE_DEPOSIT,
@@ -122,6 +127,8 @@ public final class StashOrganizer {
     private static final int BREAK_TIMEOUT_TICKS = 100;
     private static final int CONDENSE_MIN_ITEMS = 1;
     private static final int SHULKER_HOTBAR_SLOT = 6;
+    private static final int MIN_OPEN_TIMEOUT_TICKS = 200;
+    private static final int OPEN_RETRY_INTERVAL_TICKS = 20;
 
     // Runtime State
     private int[] walkTarget;
@@ -130,6 +137,15 @@ public final class StashOrganizer {
     private int openWaitTicks;
     private int actionSlotIndex;
     private int actionCooldown;
+    private final Set<Long> shulkerFetchTriedSources = new HashSet<>();
+    private boolean fetchedEmptyShulker;
+    // Counts successful clicks during the current TAKING/DEPOSITING container visit. TAKING
+    // resumes scanning from wherever it left off each tick rather than from slot 0, so the
+    // final tick of a visit naturally finds "nothing left" once everything matching has already
+    // been taken — that's normal completion, not a failure, and should only be reported as a
+    // failure if nothing was ever moved during the whole visit.
+    private int movedThisVisit;
+    private boolean sourceVisitFailed;
 
     private int totalTasks;
     private int completedTasks;
@@ -261,10 +277,34 @@ public final class StashOrganizer {
 
     // Receives container data from module packet handler.
     public void onContainerData(Session session, ClientboundContainerSetContentPacket packet) {
+        if (packet.getContainerId() > 0 && packet.getContainerId() == openContainerId) {
+            // Refresh the compatibility snapshot for the shulker/crafting states that still
+            // consume it. Normal taking/depositing reads Zenith's live open container below.
+            this.containerSlots = packet.getItems();
+            return;
+        }
+        // Container clicks deliberately request a full server response. Those follow-up
+        // SetContent packets must refresh Zenith's cache, but they are not new opens and must
+        // not replace organizer state. A late response after an opening timeout is different:
+        // it has genuinely opened a GUI after this state machine moved on. Close that orphaned
+        // window immediately, otherwise the next pathing/action job runs behind a chest GUI.
+        if (packet.getContainerId() <= 0) return;
+        if (!isAwaitingContainerOpen()) {
+            closeUnexpectedContainer(packet.getContainerId());
+            return;
+        }
         this.serverSession = session;
         this.openContainerId = packet.getContainerId();
         this.containerSlots = packet.getItems();
         this.containerDataReceived = true;
+    }
+
+    private boolean isAwaitingContainerOpen() {
+        return switch (state) {
+            case OPENING, SHULKER_FETCH_OPEN, SHULKER_STORE_OPEN, SHULKER_OPENING,
+                 CRAFT_MATERIAL_OPEN, CRAFT_OPENING, OVERFLOW_OPENING -> true;
+            default -> false;
+        };
     }
 
     // Tick
@@ -295,6 +335,7 @@ public final class StashOrganizer {
             case SHULKER_FETCH_WALK  -> tickWalking();
             case SHULKER_FETCH_OPEN  -> tickShulkerFetchOpen();
             case SHULKER_FETCH_TAKE  -> tickShulkerFetchTake();
+            case SHULKER_FETCH_CLOSING -> tickShulkerFetchClosing();
             case SHULKER_STORE_WALK  -> tickWalking();
             case SHULKER_STORE_OPEN  -> tickShulkerStoreOpen();
             case SHULKER_STORE_DEPOSIT -> tickShulkerStoreDeposit();
@@ -328,20 +369,27 @@ public final class StashOrganizer {
 
         info("Analyzing " + regionContainers.size() + " containers in region...");
 
-        // Build position map
-        Map<Long, ContainerEntry> byPos = new LinkedHashMap<>();
-        for (ContainerEntry entry : regionContainers) {
-            byPos.put(posKey(entry.x(), entry.y(), entry.z()), entry);
-        }
+        // A double chest is one physical inventory even though both block entities can remain
+        // in an incrementally refreshed index. Keep the newer half for content planning while
+        // retaining the full geometry list for hopper-lane detection.
+        List<ContainerEntry> planningContainers = deduplicateDoubleChestInventories(regionContainers);
 
-        // Step 1: Detect columns (connected-component grouping)
-        // Hoppers are excluded here: they're FIFO funnels, not deposit/cascade
-        // targets, and must never be shift-clicked into as if they were storage.
-        Set<int[]> positions = regionContainers.stream()
-                .filter(e -> !"minecraft:hopper".equals(e.blockType()))
-                .map(e -> new int[]{e.x(), e.y(), e.z()})
-                .collect(Collectors.toCollection(LinkedHashSet::new));
-        List<Column> columns = detectColumns(positions);
+        // Step 1: Detect the actual hopper-fed staircase lanes. A geometric connected-
+        // component pass splits the two halves of double chests, cross-links neighboring
+        // staircases, and even admitted placed shulker block entities as destination columns.
+        // Each hopper step advances two blocks horizontally while dropping one Y level, so
+        // hoppers with the same facing/perpendicular coordinate/diagonal invariant form one
+        // physical lane. The first position is the lane's top input chest.
+        List<Column> columns = detectStaircaseColumns(regionContainers);
+        if (columns.isEmpty()) {
+            // Compatibility fallback for a stash without hopper staircases. Only permanent
+            // storage blocks are eligible destinations; placed shulkers are source contents.
+            Set<int[]> positions = regionContainers.stream()
+                    .filter(StashOrganizer::isPermanentStorage)
+                    .map(e -> new int[]{e.x(), e.y(), e.z()})
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            columns = detectColumns(positions);
+        }
 
         // Build lookup: posKey → column
         Map<Long, Column> posToColumn = new HashMap<>();
@@ -357,7 +405,7 @@ public final class StashOrganizer {
         // Step 2: Map items to locations (accessible items only)
         Map<String, List<ItemLocation>> itemLocations = new LinkedHashMap<>();
 
-        for (ContainerEntry container : regionContainers) {
+        for (ContainerEntry container : planningContainers) {
             int[] pos = {container.x(), container.y(), container.z()};
             Map<String, Integer> accessible = new HashMap<>(container.items());
 
@@ -381,31 +429,54 @@ public final class StashOrganizer {
         }
 
         // Step 2b: Map filled shulkers by primary content
-        record ShulkerLoc(int[] pos, String shulkerType, String primaryContent) {}
+        record ShulkerLoc(int[] pos, String shulkerType, String primaryContent, int contentWeight) {}
         Map<String, List<ShulkerLoc>> shulkersByContent = new LinkedHashMap<>();
 
-        for (ContainerEntry container : regionContainers) {
+        for (ContainerEntry container : planningContainers) {
             int[] pos = {container.x(), container.y(), container.z()};
+            // Defensive: aggregate by color here too in case shulkerDetails() came from stale
+            // (pre-fix) index/db data with one raw entry per physical shulker slot instead of
+            // one per color — otherwise a chest with many identical-colored shulkers would
+            // generate that many near-duplicate relocation tasks for what should be one move.
+            Map<String, Map<String, Integer>> byColor = new LinkedHashMap<>();
             for (ContainerEntry.ShulkerDetail sd : container.shulkerDetails()) {
-                String primary = getPrimaryContent(sd.items());
+                var colorItems = byColor.computeIfAbsent(sd.color(), k -> new LinkedHashMap<>());
+                for (var item : sd.items().entrySet()) {
+                    colorItems.merge(item.getKey(), item.getValue(), Integer::sum);
+                }
+            }
+            for (var colorEntry : byColor.entrySet()) {
+                String primary = getPrimaryContent(colorEntry.getValue());
                 if (primary != null) {
+                    int contentWeight = colorEntry.getValue().values().stream().mapToInt(Integer::intValue).sum();
                     shulkersByContent.computeIfAbsent(primary, k -> new ArrayList<>())
-                            .add(new ShulkerLoc(pos, sd.color(), primary));
+                            .add(new ShulkerLoc(pos, colorEntry.getKey(), primary, contentWeight));
                 }
             }
         }
 
-        // Weight columns by shulker contents
+        // Establish the organization schema from filled shulkers first. If an item already
+        // exists in filled shulkers, its lane preference and volume are derived exclusively
+        // from those shulkers; loose staging items must not choose the lane ahead of them.
+        Map<String, List<ItemLocation>> assignmentLocations = new LinkedHashMap<>();
         for (var entry : shulkersByContent.entrySet()) {
+            List<ItemLocation> evidence = assignmentLocations.computeIfAbsent(entry.getKey(), k -> new ArrayList<>());
+            for (ShulkerLoc shulker : entry.getValue()) {
+                evidence.add(new ItemLocation(shulker.pos(), shulker.contentWeight()));
+            }
             itemLocations.computeIfAbsent(entry.getKey(), k -> new ArrayList<>());
+        }
+        for (var entry : itemLocations.entrySet()) {
+            assignmentLocations.putIfAbsent(entry.getKey(), new ArrayList<>(entry.getValue()));
         }
 
         // Step 3: Assign items to columns (largest volume first)
         columnAssignment = new LinkedHashMap<>();
         Set<Integer> assignedColumnIds = new HashSet<>();
+        Map<Integer, Long> columnLoads = new HashMap<>();
 
         List<Map.Entry<String, List<ItemLocation>>> sortedItems =
-                new ArrayList<>(itemLocations.entrySet());
+                new ArrayList<>(assignmentLocations.entrySet());
         sortedItems.sort((a, b) -> {
             int totalA = a.getValue().stream().mapToInt(ItemLocation::quantity).sum();
             int totalB = b.getValue().stream().mapToInt(ItemLocation::quantity).sum();
@@ -429,15 +500,18 @@ public final class StashOrganizer {
             if (col == null || assignedColumnIds.contains(col.id())) continue;
             columnAssignment.put(itemEntry.getKey(), col);
             assignedColumnIds.add(col.id());
+            long weight = assignmentLocations.getOrDefault(itemEntry.getKey(), List.of()).stream()
+                    .mapToLong(ItemLocation::quantity).sum();
+            columnLoads.merge(col.id(), weight, Long::sum);
         }
 
         int shared = 0;
-        Set<String> sharedItemIds = new HashSet<>();
         for (var entry : sortedItems) {
             String itemId = entry.getKey();
             if (columnAssignment.containsKey(itemId)) continue; // already reserved by persisted pass
             List<ItemLocation> locations = entry.getValue();
             locations.sort(Comparator.comparingInt(ItemLocation::quantity).reversed());
+            long itemWeight = locations.stream().mapToLong(ItemLocation::quantity).sum();
 
             // Prefer column with highest quantity of this item
             Column assigned = null;
@@ -466,13 +540,18 @@ public final class StashOrganizer {
                             locations.get(0).pos()[0], locations.get(0).pos()[1], locations.get(0).pos()[2]));
                     if (col != null) assigned = col;
                 }
-                sharedItemIds.add(itemId);
+                if (assigned == null) {
+                    assigned = columns.stream()
+                            .min(Comparator.comparingLong(col -> columnLoads.getOrDefault(col.id(), 0L)))
+                            .orElse(null);
+                }
                 shared++;
             }
 
             if (assigned != null) {
                 columnAssignment.put(itemId, assigned);
                 assignedColumnIds.add(assigned.id());
+                columnLoads.merge(assigned.id(), itemWeight, Long::sum);
             }
         }
 
@@ -499,41 +578,20 @@ public final class StashOrganizer {
         for (var entry : columnAssignment.entrySet()) {
             String itemId = entry.getKey();
             Column col = entry.getValue();
-            Set<Long> columnChestKeys = new HashSet<>();
-            for (int[] p : col.chests()) columnChestKeys.add(posKey(p[0], p[1], p[2]));
 
             List<ItemLocation> locations = itemLocations.get(itemId);
             if (locations == null || locations.isEmpty()) continue;
 
             int totalLoose = locations.stream().mapToInt(ItemLocation::quantity).sum();
-
-            if (sharedItemIds.contains(itemId)) {
-                // Shared: pack into mixed shulkers
-                for (ItemLocation loc : locations) {
-                    consolidationQueue.add(new MoveTask(loc.pos(), col.top(), itemId));
-                }
-            } else if (totalLoose >= config.condenseMinItems) {
-                // Condense loose items into shulkers
+            if (totalLoose >= config.condenseMinItems) {
+                // Loose reconciliation is a distinct final phase. These tasks collect the
+                // exact item variant and then enter the place/fill/break/store shulker cycle;
+                // they never dump loose stacks straight into a lane chest.
                 for (ItemLocation loc : locations) {
                     consolidationQueue.add(new MoveTask(loc.pos(), col.top(), itemId));
                 }
                 condenseTypes++;
-            } else {
-                // Move loose items to assigned column
-                for (ItemLocation loc : locations) {
-                    if (!columnChestKeys.contains(posKey(loc.pos()[0], loc.pos()[1], loc.pos()[2]))) {
-                        taskQueue.add(new MoveTask(loc.pos(), col.top(), itemId));
-                    }
-                }
             }
-        }
-
-        // Batch consolidation by item type
-        if (!consolidationQueue.isEmpty()) {
-            List<MoveTask> sorted = new ArrayList<>(consolidationQueue);
-            sorted.sort(Comparator.comparing(MoveTask::itemId));
-            consolidationQueue.clear();
-            consolidationQueue.addAll(sorted);
         }
 
         // Step 4b: Move filled shulkers to matching columns
@@ -554,12 +612,12 @@ public final class StashOrganizer {
             }
         }
 
-        // Empty the bot's own inventory into the stash first — anything not on the
-        // keep list (tools/weapons/totems/elytra the bot should always carry) gets
-        // queued ahead of every other task so the inventory frees up immediately.
-        queueInventoryDepositTasks();
+        // Planning phases are deliberate: establish filled-shulker lanes first, then clear
+        // filled shulkers already in the bot inventory, and only then pack loose stash items.
+        // Mid-run inventory-full recovery still promotes its emergency deposit tasks.
+        queueInventoryDepositTasks(false);
 
-        totalTasks = taskQueue.size();
+        totalTasks = taskQueue.size() + consolidationQueue.size();
         completedTasks = 0;
 
         if (taskQueue.isEmpty() && consolidationQueue.isEmpty()) {
@@ -569,6 +627,8 @@ public final class StashOrganizer {
             restorePlaceBlockSneak();
             state = State.DONE;
             emit("organize_completed", Map.of(
+                "completed_tasks", 0,
+                "total_tasks", 0,
                 "overflow_types", 0
             ));
             return;
@@ -579,7 +639,7 @@ public final class StashOrganizer {
                 .append(columns.size()).append(" columns (")
                 .append(columnAssignment.size()).append(" types");
         if (condenseTypes > 0) summary.append(", ").append(condenseTypes).append(" to condense");
-        if (shared > 0) summary.append(", ").append(shared).append(" to consolidate");
+        if (shared > 0) summary.append(", ").append(shared).append(" sharing columns");
         if (shulkerMoves > 0) summary.append(", ").append(shulkerMoves).append(" shulker sorts");
         summary.append(").");
         info(summary.toString());
@@ -607,7 +667,7 @@ public final class StashOrganizer {
     // reconciliation. Everything else is routed to whatever column already matches its item
     // type (or its shulker's primary content, for a filled shulker held in inventory). Items
     // with no matching column yet are left in inventory rather than inventing a destination.
-    private void queueInventoryDepositTasks() {
+    private void queueInventoryDepositTasks(boolean prioritize) {
         var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
         if (playerContainer == null) return;
 
@@ -626,10 +686,25 @@ public final class StashOrganizer {
         };
 
         Map<String, Integer> keptSoFar = new HashMap<>();
-        List<MoveTask> inventoryTasks = new ArrayList<>();
+        // One task deposits every matching stack from the inventory. Creating a task per
+        // occupied slot meant the first task emptied all matches and every remaining duplicate
+        // reopened the same destination only to report nothing_to_deposit.
+        Map<String, MoveTask> inventoryTasks = new LinkedHashMap<>();
+        Set<String> alreadyQueued = taskQueue.stream()
+                .filter(MoveTask::alreadyInInventory)
+                .map(this::inventoryTaskKey)
+                .collect(Collectors.toSet());
+        consolidationQueue.stream()
+                .filter(MoveTask::alreadyInInventory)
+                .map(this::inventoryTaskKey)
+                .forEach(alreadyQueued::add);
         int skippedNoColumn = 0;
-        for (int slot = 0; slot < 36; slot++) {
-            ItemStack stack = playerContainer.getItemStack(slot);
+        // Zenith's raw player inventory container is size 46: 0-4=crafting, 5-8=armor,
+        // 9-35=main inventory, 36-44=hotbar, 45=offhand. Scan only 9-44 (main+hotbar) —
+        // otherwise equipped armor gets misread as a loose item, and the real hotbar
+        // (36-44) never gets scanned/emptied at all.
+        for (int slot = 9; slot < 45; slot++) {
+            ItemStack stack = getCurrentPlayerInventoryStack(slot);
             if (stack == null || stack.getAmount() <= 0) continue;
 
             String itemId = itemIdFromStack(stack);
@@ -644,7 +719,10 @@ public final class StashOrganizer {
                 if (already >= cap) {
                     // cap already met by earlier slots — deposit this whole stack
                 } else {
-                    keptSoFar.put(itemId, cap);
+                    // ShiftClick can only move the whole stack. Keep a stack that straddles
+                    // the cap rather than silently depositing items the keep rule protects.
+                    keptSoFar.put(itemId, already + stack.getAmount());
+                    continue;
                 }
             }
 
@@ -668,21 +746,186 @@ public final class StashOrganizer {
                     skippedNoColumn++;
                     continue;
                 }
-                inventoryTasks.add(new MoveTask(currentPos, overflow, itemId, null, true));
+                MoveTask task = new MoveTask(currentPos, overflow, itemId, null, true);
+                String key = inventoryTaskKey(task);
+                if (!alreadyQueued.contains(key)) inventoryTasks.putIfAbsent(key, task);
                 continue;
             }
-            inventoryTasks.add(new MoveTask(currentPos, col.top(), itemId, contentFilter, true));
+            MoveTask task = new MoveTask(currentPos, col.top(), itemId, contentFilter, true);
+            String key = inventoryTaskKey(task);
+            if (!alreadyQueued.contains(key)) inventoryTasks.putIfAbsent(key, task);
         }
 
         if (!inventoryTasks.isEmpty()) {
-            for (int i = inventoryTasks.size() - 1; i >= 0; i--) {
-                taskQueue.addFirst(inventoryTasks.get(i));
+            List<MoveTask> uniqueTasks = new ArrayList<>(inventoryTasks.values());
+            if (prioritize) {
+                for (int i = uniqueTasks.size() - 1; i >= 0; i--) {
+                    taskQueue.addFirst(uniqueTasks.get(i));
+                }
+            } else {
+                for (MoveTask task : uniqueTasks) {
+                    if (isShulkerBoxItem(task.itemId())) {
+                        taskQueue.addLast(task);
+                    } else {
+                        consolidationQueue.addLast(task);
+                    }
+                }
             }
-            info("Queued " + inventoryTasks.size() + " item(s) from the bot's own inventory to deposit first.");
+            info("Queued " + inventoryTasks.size() + " item type(s) already in the bot inventory for "
+                    + (prioritize ? "recovery deposit." : "the appropriate organization phase."));
+            if (state != State.PLANNING) {
+                totalTasks += inventoryTasks.size();
+            }
         }
         if (skippedNoColumn > 0) {
             info(skippedNoColumn + " inventory item(s) left in inventory — no matching stash column yet.");
         }
+    }
+
+    private String inventoryTaskKey(MoveTask task) {
+        int[] destination = task.destination();
+        return posKey(destination[0], destination[1], destination[2]) + "\u0000"
+                + task.itemId() + "\u0000" + Objects.toString(task.shulkerContentFilter(), "");
+    }
+
+    private record StaircaseKey(int dx, int dz, int perpendicular, int diagonal) {}
+
+    /**
+     * The index can retain both halves of a double chest after incremental scans.  Those
+     * records are not two inventories: they are two observations of one inventory and one
+     * may be older.  Plan moves from the freshest observation only.  Geometry deliberately
+     * continues to use the full list, since both block positions are useful for hopper-lane
+     * detection.
+     */
+    private static List<ContainerEntry> deduplicateDoubleChestInventories(Collection<ContainerEntry> containers) {
+        Map<Long, ContainerEntry> byPos = new LinkedHashMap<>();
+        for (ContainerEntry entry : containers) {
+            byPos.put(posKey(entry.x(), entry.y(), entry.z()), entry);
+        }
+
+        List<ContainerEntry> result = new ArrayList<>();
+        Set<Long> consumed = new HashSet<>();
+        for (ContainerEntry entry : containers) {
+            long key = posKey(entry.x(), entry.y(), entry.z());
+            if (!consumed.add(key)) continue;
+
+            int[] partner = findDoubleChestPartner(entry);
+            if (partner == null) {
+                result.add(entry);
+                continue;
+            }
+            ContainerEntry other = byPos.get(posKey(partner[0], partner[1], partner[2]));
+            if (other == null) {
+                result.add(entry);
+                continue;
+            }
+            consumed.add(posKey(other.x(), other.y(), other.z()));
+            if (other.timestamp() > entry.timestamp()
+                    || (other.timestamp() == entry.timestamp() && other.posKey() < entry.posKey())) {
+                result.add(other);
+            } else {
+                result.add(entry);
+            }
+        }
+        return result;
+    }
+
+    /** Returns the real partner only when chest state proves that these two blocks form one. */
+    private static int[] findDoubleChestPartner(ContainerEntry entry) {
+        if (!entry.isDouble() || !("minecraft:chest".equals(entry.blockType())
+                || "minecraft:trapped_chest".equals(entry.blockType()))) {
+            return null;
+        }
+        var state = World.getBlockState(entry.x(), entry.y(), entry.z());
+        ChestType chestType = state.getProperty(BlockStateProperties.CHEST_TYPE);
+        Direction facing = state.getProperty(BlockStateProperties.HORIZONTAL_FACING);
+        if (chestType == null || chestType == ChestType.SINGLE || facing == null) return null;
+
+        for (Direction direction : Direction.HORIZONTALS) {
+            int x = entry.x() + direction.x();
+            int z = entry.z() + direction.z();
+            var candidate = World.getBlockState(x, entry.y(), z);
+            if (!candidate.block().equals(state.block())) continue;
+            ChestType candidateType = candidate.getProperty(BlockStateProperties.CHEST_TYPE);
+            Direction candidateFacing = candidate.getProperty(BlockStateProperties.HORIZONTAL_FACING);
+            if (candidateType == chestType.getOpposite() && candidateFacing == facing) {
+                return new int[]{x, entry.y(), z};
+            }
+        }
+        return null;
+    }
+
+    static List<Column> detectStaircaseColumns(Collection<ContainerEntry> containers) {
+        Map<Long, ContainerEntry> byPos = new HashMap<>();
+        for (ContainerEntry entry : containers) {
+            byPos.put(posKey(entry.x(), entry.y(), entry.z()), entry);
+        }
+
+        Map<StaircaseKey, List<int[][]>> stepsByLane = new LinkedHashMap<>();
+        for (ContainerEntry hopper : containers) {
+            if (!"minecraft:hopper".equals(hopper.blockType()) || hopper.hopperFacing() == null) continue;
+
+            int dx;
+            int dz;
+            switch (hopper.hopperFacing()) {
+                case "NORTH" -> { dx = 0; dz = -1; }
+                case "SOUTH" -> { dx = 0; dz = 1; }
+                case "WEST"  -> { dx = -1; dz = 0; }
+                case "EAST"  -> { dx = 1; dz = 0; }
+                default -> { continue; }
+            }
+
+            ContainerEntry input = byPos.get(posKey(hopper.x(), hopper.y() + 1, hopper.z()));
+            ContainerEntry output = byPos.get(posKey(hopper.x() + dx, hopper.y(), hopper.z() + dz));
+            if (!isPermanentStorage(input) || !isPermanentStorage(output)) continue;
+
+            int along = hopper.x() * dx + hopper.z() * dz;
+            int perpendicular = hopper.x() * -dz + hopper.z() * dx;
+            StaircaseKey key = new StaircaseKey(dx, dz, perpendicular, along + 2 * hopper.y());
+            stepsByLane.computeIfAbsent(key, ignored -> new ArrayList<>()).add(new int[][]{
+                {input.x(), input.y(), input.z()},
+                {output.x(), output.y(), output.z()}
+            });
+        }
+
+        List<Column> columns = new ArrayList<>();
+        for (var laneEntry : stepsByLane.entrySet()) {
+            StaircaseKey key = laneEntry.getKey();
+            Map<Long, int[]> uniqueStorage = new LinkedHashMap<>();
+            for (int[][] step : laneEntry.getValue()) {
+                for (int[] pos : step) {
+                    uniqueStorage.putIfAbsent(posKey(pos[0], pos[1], pos[2]), pos);
+                }
+            }
+
+            List<int[]> ordered = new ArrayList<>(uniqueStorage.values());
+            ordered.sort(Comparator
+                    .<int[]>comparingInt(pos -> pos[1]).reversed()
+                    .thenComparingInt(pos -> pos[0] * key.dx() + pos[2] * key.dz()));
+            if (!ordered.isEmpty()) {
+                columns.add(new Column(columns.size(), ordered));
+            }
+        }
+
+        columns.sort(Comparator
+                .comparingInt((Column col) -> col.top()[0])
+                .thenComparingInt(col -> col.top()[2])
+                .thenComparingInt(col -> col.top()[1]));
+
+        // IDs are used only as stable identities inside one plan; restore sequential IDs
+        // after sorting the lanes into deterministic world-coordinate order.
+        List<Column> reindexed = new ArrayList<>(columns.size());
+        for (int i = 0; i < columns.size(); i++) {
+            reindexed.add(new Column(i, columns.get(i).chests()));
+        }
+        return reindexed;
+    }
+
+    private static boolean isPermanentStorage(ContainerEntry entry) {
+        return entry != null && switch (entry.blockType()) {
+            case "minecraft:chest", "minecraft:trapped_chest", "minecraft:barrel" -> true;
+            default -> false;
+        };
     }
 
     // Column Detection
@@ -771,23 +1014,18 @@ public final class StashOrganizer {
         switch (state) {
             case WALKING              -> {
                 state = State.OPENING;
-                interactWithBlock(walkTarget);
             }
             case SHULKER_FETCH_WALK   -> {
                 state = State.SHULKER_FETCH_OPEN;
-                interactWithBlock(walkTarget);
             }
             case SHULKER_STORE_WALK   -> {
                 state = State.SHULKER_STORE_OPEN;
-                interactWithBlock(walkTarget);
             }
             case OVERFLOW_WALKING     -> {
                 state = State.OVERFLOW_OPENING;
-                interactWithBlock(walkTarget);
             }
             default -> {
                 state = State.OPENING;
-                interactWithBlock(walkTarget);
             }
         }
     }
@@ -797,22 +1035,26 @@ public final class StashOrganizer {
         openWaitTicks++;
 
         if (containerDataReceived) {
+            BARITONE.stop();
             actionSlotIndex = 0;
             actionCooldown = 0;
+            movedThisVisit = 0;
+            sourceVisitFailed = false;
             state = (currentRole == TargetRole.SOURCE) ? State.TAKING : State.DEPOSITING;
             return;
         }
 
-        if (openWaitTicks > config.organizerOpenTimeoutTicks) {
+        if (openWaitTicks > organizerOpenTimeoutTicks()) {
             info("Timeout opening container, skipping.");
             emit("organize_failed", Map.of("reason", "open_timeout"));
+            BARITONE.stop();
             advanceToNextTask();
             return;
         }
 
         // A single missed right-click (rotation not settled, brief lag, etc.) should not
         // doom the whole task — retry periodically like tickShulkerOpening does.
-        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+        if (openWaitTicks == 1 || openWaitTicks % OPEN_RETRY_INTERVAL_TICKS == 0) {
             BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
@@ -821,18 +1063,21 @@ public final class StashOrganizer {
     private void tickTaking() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
-        if (containerSlots == null || openContainerId < 0) {
-            transitionToDestination();
+        Container open = getLiveOpenContainer();
+        if (open == null) {
+            sourceVisitFailed = true;
+            emit("organize_target_failed", Map.of("reason", "source_container_lost"));
+            state = State.CLOSING_SOURCE;
+            closeCurrentContainer();
             return;
         }
 
-        int chestSlots = getOpenContainerSlotCount();
-        boolean inventoryFull = false;
+        int chestSlots = getOpenContainerSlotCount(open);
         int idCandidates = 0;
         java.util.Set<String> actualPrimaries = new java.util.LinkedHashSet<>();
 
         while (actionSlotIndex < chestSlots) {
-            ItemStack stack = containerSlots[actionSlotIndex];
+            ItemStack stack = open.getItemStack(actionSlotIndex);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
                 if (currentTask != null && itemId.equals(currentTask.itemId())) {
@@ -847,20 +1092,40 @@ public final class StashOrganizer {
                         }
                         String primary = getPrimaryContent(ItemIdentifier.readShulkerContents(stack));
                         actualPrimaries.add(String.valueOf(primary));
-                        if (!ItemIdentifier.baseItemId(currentTask.shulkerContentFilter()).equals(ItemIdentifier.baseItemId(primary))) {
+                        if (!ItemIdentifier.contentItemIdsMatch(currentTask.shulkerContentFilter(), primary)) {
                             actionSlotIndex++;
                             continue;
                         }
                     }
 
                     if (!hasInventoryRoom()) {
-                        inventoryFull = true;
-                        emit("organize_target_failed", Map.of("reason", "inventory_full_cannot_take"));
-                        break;
+                        if (consolidationMode && movedThisVisit > 0) {
+                            // Pack the batch collected so far, then revisit this same source
+                            // for any remainder instead of dumping the loose batch into a chest.
+                            consolidationQueue.addFirst(currentTask);
+                            state = State.CLOSING_SOURCE;
+                            closeCurrentContainer();
+                            return;
+                        }
+                        if (movedThisVisit == 0) {
+                            emit("organize_target_failed", Map.of("reason", "inventory_full_cannot_take"));
+                        }
+                        // queueInventoryDepositTasks() only runs once at the start of planning —
+                        // if inventory fills up mid-run with nothing further matching whatever's
+                        // stuck inside, every remaining task would fail this same way forever.
+                        // Re-queue this task for a later retry, then divert to emptying out
+                        // whatever's actually in inventory right now before continuing.
+                        if (currentTask != null) {
+                            taskQueue.addFirst(currentTask);
+                        }
+                        queueInventoryDepositTasks(true);
+                        advanceToNextTask();
+                        return;
                     }
 
                     if (quickMoveSlot(actionSlotIndex)) {
                         actionSlotIndex++;
+                        movedThisVisit++;
                     }
                     actionCooldown = config.organizerClickCooldownTicks;
                     return;
@@ -869,7 +1134,8 @@ public final class StashOrganizer {
             actionSlotIndex++;
         }
 
-        if (!inventoryFull) {
+        if (movedThisVisit == 0) {
+            sourceVisitFailed = true;
             emit("organize_target_failed", Map.of(
                 "reason", "item_not_found_at_source",
                 "id_candidates_seen", idCandidates,
@@ -885,8 +1151,13 @@ public final class StashOrganizer {
         actionCooldown++;
         if (actionCooldown >= 3) {
             actionCooldown = 0;
-            // Always transition to destination to deposit items
-            transitionToDestination();
+            if (sourceVisitFailed) {
+                advanceToNextTask();
+            } else if (consolidationMode) {
+                startShulkerPacking(currentTask.itemId(), currentTask.destination());
+            } else {
+                transitionToDestination();
+            }
         }
     }
 
@@ -894,23 +1165,23 @@ public final class StashOrganizer {
     private void tickDepositing() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
-        if (containerSlots == null || openContainerId < 0) {
+        Container open = getLiveOpenContainer();
+        if (open == null) {
+            emit("organize_target_failed", Map.of("reason", "destination_container_lost"));
             advanceToNextTask();
             return;
         }
 
-        int chestSlots = getOpenContainerSlotCount();
+        int chestSlots = getOpenContainerSlotCount(open);
 
         // Window layout: [chest slots][player inv 27][hotbar 9]
 
-        int playerSlot = Math.max(HOTBAR_SIZE, actionSlotIndex); // slot 9 — skip hotbar
-        while (playerSlot < 36) {
-            // Read player inv from cache
-            var invCache = CACHE.getPlayerCache().getInventoryCache();
-            var playerContainer = invCache.getPlayerInventory();
-            if (playerContainer == null) break;
-
-            ItemStack stack = playerContainer.getItemStack(playerSlot);
+        int playerSlot = Math.max(HOTBAR_SIZE, actionSlotIndex); // slot 9 — skip crafting/armor
+        while (playerSlot < 45) {
+            int containerSlotIndex = rawPlayerSlotToWindowSlot(chestSlots, playerSlot);
+            // While a non-zero container is open Zenith only updates the appended player
+            // section in that window. Its raw Container(0, 46) is not refreshed until close.
+            ItemStack stack = open.getItemStack(containerSlotIndex);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
                 if (currentTask != null && itemId.equals(currentTask.itemId())) {
@@ -924,7 +1195,7 @@ public final class StashOrganizer {
                             continue;
                         }
                         String primary = getPrimaryContent(ItemIdentifier.readShulkerContents(stack));
-                        if (!ItemIdentifier.baseItemId(currentTask.shulkerContentFilter()).equals(ItemIdentifier.baseItemId(primary))) {
+                        if (!ItemIdentifier.contentItemIdsMatch(currentTask.shulkerContentFilter(), primary)) {
                             playerSlot++;
                             continue;
                         }
@@ -937,21 +1208,20 @@ public final class StashOrganizer {
                         if (cascadeToNextInColumn()) {
                             return;
                         }
-                        // No more chests in column — start shulker packing
-                        startShulkerPacking(currentTask.itemId(), currentTask.destination());
+                        // Filled shulkers cannot be nested inside another shulker. Packing is
+                        // exclusively a loose-item reconciliation operation.
+                        if (isShulkerBoxItem(currentTask.itemId())) {
+                            emit("organize_target_failed", Map.of("reason", "shulker_lane_full"));
+                            advanceToNextTask();
+                        } else {
+                            startShulkerPacking(currentTask.itemId(), currentTask.destination());
+                        }
                         return;
-                    }
-
-                    // Map player slot → container window slot
-                    int containerSlotIndex;
-                    if (playerSlot < 9) {
-                        containerSlotIndex = chestSlots + 27 + playerSlot; // hotbar
-                    } else {
-                        containerSlotIndex = chestSlots + playerSlot - 9; // main inventory
                     }
 
                     if (quickMoveSlot(containerSlotIndex)) {
                         playerSlot++;
+                        movedThisVisit++;
                     }
                     actionCooldown = config.organizerClickCooldownTicks;
                     // Resume from this slot next tick
@@ -963,7 +1233,9 @@ public final class StashOrganizer {
         }
 
         // Done depositing
-        emit("organize_target_failed", Map.of("reason", "nothing_to_deposit"));
+        if (movedThisVisit == 0) {
+            emit("organize_target_failed", Map.of("reason", "nothing_to_deposit"));
+        }
         state = State.CLOSING_DEST;
         closeCurrentContainer();
         actionCooldown = 0;
@@ -989,20 +1261,22 @@ public final class StashOrganizer {
         openWaitTicks++;
 
         if (containerDataReceived) {
+            BARITONE.stop();
             actionSlotIndex = 0;
             actionCooldown = 0;
             state = State.SHULKER_FETCH_TAKE;
             return;
         }
 
-        if (openWaitTicks > config.organizerOpenTimeoutTicks) {
+        if (openWaitTicks > organizerOpenTimeoutTicks()) {
             info("Timeout opening container for shulker fetch.");
             emit("organize_failed", Map.of("reason", "shulker_fetch_open_timeout"));
+            BARITONE.stop();
             startOverflow();
             return;
         }
 
-        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+        if (openWaitTicks == 1 || openWaitTicks % OPEN_RETRY_INTERVAL_TICKS == 0) {
             BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
@@ -1010,40 +1284,59 @@ public final class StashOrganizer {
     private void tickShulkerFetchTake() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
-        if (containerSlots == null || openContainerId < 0) {
+        Container open = getLiveOpenContainer();
+        if (open == null) {
             startOverflow();
             return;
         }
 
-        int chestSlots = getOpenContainerSlotCount();
+        int chestSlots = getOpenContainerSlotCount(open);
 
         while (actionSlotIndex < chestSlots) {
-            ItemStack stack = containerSlots[actionSlotIndex];
+            ItemStack stack = open.getItemStack(actionSlotIndex);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
-                if (isShulkerBoxItem(itemId)) {
-                    // Take the shulker
+                if (isShulkerBoxItem(itemId) && ItemIdentifier.readShulkerContents(stack).isEmpty()) {
+                    // Take only an actually empty shulker.  Index summaries cannot distinguish
+                    // every physical box, so the live stack is the authority here.
                     if (!quickMoveSlot(actionSlotIndex)) {
                         actionCooldown = config.organizerClickCooldownTicks;
                         return;
                     }
-                    actionCooldown = config.organizerClickCooldownTicks;
-                    closeCurrentContainer();
-
-                    if (consolidationMode) {
-                        advanceConsolidation();
-                    } else {
-                        advanceToNextTask();
-                    }
+                    // InventoryManager rejects a CloseContainer submitted in the same tick as
+                    // a ShiftClick.  Let the click settle, then close and wait for raw
+                    // Container(0) to receive the returned inventory state.
+                    fetchedEmptyShulker = true;
+                    actionCooldown = 0;
+                    state = State.SHULKER_FETCH_CLOSING;
                     return;
                 }
             }
             actionSlotIndex++;
         }
 
-        // No shulker found
-        closeCurrentContainer();
-        startOverflow();
+        // This was a false positive from the indexed summary (all its boxes are filled).
+        // Close cleanly and try the next candidate before declaring that no packing box exists.
+        fetchedEmptyShulker = false;
+        actionCooldown = 0;
+        state = State.SHULKER_FETCH_CLOSING;
+    }
+
+    private void tickShulkerFetchClosing() {
+        actionCooldown++;
+        if (actionCooldown == 3) {
+            closeCurrentContainer();
+            return;
+        }
+        if (actionCooldown >= 6) {
+            actionCooldown = 0;
+            if (fetchedEmptyShulker) {
+                state = State.SHULKER_SELECTING;
+                shulkerTicks = 0;
+            } else {
+                startFetchShulker();
+            }
+        }
     }
 
     // SHULKER STORE — deposit filled shulker into destination
@@ -1051,20 +1344,23 @@ public final class StashOrganizer {
         openWaitTicks++;
 
         if (containerDataReceived) {
+            BARITONE.stop();
             state = State.SHULKER_STORE_DEPOSIT;
             actionSlotIndex = HOTBAR_SIZE;
             actionCooldown = 0;
+            movedThisVisit = 0;
             return;
         }
 
-        if (openWaitTicks > config.organizerOpenTimeoutTicks) {
+        if (openWaitTicks > organizerOpenTimeoutTicks()) {
             info("Timeout opening destination for shulker deposit.");
             emit("organize_failed", Map.of("reason", "shulker_store_open_timeout"));
+            BARITONE.stop();
             advanceToNextTask();
             return;
         }
 
-        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+        if (openWaitTicks == 1 || openWaitTicks % OPEN_RETRY_INTERVAL_TICKS == 0) {
             BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
@@ -1072,36 +1368,27 @@ public final class StashOrganizer {
     private void tickShulkerStoreDeposit() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
-        if (containerSlots == null || openContainerId < 0) {
+        Container open = getLiveOpenContainer();
+        if (open == null) {
             advanceToNextTask();
             return;
         }
 
-        int chestSlots = getOpenContainerSlotCount();
+        int chestSlots = getOpenContainerSlotCount(open);
 
-        // Deposit shulkers from player inventory
-        var invCache = CACHE.getPlayerCache().getInventoryCache();
-        var playerContainer = invCache.getPlayerInventory();
-        if (playerContainer == null) {
-            closeCurrentContainer();
-            advanceToNextTask();
-            return;
-        }
-
-        while (actionSlotIndex < 36) {
-            ItemStack stack = playerContainer.getItemStack(actionSlotIndex);
+        // Deposit only the shulker produced for this exact packed item variant.
+        while (actionSlotIndex < 45) {
+            int containerSlotIndex = rawPlayerSlotToWindowSlot(chestSlots, actionSlotIndex);
+            ItemStack stack = open.getItemStack(containerSlotIndex);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
-                if (isShulkerBoxItem(itemId)) {
-                    int containerSlotIndex;
-                    if (actionSlotIndex < 9) {
-                        containerSlotIndex = chestSlots + 27 + actionSlotIndex;
-                    } else {
-                        containerSlotIndex = chestSlots + actionSlotIndex - 9;
-                    }
-
+                String primary = isShulkerBoxItem(itemId)
+                        ? getPrimaryContent(ItemIdentifier.readShulkerContents(stack))
+                        : null;
+                if (ItemIdentifier.contentItemIdsMatch(packItemId, primary)) {
                     if (quickMoveSlot(containerSlotIndex)) {
                         actionSlotIndex++;
+                        movedThisVisit++;
                     }
                     actionCooldown = config.organizerClickCooldownTicks;
                     return;
@@ -1111,7 +1398,11 @@ public final class StashOrganizer {
         }
 
         closeCurrentContainer();
-        completedTasks++;
+        if (movedThisVisit > 0) {
+            completedTasks++;
+        } else {
+            emit("organize_target_failed", Map.of("reason", "packed_shulker_not_found_in_inventory"));
+        }
 
         if (consolidationMode) {
             if (!consolidationQueue.isEmpty()) {
@@ -1129,6 +1420,8 @@ public final class StashOrganizer {
     private void startShulkerPacking(String itemId, int[] destination) {
         this.packItemId = itemId;
         this.packDestination = destination;
+        this.shulkerFetchTriedSources.clear();
+        this.fetchedEmptyShulker = false;
         info("Starting shulker packing for: " + itemId);
         state = State.SHULKER_SELECTING;
         shulkerTicks = 0;
@@ -1141,7 +1434,7 @@ public final class StashOrganizer {
         int shulkerSlot = findEmptyShulkerInInventory();
         if (shulkerSlot < 0) {
             // Need to fetch from region or craft
-            if (hasEmptyShulkerInRegion()) {
+            if (hasPotentialShulkerInRegion()) {
                 startFetchShulker();
                 return;
             }
@@ -1194,7 +1487,7 @@ public final class StashOrganizer {
             return;
         }
 
-        if (shulkerTicks > config.organizerOpenTimeoutTicks) {
+        if (shulkerTicks > organizerOpenTimeoutTicks()) {
             info("Shulker placement timed out");
             emit("organize_failed", Map.of("reason", "shulker_place_timeout"));
             startOverflow();
@@ -1234,7 +1527,7 @@ public final class StashOrganizer {
             return;
         }
 
-        if (shulkerTicks > config.organizerOpenTimeoutTicks) {
+        if (shulkerTicks > organizerOpenTimeoutTicks()) {
             shulkerPlaceRetries++;
             if (shulkerPlaceRetries > 3) {
                 info("Shulker placement verification timeout");
@@ -1251,20 +1544,22 @@ public final class StashOrganizer {
         openWaitTicks++;
 
         if (containerDataReceived && openContainerId >= 0) {
+            BARITONE.stop();
             state = State.SHULKER_FILLING;
             actionSlotIndex = 9;
             actionCooldown = 0;
             return;
         }
 
-        if (openWaitTicks > config.organizerOpenTimeoutTicks) {
+        if (openWaitTicks > organizerOpenTimeoutTicks()) {
             info("Timeout opening placed shulker");
             emit("organize_failed", Map.of("reason", "shulker_open_timeout"));
+            BARITONE.stop();
             startOverflow();
             return;
         }
 
-        if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
+        if (openWaitTicks == 1 || openWaitTicks % OPEN_RETRY_INTERVAL_TICKS == 0) {
             BARITONE.rightClickBlock(shulkerPlacePos[0], shulkerPlacePos[1], shulkerPlacePos[2]);
         }
     }
@@ -1272,27 +1567,19 @@ public final class StashOrganizer {
     private void tickShulkerFilling() {
         if (actionCooldown > 0) { actionCooldown--; return; }
 
-        if (containerSlots == null || openContainerId < 0) {
+        Container open = getLiveOpenContainer();
+        if (open == null) {
             startOverflow();
             return;
         }
 
-        int chestSlots = getOpenContainerSlotCount(); // Should be 27 for shulker
-
-        // Deposit packItemId from player inventory into shulker
-        var invCache = CACHE.getPlayerCache().getInventoryCache();
-        var playerContainer = invCache.getPlayerInventory();
-        if (playerContainer == null) {
-            closeCurrentContainer();
-            state = State.SHULKER_CLOSING;
-            shulkerTicks = 0;
-            return;
-        }
+        int chestSlots = getOpenContainerSlotCount(open); // Should be 27 for shulker
 
         // Check if shulker is full
         boolean shulkerFull = true;
         for (int i = 0; i < chestSlots; i++) {
-            if (containerSlots[i] == null || containerSlots[i].getAmount() == 0) {
+            ItemStack stack = open.getItemStack(i);
+            if (stack == null || stack.getAmount() == 0) {
                 shulkerFull = false;
                 break;
             }
@@ -1305,19 +1592,15 @@ public final class StashOrganizer {
             return;
         }
 
-        while (actionSlotIndex < 36) {
-            ItemStack stack = playerContainer.getItemStack(actionSlotIndex);
+        while (actionSlotIndex < 45) {
+            int containerSlotIndex = rawPlayerSlotToWindowSlot(chestSlots, actionSlotIndex);
+            ItemStack stack = open.getItemStack(containerSlotIndex);
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
                 if (itemId.equals(packItemId)) {
-                    int containerSlotIndex;
-                    if (actionSlotIndex < 9) {
-                        containerSlotIndex = chestSlots + 27 + actionSlotIndex;
-                    } else {
-                        containerSlotIndex = chestSlots + actionSlotIndex - 9;
+                    if (quickMoveSlot(containerSlotIndex)) {
+                        actionSlotIndex++;
                     }
-
-                    quickMoveSlot(containerSlotIndex);
                     actionCooldown = config.organizerClickCooldownTicks;
                     return;
                 }
@@ -1378,8 +1661,9 @@ public final class StashOrganizer {
         shulkerTicks++;
 
         if (shulkerTicks >= PICKUP_DELAY_TICKS) {
-            // Check if we have filled shulker in inventory
-            if (hasFilledShulkerInInventory()) {
+            // Wait for the specific box we just packed, not an unrelated filled shulker the
+            // bot was already carrying for a different lane.
+            if (hasPackedShulkerInInventory()) {
                 // Store it in destination
                 walkTarget = packDestination;
                 state = State.SHULKER_STORE_WALK;
@@ -1539,16 +1823,23 @@ public final class StashOrganizer {
         openWaitTicks++;
 
         if (containerDataReceived) {
+            BARITONE.stop();
             state = State.OVERFLOW_DEPOSITING;
             actionSlotIndex = HOTBAR_SIZE;
             actionCooldown = 0;
             return;
         }
 
-        if (openWaitTicks > config.organizerOpenTimeoutTicks) {
+        if (openWaitTicks > organizerOpenTimeoutTicks()) {
             info("Timeout opening overflow chest.");
             emit("organize_failed", Map.of("reason", "overflow_open_timeout"));
+            BARITONE.stop();
             advanceToNextTask();
+            return;
+        }
+
+        if (openWaitTicks == 1 || openWaitTicks % OPEN_RETRY_INTERVAL_TICKS == 0) {
+            BARITONE.rightClickBlock(walkTarget[0], walkTarget[1], walkTarget[2]);
         }
     }
 
@@ -1571,14 +1862,14 @@ public final class StashOrganizer {
         }
 
         // Deposit all items from inventory
-        while (actionSlotIndex < 36) {
+        while (actionSlotIndex < 45) {
             ItemStack stack = playerContainer.getItemStack(actionSlotIndex);
             if (stack != null && stack.getAmount() > 0) {
                 int containerSlotIndex;
-                if (actionSlotIndex < 9) {
-                    containerSlotIndex = chestSlots + 27 + actionSlotIndex;
-                } else {
+                if (actionSlotIndex < 36) {
                     containerSlotIndex = chestSlots + actionSlotIndex - 9;
+                } else {
+                    containerSlotIndex = chestSlots + 27 + (actionSlotIndex - 36);
                 }
 
                 if (quickMoveSlot(containerSlotIndex)) {
@@ -1605,6 +1896,10 @@ public final class StashOrganizer {
 
         // Next batch
         currentTask = consolidationQueue.poll();
+        if (currentTask.alreadyInInventory()) {
+            startShulkerPacking(currentTask.itemId(), currentTask.destination());
+            return;
+        }
         currentRole = TargetRole.SOURCE;
         walkTarget = currentTask.source();
         actionSlotIndex = 0;
@@ -1669,6 +1964,8 @@ public final class StashOrganizer {
         restorePlaceBlockSneak();
         state = State.DONE;
         emit("organize_completed", Map.of(
+            "completed_tasks", completedTasks,
+            "total_tasks", totalTasks,
             "overflow_types", overflowItems.size()
         ));
         info("Organization complete! " + completedTasks + " moves executed.");
@@ -1699,15 +1996,35 @@ public final class StashOrganizer {
     }
 
     private void closeCurrentContainer() {
+        int cacheContainerId = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+        if (cacheContainerId <= 0) {
+            containerDataReceived = false;
+            openContainerId = -1;
+            return;
+        }
         try {
             INVENTORY.submit(InventoryActionRequest.builder()
                     .owner(this)
-                    .actions(new CloseContainer())
+                    .actions(new CloseContainer(cacheContainerId))
                     .priority(5000)
+                    .actionDelayTicks(0)
                     .build());
         } catch (Exception ignored) {}
         containerDataReceived = false;
         openContainerId = -1;
+    }
+
+    /** Closes a server window that arrived after its owning opening state was abandoned. */
+    private void closeUnexpectedContainer(int containerId) {
+        try {
+            INVENTORY.submit(InventoryActionRequest.builder()
+                    .owner(this)
+                    .actions(new CloseContainer(containerId))
+                    .priority(7000)
+                    .actionDelayTicks(0)
+                    .build());
+        } catch (Exception ignored) {
+        }
     }
 
     private void saveAndDisableBaritoneBreaking() {
@@ -1751,8 +2068,39 @@ public final class StashOrganizer {
     }
 
     private int getOpenContainerSlotCount() {
-        if (containerSlots == null) return 0;
-        return Math.max(0, containerSlots.length - 36);
+        Container open = getLiveOpenContainer();
+        return open == null ? 0 : getOpenContainerSlotCount(open);
+    }
+
+    private static int getOpenContainerSlotCount(Container open) {
+        return Math.max(0, open.getSize() - 36);
+    }
+
+    private Container getLiveOpenContainer() {
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        int cacheContainerId = inventoryCache.getOpenContainerId();
+        if (openContainerId <= 0 || cacheContainerId != openContainerId) return null;
+        Container open = inventoryCache.getOpenContainer();
+        return open.getContainerId() == openContainerId ? open : null;
+    }
+
+    private static int rawPlayerSlotToWindowSlot(int chestSlots, int rawSlot) {
+        return rawSlot < 36
+            ? chestSlots + rawSlot - 9
+            : chestSlots + 27 + rawSlot - 36;
+    }
+
+    private int organizerOpenTimeoutTicks() {
+        return Math.max(MIN_OPEN_TIMEOUT_TICKS, config.organizerOpenTimeoutTicks);
+    }
+
+    private ItemStack getCurrentPlayerInventoryStack(int rawSlot) {
+        Container open = getLiveOpenContainer();
+        if (open != null) {
+            return open.getItemStack(rawPlayerSlotToWindowSlot(getOpenContainerSlotCount(open), rawSlot));
+        }
+        Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        return player == null ? null : player.getItemStack(rawSlot);
     }
 
     // Shift-click a slot in the open container.
@@ -1783,22 +2131,19 @@ public final class StashOrganizer {
 
     // Inventory Helpers
     private boolean hasInventoryRoom() {
-        var invCache = CACHE.getPlayerCache().getInventoryCache();
-        var playerContainer = invCache.getPlayerInventory();
-        if (playerContainer == null) return false;
-
-        for (int i = HOTBAR_SIZE; i < 36; i++) {
-            ItemStack stack = playerContainer.getItemStack(i);
+        for (int i = HOTBAR_SIZE; i < 45; i++) {
+            ItemStack stack = getCurrentPlayerInventoryStack(i);
             if (stack == null || stack.getAmount() == 0) return true;
         }
         return false;
     }
 
     private boolean hasChestRoom() {
-        if (containerSlots == null || openContainerId < 0) return false;
-        int chestSlots = getOpenContainerSlotCount();
+        Container open = getLiveOpenContainer();
+        if (open == null) return false;
+        int chestSlots = getOpenContainerSlotCount(open);
         for (int i = 0; i < chestSlots; i++) {
-            ItemStack stack = containerSlots[i];
+            ItemStack stack = open.getItemStack(i);
             if (stack == null || stack.getAmount() == 0) return true;
         }
         return false;
@@ -1807,7 +2152,10 @@ public final class StashOrganizer {
     // Return true after selecting the next chest in the column.
     private boolean cascadeToNextInColumn() {
         if (currentTask == null) return false;
-        Column col = columnAssignment.get(currentTask.itemId());
+        String assignmentKey = currentTask.shulkerContentFilter() != null
+                ? currentTask.shulkerContentFilter()
+                : currentTask.itemId();
+        Column col = columnAssignment.get(assignmentKey);
         if (col == null) return false;
 
         depositColumnIndex++;
@@ -1913,7 +2261,7 @@ public final class StashOrganizer {
             case SHULKER_SELECTING, SHULKER_PLACING, SHULKER_WAIT_PLACE, SHULKER_OPENING, 
                  SHULKER_FILLING, SHULKER_CLOSING, SHULKER_BREAKING, SHULKER_PICKUP
                                    -> "Packing items into shulker...";
-            case SHULKER_FETCH_WALK, SHULKER_FETCH_OPEN, SHULKER_FETCH_TAKE
+            case SHULKER_FETCH_WALK, SHULKER_FETCH_OPEN, SHULKER_FETCH_TAKE, SHULKER_FETCH_CLOSING
                                    -> "Fetching empty shulker...";
             case SHULKER_STORE_WALK, SHULKER_STORE_OPEN, SHULKER_STORE_DEPOSIT
                                    -> "Storing filled shulker...";
@@ -1965,7 +2313,19 @@ public final class StashOrganizer {
         return false;
     }
 
-    private boolean hasEmptyShulkerInRegion() {
+    private boolean hasPackedShulkerInInventory() {
+        var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (playerContainer == null) return false;
+        for (int i = 9; i <= 44; i++) {
+            ItemStack stack = playerContainer.getItemStack(i);
+            if (stack == null || stack.getAmount() <= 0 || !isShulkerBoxItem(itemIdFromStack(stack))) continue;
+            String primary = getPrimaryContent(ItemIdentifier.readShulkerContents(stack));
+            if (ItemIdentifier.contentItemIdsMatch(packItemId, primary)) return true;
+        }
+        return false;
+    }
+
+    private boolean hasPotentialShulkerInRegion() {
         for (ContainerEntry container : index.getAll()) {
             if (isInRegion(container.x(), container.y(), container.z())) {
                 for (String itemId : container.items().keySet()) {
@@ -1979,11 +2339,13 @@ public final class StashOrganizer {
     }
 
     private void startFetchShulker() {
-        // Find container with shulker
+        // Index summaries are aggregate, so visit each candidate at most once and let the
+        // live open window decide whether it contains an empty box.
         for (ContainerEntry container : index.getAll()) {
             if (isInRegion(container.x(), container.y(), container.z())) {
                 for (String itemId : container.items().keySet()) {
-                    if (isShulkerBoxItem(itemId)) {
+                    long key = posKey(container.x(), container.y(), container.z());
+                    if (isShulkerBoxItem(itemId) && shulkerFetchTriedSources.add(key)) {
                         walkTarget = new int[]{container.x(), container.y(), container.z()};
                         state = State.SHULKER_FETCH_WALK;
                         openWaitTicks = 0;
@@ -2141,4 +2503,3 @@ public final class StashOrganizer {
         return x >= minX && x <= maxX && y >= minY && y <= maxY && z >= minZ && z <= maxZ;
     }
 }
-

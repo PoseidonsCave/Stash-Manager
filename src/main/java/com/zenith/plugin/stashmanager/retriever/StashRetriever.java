@@ -991,7 +991,9 @@ public final class StashRetriever {
         var playerContainer = invCache.getPlayerInventory();
         if (playerContainer == null) return false;
 
-        for (int i = 9; i < 36; i++) {
+        // Raw player inventory container is size 46: 9-35=main inventory, 36-44=hotbar —
+        // must check both ranges or a full main inventory with a free hotbar slot looks full.
+        for (int i = 9; i < 45; i++) {
             ItemStack stack = playerContainer.getItemStack(i);
             if (stack == null || stack.getAmount() == 0) return true;
         }

@@ -123,6 +123,22 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stash organize` | Start sorting items across containers by type |
 | `stash organize stop` | Stop the organizer mid-run |
 | `stash organize status` | Show organizer state and progress |
+| `stash lanes` | Calculate dedicated-lane capacity from the latest scan |
+
+The organizer treats each physical shulker as empty, homogeneous bulk, or mixed. Only
+homogeneous bulk boxes are assigned to bulk storage lanes; mixed boxes, including premade kits,
+are preserved until an explicit kit policy exists. Existing homogeneous lanes are reused, and
+each bulk item variant requires its own lane. Planning stops with a capacity diagnostic if there
+are not enough unassigned lanes instead of silently sharing a lane.
+
+Loose bulk items are reconciled only after lane planning succeeds. The bot batches the same exact
+item variant across source chests, tops off compatible partial shulkers before consuming empty
+ones, and performs temporary shulker placement at the organizer's starting position. After
+upgrading from a version that aggregated shulkers by color, run a fresh `stash scan` before
+`stash organize`; legacy records are intentionally unclassified so kit contents are never guessed.
+Every completed scan runs the same audit automatically. The report compares assignable lanes with
+the number of exact bulk item variants, reports spare lanes or the exact shortfall, and is also
+available from `GET /api/v1/organizer` under `lane_capacity`.
 
 ### Supply Chests
 
@@ -143,6 +159,7 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config scanDelay <ticks>` | Ticks between container reads (1–200) |
 | `stash config openTimeout <ticks>` | Max wait ticks for container open response (1–600) |
 | `stash config maxContainers <count>` | Container cap per scan session (1–100000) |
+| `stash config preemptionCooldown <seconds>` | Minimum scanner pause after another automation task takes control (1–3600) |
 | `stash config waypointDistance <blocks>` | Walk distance for unloaded chunks (1–256) |
 | `stash config returnToStart <on\|off>` | Return bot to start position after scan |
 | **Database** | |
@@ -181,9 +198,10 @@ Saved automatically via ZenithProxy's plugin config system.
 |---------|---------|-------------|
 | `enabled` | `true` | Enable/disable the module |
 | `scanDelayTicks` | `5` | Ticks between container reads |
-| `openTimeoutTicks` | `60` | Max wait for container open response |
+| `openTimeoutTicks` | `400` | Max wait for container open response |
 | `maxContainers` | `2048` | Container cap per scan session |
 | `waypointDistance` | `48` | Walk distance for unloaded chunks |
+| `scanPreemptionCooldownSeconds` | `300` | Minimum pause after yielding to another automation task |
 | `returnToStart` | `true` | Pathfind back to starting position after scan |
 
 ### Organizer
@@ -311,7 +329,7 @@ This shows the connection state and how many containers/items are stored.
 - **History** — `scan_history` table tracks every scan run with timestamps and counts
 - **Bulk export** — `stash export` pulls from the database for complete CSV dumps
 - **Stable organize layout** — once the database is enabled, the organizer remembers which
-  column each item type was assigned to and reuses it on future `stash organize` runs instead
+  dedicated lane each bulk item variant was assigned to and reuses it on future `stash organize` runs instead
   of recomputing (and potentially reshuffling) assignments from scratch. Without a configured
   database this falls back to in-memory-only assignment for that session, so persistent stash
   organization is on the end user to set up (see Database Setup below) if you want it.
@@ -322,6 +340,7 @@ This shows the connection state and how many containers/items are stored.
 |-------|----------|
 | `containers` | Position, type, dimension, item count, first/last seen timestamps, label |
 | `container_items` | Slot, item ID, display name, count per container |
+| `container_shulkers` | Physical shulker slot and color per container, including empty boxes |
 | `scan_history` | Start/end time, container count, status per scan run |
 | `regions` | Named scan regions with pos1/pos2 coordinates |
 | `config` | Key-value plugin configuration pairs |
@@ -367,6 +386,14 @@ stashmanager_api_uptime_seconds 3600
 stash_organizer_active 0
 stash_organizer_tasks_completed 0
 stash_organizer_tasks_total 0
+stash_lane_capacity_ready 1
+stash_lanes_detected 24
+stash_lanes_assignable 22
+stash_lanes_required 18
+stash_lanes_spare 4
+stash_lanes_shortfall 0
+stash_shulkers_mixed 3
+stash_shulkers_unclassified 0
 ```
 
 Add this as a Prometheus scrape target and build Grafana dashboards from the `stashmanager_*` metrics.

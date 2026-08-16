@@ -76,6 +76,17 @@ public final class ItemIdentifier {
         return bracket >= 0 ? itemId.substring(0, bracket) : itemId;
     }
 
+    // Variant-aware compatibility match. Fresh fortune and silk-touch identifiers must stay
+    // distinct; base-ID fallback is only for a legacy index value that has no suffix at all.
+    public static boolean contentItemIdsMatch(String expected, String actual) {
+        if (expected == null || actual == null) return false;
+        if (expected.equals(actual)) return true;
+        boolean expectedHasVariant = expected.indexOf('[') >= 0;
+        boolean actualHasVariant = actual.indexOf('[') >= 0;
+        if (expectedHasVariant && actualHasVariant) return false;
+        return baseItemId(expected).equals(baseItemId(actual));
+    }
+
     private static String getPickaxeEnchantSuffix(ItemStack stack) {
         try {
             DataComponents components = stack.getDataComponents();

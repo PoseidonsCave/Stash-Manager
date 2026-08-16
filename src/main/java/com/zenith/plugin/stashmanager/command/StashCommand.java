@@ -1814,7 +1814,9 @@ public class StashCommand extends Command {
         var playerContainer = invCache.getPlayerInventory();
         if (playerContainer == null) return snapshot;
 
-        for (int slot = 0; slot < 36; slot++) {
+        // Raw player inventory container is size 46: 0-4=crafting, 5-8=armor, 9-35=main
+        // inventory, 36-44=hotbar, 45=offhand — only 9-44 are actual carried items.
+        for (int slot = 9; slot < 45; slot++) {
             ItemStack stack = playerContainer.getItemStack(slot);
             if (stack == null || stack.getAmount() <= 0) continue;
             String itemId = itemIdFromStack(stack);

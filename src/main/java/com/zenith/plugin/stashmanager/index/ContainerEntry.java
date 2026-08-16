@@ -21,11 +21,21 @@ public record ContainerEntry(
 
     // Per-shulker breakdown: color and items inside.
     public record ShulkerDetail(
+        int slot,
         String color,
         Map<String, Integer> items
     ) {
         public ShulkerDetail {
             items = items == null ? Collections.emptyMap() : new LinkedHashMap<>(items);
+        }
+
+        // Legacy scans/database rows were aggregated by color and have no physical slot.
+        public ShulkerDetail(String color, Map<String, Integer> items) {
+            this(-1, color, items);
+        }
+
+        public boolean isPhysicalInstance() {
+            return slot >= 0;
         }
     }
 
