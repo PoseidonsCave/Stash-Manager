@@ -9,11 +9,15 @@ import com.zenith.feature.inventory.actions.SetHeldItem;
 import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
+import com.zenith.feature.player.Input;
+import com.zenith.feature.player.InputRequest;
 import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
+import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
+import com.zenith.plugin.stashmanager.orchestration.SneakReleaseGate;
 import com.zenith.plugin.stashmanager.organizer.lane.FifoLane;
 import com.zenith.plugin.stashmanager.organizer.lane.LaneDetector;
 import com.zenith.plugin.stashmanager.util.BaritoneCompat;
@@ -41,6 +45,8 @@ import java.util.function.BiConsumer;
 
 import static com.zenith.Globals.BARITONE;
 import static com.zenith.Globals.CACHE;
+import static com.zenith.Globals.BOT;
+import static com.zenith.Globals.INPUTS;
 import static com.zenith.Globals.INVENTORY;
 
 // Retrieves requested items from candidate containers.
@@ -56,9 +62,7 @@ public final class StashRetriever {
     }
 
     private static final int OPEN_TIMEOUT_TICKS = 60;
-    // Zenith's own InventoryManager only executes a queued action every actionDelayTicks (5
-    // by default) — submitting faster than that gets silently rejected, so this must stay
-    // at or above that value.
+    // Match Zenith's default 5-tick click cadence; faster submissions are rejected.
     private static final int CLICK_COOLDOWN_TICKS = 6;
     private static final int WALK_TIMEOUT_TICKS = 400;
     private static final int MAX_CONSECUTIVE_FAILURES = 4;
@@ -89,6 +93,7 @@ public final class StashRetriever {
     private int consecutiveFailures;
     private int initialRequestedTotal;
     private int successfulTransfers;
+    private final SneakReleaseGate containerOpenGate = new SneakReleaseGate();
 
     private volatile boolean containerDataReceived = false;
     private volatile int openContainerId = -1;
@@ -286,12 +291,12 @@ public final class StashRetriever {
         walkingTicks++;
 
         double dist = distanceTo(currentTarget[0], currentTarget[1], currentTarget[2]);
-        if (dist <= 5.0) {
+        if (isAtTargetAccessPosition()) {
             BARITONE.stop();
             state = State.OPENING;
+            containerOpenGate.reset();
             openWaitTicks = 0;
             containerDataReceived = false;
-            interactWithTarget();
             return;
         }
 
@@ -315,8 +320,6 @@ public final class StashRetriever {
     }
 
     private void tickOpening() {
-        openWaitTicks++;
-
         if (containerDataReceived) {
             state = State.TAKING;
             actionSlotIndex = 0;
@@ -325,14 +328,16 @@ public final class StashRetriever {
             return;
         }
 
+        if (!prepareStandingContainerInteraction()) return;
+        openWaitTicks++;
+
         if (openWaitTicks > OPEN_TIMEOUT_TICKS) {
             consecutiveFailures++;
             advanceToNextTarget("open_timeout");
             return;
         }
 
-        // A single missed right-click (rotation not settled, brief lag, etc.) should not
-        // doom the whole target — retry periodically like tickUnloadOpen does.
+        // Retry missed opens instead of failing the target.
         if (openWaitTicks == 1 || openWaitTicks % 10 == 0) {
             interactWithTarget();
         }
@@ -344,7 +349,7 @@ public final class StashRetriever {
             return;
         }
 
-        // Drive any in-progress partial-take split first
+        // Finish the current split before taking another slot.
         if (splitInProgress) {
             if (tickSplitTake()) {
                 actionCooldown = CLICK_COOLDOWN_TICKS;
@@ -375,7 +380,7 @@ public final class StashRetriever {
 
                 if ((wantedDirectly || wantedForContents) && hasInventoryRoom()) {
                     
-                    // If wanted directly and stack exceeds need, do partial-take split
+                    // Split stacks larger than the remaining request.
                     if (wantedDirectly && !wantedForContents && needed != null && needed > 0 && stack.getAmount() > needed) {
                         beginSplitTake(actionSlotIndex, itemId, stack.getAmount(), needed);
                         actionSlotIndex++;
@@ -392,7 +397,7 @@ public final class StashRetriever {
                     actionCooldown = CLICK_COOLDOWN_TICKS;
 
                     if (wantedForContents) {
-                        // Track this shulker as owned since we're taking it for contents
+                        // Track shulkers borrowed for unloading.
                         beginTrackingOwnedShulker(stack, chestSlots);
                         
                         int[] revisitTarget = currentTarget == null ? null : currentTarget.clone();
@@ -457,8 +462,7 @@ public final class StashRetriever {
             return;
         }
 
-        // Sneak while placing so the right-click places the shulker instead of opening
-        // whatever interactive block (chest, barrel, etc.) happens to be nearby.
+        // Sneak so right-click places the shulker instead of opening a nearby container.
         setPlaceBlockSneak(unloadPhase == 1);
 
         switch (unloadPhase) {
@@ -546,6 +550,7 @@ public final class StashRetriever {
                 "placed_position", posString(placedShulkerPos)
             ));
             unloadPhase = 2;
+            containerOpenGate.reset();
             unloadTicks = 0;
             unloadPlaceFuture = null;
             return;
@@ -592,6 +597,11 @@ public final class StashRetriever {
             unloadTicks = 0;
             actionCooldown = 0;
             actionSlotIndex = 0;
+            return;
+        }
+
+        if (!prepareStandingContainerInteraction()) {
+            unloadTicks = 0;
             return;
         }
 
@@ -867,10 +877,7 @@ public final class StashRetriever {
         return score;
     }
 
-    // Like matchScore, but only counts quantities available loose in the
-    // container itself — not merged-in shulker contents, which require an
-    // extra take-and-unload step. Used to prefer quick direct grabs when
-    // otherwise tied (e.g. a lane's input vs. output chest).
+    // Count loose items only; prefer direct grabs when total scores tie.
     private int directMatchScore(ContainerEntry entry) {
         Map<String, Integer> direct = new HashMap<>(entry.items());
         for (ContainerEntry.ShulkerDetail sd : entry.shulkerDetails()) {
@@ -900,8 +907,7 @@ public final class StashRetriever {
         if (!isShulkerBoxItem(itemId)) return false;
 
         for (var entry : ItemIdentifier.readShulkerContents(stack).entrySet()) {
-            // Match by base item id too — a shulker holding an enchanted tool (e.g.
-            // "diamond_pickaxe[fortune]") should still satisfy a plain "diamond_pickaxe" request.
+            // Let suffixed tool variants satisfy base-item requests.
             Integer needed = remaining.get(entry.getKey());
             if (needed == null) needed = remaining.get(ItemIdentifier.baseItemId(entry.getKey()));
             if (needed != null && needed > 0 && entry.getValue() > 0) {
@@ -940,9 +946,29 @@ public final class StashRetriever {
         BARITONE.pathTo(new GoalGetToBlock(new BlockPos(currentTarget[0], currentTarget[1], currentTarget[2])));
     }
 
+    private boolean isAtTargetAccessPosition() {
+        if (currentTarget == null) return false;
+        var playerCache = CACHE.getPlayerCache();
+        return ContainerApproach.isAtAccessPosition(
+            playerCache.getX(), playerCache.getY(), playerCache.getZ(),
+            currentTarget[0], currentTarget[1], currentTarget[2]);
+    }
+
     private void interactWithTarget() {
         if (currentTarget == null) return;
         BARITONE.rightClickBlock(currentTarget[0], currentTarget[1], currentTarget[2]);
+    }
+
+    private boolean prepareStandingContainerInteraction() {
+        setPlaceBlockSneak(false);
+        BARITONE.stop();
+        if (containerOpenGate.tick(BOT.isSneaking())) return true;
+        INPUTS.submit(InputRequest.builder()
+            .owner(this)
+            .input(Input.builder().sneaking(false).build())
+            .priority(SneakReleaseGate.INPUT_PRIORITY)
+            .build());
+        return false;
     }
 
     private void closeCurrentContainer() {
@@ -963,13 +989,7 @@ public final class StashRetriever {
         return Math.max(0, containerSlots.length - 36);
     }
 
-    // Goes through Zenith's own InventoryManager queue (ShiftClick action) instead of
-    // hand-rolling the raw packet ourselves — that queue builds the packet fresh at actual
-    // execution time (correct action/state id, no off-by-one) and verifies the container id
-    // still matches what's currently open before sending, which our own raw send never did.
-    // Returns false if InventoryManager rejected the submission outright (e.g. a previous
-    // action from this or another owner is still pending) — callers must NOT treat the slot
-    // as handled when this returns false, or progress gets reported without anything moving.
+    // Use Zenith's queue for current action/container IDs; false means the click was rejected.
     private boolean quickMoveSlot(int slot) {
         if (openContainerId < 0) return false;
 
@@ -991,8 +1011,7 @@ public final class StashRetriever {
         var playerContainer = invCache.getPlayerInventory();
         if (playerContainer == null) return false;
 
-        // Raw player inventory container is size 46: 9-35=main inventory, 36-44=hotbar —
-        // must check both ranges or a full main inventory with a free hotbar slot looks full.
+        // Player inventory: main 9-35, hotbar 36-44.
         for (int i = 9; i < 45; i++) {
             ItemStack stack = playerContainer.getItemStack(i);
             if (stack == null || stack.getAmount() == 0) return true;
@@ -1044,9 +1063,7 @@ public final class StashRetriever {
         return playerContainer.getItemStack(slot);
     }
 
-    // Searches a wide area around the player rather than a small fixed ring, so a spot
-    // further down a packed shelving aisle can still be found even if the immediate
-    // neighbors are all chests; picks the closest valid spot rather than the first found.
+    // Search broadly and use the nearest safe placement spot.
     private int[] findShulkerPlaceSpot() {
         int baseX = (int) Math.floor(CACHE.getPlayerCache().getX());
         int baseY = (int) Math.floor(CACHE.getPlayerCache().getY());
@@ -1067,9 +1084,7 @@ public final class StashRetriever {
                     var targetBlock = World.getBlock(x, y, z);
                     var aboveBlock = World.getBlock(x, y + 1, z);
                     var belowBlock = World.getBlock(x, y - 1, z);
-                    // Baritone tries every neighboring face (down/south/east/north/west/up) to place
-                    // against, not just the one below — any of them being a container/GUI block
-                    // means a right-click there opens it instead of placing the shulker.
+                    // Reject spots where any placement face can open a container.
                     var northBlock = World.getBlock(x, y, z - 1);
                     var southBlock = World.getBlock(x, y, z + 1);
                     var eastBlock = World.getBlock(x + 1, y, z);
@@ -1133,15 +1148,14 @@ public final class StashRetriever {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
-    // Split-Take (Partial Stack Retrieval)
-    // Return true when this tick sends an inventory click.
+    // Return true when this tick submits a split-stack click.
     private boolean tickSplitTake() {
         if (serverSession == null || openContainerId < 0) {
             resetSplit();
             return false;
         }
 
-        // Step 1: pick up the source stack to cursor
+        // Pick up the source stack.
         if (!splitCursorReady) {
             if (!submitClickItem(splitSrcSlot, ClickItemAction.LEFT_CLICK)) {
                 return true;
@@ -1150,7 +1164,7 @@ public final class StashRetriever {
             return true;
         }
 
-        // Step 2: right-click source to drop excess back, one item per tick
+        // Put excess items back one per tick.
         if (splitPutbacksLeft > 0) {
             if (!submitClickItem(splitSrcSlot, ClickItemAction.RIGHT_CLICK)) {
                 return true;
@@ -1159,7 +1173,7 @@ public final class StashRetriever {
             return true;
         }
 
-        // Step 3: drop the kept portion into an empty player slot
+        // Move the kept portion to an empty player slot.
         int chestSlots = getOpenContainerSlotCount();
         int playerStart = chestSlots;
         int dropSlot = -1;
@@ -1174,7 +1188,7 @@ public final class StashRetriever {
         }
 
         if (dropSlot == -1) {
-            // No room. Put cursor back at source as fallback and bail
+            // Restore the source stack when inventory is full.
             submitClickItem(splitSrcSlot, ClickItemAction.LEFT_CLICK);
             resetSplit();
             return true;
@@ -1184,15 +1198,13 @@ public final class StashRetriever {
             return true;
         }
 
-        // Record that we took the needed amount
+        // Record the amount moved.
         recordTaken(splitItemId, splitNeeded);
         resetSplit();
         return true;
     }
 
-    // Submit a CLICK_ITEM action for the split-take state machine and report whether
-    // InventoryManager actually accepted it — a rejected submission must not be treated
-    // as having happened, or the split-take steps advance past clicks that never landed.
+    // Advance split state only after InventoryManager accepts the click.
     private boolean submitClickItem(int slot, ClickItemAction action) {
         try {
             var future = INVENTORY.submit(InventoryActionRequest.builder()
@@ -1207,7 +1219,7 @@ public final class StashRetriever {
         }
     }
 
-    // Begin a partial-take split for a slot whose stack exceeds what we need.
+    // Start splitting a stack larger than the remaining request.
     private void beginSplitTake(int srcSlot, String itemId, int stackCount, int needed) {
         splitInProgress = true;
         splitSrcSlot = srcSlot;
@@ -1234,13 +1246,12 @@ public final class StashRetriever {
         consecutiveFailures = 0; // reset on successful take
     }
 
-    // Owned Shulker Tracking
-    // Track where a borrowed shulker lands in player inventory.
+    // Track where a borrowed shulker lands.
     private void beginTrackingOwnedShulker(ItemStack stack, int chestSlots) {
         pendingOwnedShulkerFingerprint = shulkerFingerprint(stack);
         pendingOwnedShulkerCandidateSlots.clear();
         
-        // Record all empty player inventory slots as candidates
+        // Record possible destination slots.
         if (containerSlots != null) {
             for (int slot = chestSlots; slot < chestSlots + 36; slot++) {
                 if (slot < containerSlots.length) {
@@ -1253,7 +1264,7 @@ public final class StashRetriever {
         }
     }
 
-    // Match the borrowed shulker against its candidate slots.
+    // Resolve the borrowed shulker's destination slot.
     private void resolvePendingOwnedShulker() {
         if (pendingOwnedShulkerFingerprint == null || pendingOwnedShulkerCandidateSlots.isEmpty()) return;
 
@@ -1277,7 +1288,7 @@ public final class StashRetriever {
         }
     }
 
-    // Keep ownership aligned with inventory swaps.
+    // Follow ownership through inventory swaps.
     private void swapOwnedShulkerSlots(int slotA, int slotB) {
         boolean ownedA = ownedShulkerSlots.remove(slotA);
         boolean ownedB = ownedShulkerSlots.remove(slotB);
@@ -1334,7 +1345,7 @@ public final class StashRetriever {
         return false;
     }
 
-    // Return the matching inventory slot, or -1 when none exists.
+    // Return a matching owned slot, or -1.
     private int findShulkerWithNeededItems() {
         resolvePendingOwnedShulker();
         
@@ -1357,9 +1368,7 @@ public final class StashRetriever {
                 continue;
             }
 
-            // Check if shulker contains needed items
-            // Would need NBT reading to check contents
-            // Simplified: assume it has needed items if it's tracked
+            // Owned shulkers were selected because they contained requested items.
             for (String neededItem : remaining.keySet()) {
                 if (remaining.get(neededItem) > 0) {
                     return slot;
@@ -1370,4 +1379,3 @@ public final class StashRetriever {
         return -1;
     }
 }
-

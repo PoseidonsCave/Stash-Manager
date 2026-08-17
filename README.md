@@ -123,7 +123,13 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stash organize` | Start sorting items across containers by type |
 | `stash organize stop` | Stop the organizer mid-run |
 | `stash organize status` | Show organizer state and progress |
-| `stash lanes` | Calculate dedicated-lane capacity from the latest scan |
+| `stash lanes` | Show lane count, per-item lane sizes, and required double-chest construction |
+| `stash lanes export` | Download the styled, coordinate-free lane planning workbook as XLSX |
+| `stash import` | Assign the chest currently being faced as an organizer intake chest |
+| `stash import remove` | Remove the intake role from the chest currently being faced |
+| `stash import list` | List persisted intake chest block positions |
+| `stash import purge` | Preview removal of every persisted import assignment |
+| `stash import purge confirm` | Remove every import assignment without altering chest contents |
 
 The organizer treats each physical shulker as empty, homogeneous bulk, or mixed. Only
 homogeneous bulk boxes are assigned to bulk storage lanes; mixed boxes, including premade kits,
@@ -139,6 +145,26 @@ upgrading from a version that aggregated shulkers by color, run a fresh `stash s
 Every completed scan runs the same audit automatically. The report compares assignable lanes with
 the number of exact bulk item variants, reports spare lanes or the exact shortfall, and is also
 available from `GET /api/v1/organizer` under `lane_capacity`.
+
+The audit also calculates storage volume, not just lane count. Each class is converted into the
+number of shulker slots it requires using the item's real stack size, existing homogeneous boxes,
+and reusable space in partially filled matching boxes. Classes are assigned largest-first to a
+lane with enough physical chest slots. Organization fails closed with
+`INSUFFICIENT_LANE_STORAGE` when the lane count is sufficient but no individual lane can hold a
+class. Per-class allocations and shortfalls are exposed under `lane_storage` in the organizer API.
+`stash lanes` converts those slot requirements into minimum double-chest counts for every item
+lane. It reports how many new lanes must be built, which existing lanes can be expanded, and the
+total number of double chests to add. The coordinate-free XLSX export separates its summary,
+actionable construction plan, and complete lane audit into styled, filterable sheets. The same
+sanitized construction plan is available under `lane_construction` in the organizer API.
+
+Standalone inventories are outside the organizer's ownership boundary unless explicitly assigned
+with `stash import`. Import chests are persistent intake sources: `stash organize` drains their
+loose items and shulkers into the established lane scheme, but never selects an import chest as a
+destination. The import role belongs to the chest, not its cargo: loose or filled shulker-box
+items already in a storage lane or the bot inventory continue through normal reconciliation, and
+shulkers taken from an import chest use that exact same path. Facing either half of a double chest
+assigns or removes both halves atomically.
 
 ### Supply Chests
 

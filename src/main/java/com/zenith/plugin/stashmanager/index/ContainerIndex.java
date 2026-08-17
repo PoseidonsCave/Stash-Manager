@@ -6,13 +6,22 @@ import com.zenith.plugin.stashmanager.organizer.lane.LaneDetector;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 // Thread-safe in-memory container inventory index with optional DB persistence.
 public class ContainerIndex {
+    private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/ContainerIndex");
 
     private final ConcurrentHashMap<Long, ContainerEntry> entries = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, int[]> importChests = new ConcurrentHashMap<>();
+    private final AtomicLong databaseWriteFailures = new AtomicLong();
     private volatile long lastScanTimestamp = 0;
+    private volatile boolean databaseWriteHealthy = true;
+    private volatile boolean databaseWriteFailureLogged = false;
     private DatabaseManager database;
 
     public void setDatabase(DatabaseManager database) {
@@ -32,13 +41,87 @@ public class ContainerIndex {
         entries.put(entry.posKey(), entry);
         lastScanTimestamp = System.currentTimeMillis();
 
-        // Persist to database asynchronously
+        // Preserve the in-memory scan even if persistence fails, but expose and log that
+        // distinction so an apparently successful scan cannot silently leave PostgreSQL empty.
         if (database != null && database.isInitialized()) {
             try {
                 database.upsertContainer(entry);
+                databaseWriteHealthy = true;
+                databaseWriteFailureLogged = false;
             } catch (Exception e) {
-                // Log but don't fail the in-memory operation
+                databaseWriteHealthy = false;
+                databaseWriteFailures.incrementAndGet();
+                if (!databaseWriteFailureLogged) {
+                    databaseWriteFailureLogged = true;
+                    LOGGER.error("Failed to persist container at [{}]; further failures are suppressed until a successful write",
+                        entry.posString(), e);
+                }
             }
+        }
+    }
+
+    public boolean isDatabaseWriteHealthy() {
+        return databaseWriteHealthy;
+    }
+
+    public long getDatabaseWriteFailures() {
+        return databaseWriteFailures.get();
+    }
+
+    public boolean isImportChest(int x, int y, int z) {
+        return importChests.containsKey(positionKey(x, y, z));
+    }
+
+    public boolean isImportChest(ContainerEntry entry) {
+        return entry != null && isImportChest(entry.x(), entry.y(), entry.z());
+    }
+
+    public int getImportChestBlockCount() {
+        return importChests.size();
+    }
+
+    public List<int[]> getImportChests() {
+        return importChests.values().stream()
+            .map(pos -> new int[]{pos[0], pos[1], pos[2]})
+            .sorted(Comparator.<int[]>comparingInt(pos -> pos[0])
+                .thenComparingInt(pos -> pos[1])
+                .thenComparingInt(pos -> pos[2]))
+            .toList();
+    }
+
+    public void addImportChests(Collection<int[]> positions) throws Exception {
+        requireDatabase();
+        database.addImportChests(positions);
+        cacheImportChests(positions, true);
+    }
+
+    public void removeImportChests(Collection<int[]> positions) throws Exception {
+        requireDatabase();
+        database.removeImportChests(positions);
+        cacheImportChests(positions, false);
+    }
+
+    /** Clears persistence first; the cache changes only after the database mutation succeeds. */
+    public int clearImportChests() throws Exception {
+        requireDatabase();
+        int removed = database.clearImportChests();
+        importChests.clear();
+        return removed;
+    }
+
+    private void requireDatabase() {
+        if (database == null || !database.isInitialized()) {
+            throw new IllegalStateException("Database is not connected; import chest assignments require persistence.");
+        }
+    }
+
+    private void cacheImportChests(Collection<int[]> positions, boolean add) {
+        if (positions == null) return;
+        for (int[] pos : positions) {
+            if (pos == null || pos.length < 3) continue;
+            long key = positionKey(pos[0], pos[1], pos[2]);
+            if (add) importChests.put(key, new int[]{pos[0], pos[1], pos[2]});
+            else importChests.remove(key);
         }
     }
 
@@ -73,6 +156,25 @@ public class ContainerIndex {
         }
     }
 
+    /**
+     * Makes a completed regional scan authoritative. Persistence is updated first so an SQL
+     * failure cannot leave the in-memory view cleaner than the durable index.
+     */
+    public int pruneRegionExcept(int[] pos1, int[] pos2, Set<Long> retainedPositionKeys)
+            throws Exception {
+        if (pos1 == null || pos2 == null) return 0;
+        Set<Long> retained = retainedPositionKeys == null ? Set.of() : Set.copyOf(retainedPositionKeys);
+        List<ContainerEntry> stale = getInRegion(pos1, pos2).stream()
+                .filter(entry -> !retained.contains(entry.posKey()))
+                .toList();
+        if (stale.isEmpty()) return 0;
+
+        requireDatabase();
+        database.deleteContainers(stale);
+        stale.forEach(entry -> entries.remove(entry.posKey(), entry));
+        return stale.size();
+    }
+
     // Load all container entries from the database into the in-memory index.
     // Returns the number of entries loaded.
     public int loadFromDatabase() {
@@ -88,10 +190,16 @@ public class ContainerIndex {
                     .max()
                     .orElse(System.currentTimeMillis());
             }
+            importChests.clear();
+            cacheImportChests(database.loadImportChests(), true);
             return all.size();
         } catch (Exception e) {
             return 0;
         }
+    }
+
+    private static long positionKey(int x, int y, int z) {
+        return ((long) x & 0x3FFFFFFL) << 38 | ((long) y & 0xFFFL) << 26 | ((long) z & 0x3FFFFFFL);
     }
 
     public long getLastScanTimestamp() {

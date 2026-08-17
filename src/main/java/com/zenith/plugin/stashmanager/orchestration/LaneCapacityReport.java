@@ -2,7 +2,7 @@ package com.zenith.plugin.stashmanager.orchestration;
 
 import java.util.List;
 
-/** Immutable result of auditing scanned storage against the organizer's lane policy. */
+/** Snapshot of the latest lane-capacity audit. */
 public record LaneCapacityReport(
         Status status,
         int regionContainers,
@@ -16,12 +16,16 @@ public record LaneCapacityReport(
         int emptyShulkers,
         int mixedShulkers,
         int unclassifiedShulkers,
-        List<String> storageClasses) {
+        List<String> storageClasses,
+        LaneStorageCapacity.Report laneStorage,
+        List<LaneStorageCapacity.Lane> lanes) {
 
     public enum Status {
         READY,
         INSUFFICIENT_LANES,
+        INSUFFICIENT_LANE_STORAGE,
         NEEDS_FRESH_SCAN,
+        NEEDS_FRESH_CONTAINER_SCAN,
         REGION_NOT_DEFINED,
         NO_SCANNED_CONTAINERS,
         NO_LANES_DETECTED
@@ -29,11 +33,15 @@ public record LaneCapacityReport(
 
     public LaneCapacityReport {
         storageClasses = storageClasses == null ? List.of() : List.copyOf(storageClasses);
+        laneStorage = laneStorage == null
+                ? LaneStorageCapacity.assess(List.of(), List.of())
+                : laneStorage;
+        lanes = lanes == null ? List.of() : List.copyOf(lanes);
     }
 
     public static LaneCapacityReport unavailable(Status status) {
         return new LaneCapacityReport(status, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, List.of());
+                0, 0, 0, 0, List.of(), LaneStorageCapacity.assess(List.of(), List.of()), List.of());
     }
 
     public static LaneCapacityReport assess(
@@ -45,6 +53,20 @@ public record LaneCapacityReport(
             int emptyShulkers,
             int mixedShulkers,
             int unclassifiedShulkers) {
+        return assess(regionContainers, detectedLanes, protectedLanes, storageClasses,
+                bulkShulkers, emptyShulkers, mixedShulkers, unclassifiedShulkers, null);
+    }
+
+    public static LaneCapacityReport assess(
+            int regionContainers,
+            int detectedLanes,
+            int protectedLanes,
+            List<String> storageClasses,
+            int bulkShulkers,
+            int emptyShulkers,
+            int mixedShulkers,
+            int unclassifiedShulkers,
+            LaneStorageCapacity.Report laneStorage) {
         List<String> classes = storageClasses == null ? List.of() : List.copyOf(storageClasses);
         DedicatedLaneCapacity capacity = DedicatedLaneCapacity.assess(
                 detectedLanes, protectedLanes, classes.size());
@@ -56,6 +78,8 @@ public record LaneCapacityReport(
             status = Status.NO_LANES_DETECTED;
         } else if (!capacity.feasible()) {
             status = Status.INSUFFICIENT_LANES;
+        } else if (laneStorage != null && !laneStorage.feasible()) {
+            status = Status.INSUFFICIENT_LANE_STORAGE;
         } else {
             status = Status.READY;
         }
@@ -73,10 +97,55 @@ public record LaneCapacityReport(
                 Math.max(0, emptyShulkers),
                 Math.max(0, mixedShulkers),
                 Math.max(0, unclassifiedShulkers),
-                classes);
+                classes,
+                laneStorage,
+                laneStorage == null ? List.of() : java.util.stream.Stream.concat(
+                        laneStorage.allocations().stream().map(LaneStorageCapacity.Allocation::lane),
+                        laneStorage.unallocatedLanes().stream())
+                        .distinct()
+                        .toList());
     }
 
     public boolean canOrganize() {
         return status == Status.READY;
+    }
+
+    /** Override status without discarding calculated capacity. */
+    public LaneCapacityReport withStatus(Status replacement) {
+        return new LaneCapacityReport(
+                replacement,
+                regionContainers,
+                detectedLanes,
+                protectedLanes,
+                assignableLanes,
+                requiredStorageClasses,
+                laneShortfall,
+                spareLanes,
+                bulkShulkers,
+                emptyShulkers,
+                mixedShulkers,
+                unclassifiedShulkers,
+                storageClasses,
+                laneStorage,
+                lanes);
+    }
+
+    public LaneCapacityReport withLanes(List<LaneStorageCapacity.Lane> replacement) {
+        return new LaneCapacityReport(
+                status,
+                regionContainers,
+                detectedLanes,
+                protectedLanes,
+                assignableLanes,
+                requiredStorageClasses,
+                laneShortfall,
+                spareLanes,
+                bulkShulkers,
+                emptyShulkers,
+                mixedShulkers,
+                unclassifiedShulkers,
+                storageClasses,
+                laneStorage,
+                replacement);
     }
 }

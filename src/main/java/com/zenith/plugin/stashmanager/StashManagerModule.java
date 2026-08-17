@@ -6,8 +6,10 @@ import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
-import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
+import com.zenith.feature.player.Input;
+import com.zenith.feature.player.InputRequest;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
@@ -15,18 +17,28 @@ import com.zenith.network.codec.PacketHandlerStateCodec;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.debug.DebugRecorder;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.orchestration.CooperativePreemptionGate;
+import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
+import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
+import com.zenith.plugin.stashmanager.orchestration.OpenRetryCadence;
+import com.zenith.plugin.stashmanager.orchestration.SneakReleaseGate;
+import com.zenith.plugin.stashmanager.orchestration.TailRetryTracker;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
 import com.zenith.plugin.stashmanager.retriever.StashRetriever;
 import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner.ContainerLocation;
+import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
 import com.zenith.plugin.stashmanager.travel.tunnel.network.sync.SyncWorker;
+import com.zenith.util.RequestFuture;
 import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClosePacket;
 import org.jspecify.annotations.Nullable;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -35,7 +47,8 @@ import java.util.Set;
 import static com.github.rfresh2.EventConsumer.of;
 import static com.zenith.Globals.*;
 
-// Tick-driven container scanning state machine: IDLE → ZONE_SCANNING → WALKING → OPENING → READING → CLOSING → RETURNING → DONE
+// Tick-driven container scanning state machine. YIELDED temporarily releases Zenith's shared
+// automation resources and later resumes from a safe checkpoint.
 public class StashManagerModule extends Module {
 
     public enum ScanState {
@@ -47,7 +60,21 @@ public class StashManagerModule extends Module {
         CLOSING,
         WALKING_TO_ZONE,
         RETURNING,
+        YIELDED,
         DONE
+    }
+
+    private enum OwnedBaritoneProcess {
+        NONE,
+        CUSTOM_GOAL,
+        INTERACTION
+    }
+
+    private enum ScanResumeMode {
+        RETRY_CURRENT,
+        ADVANCE_CURRENT,
+        RESCAN_ZONE,
+        RETURN_TO_START
     }
 
     private final StashManagerConfig config;
@@ -65,12 +92,36 @@ public class StashManagerModule extends Module {
     private int currentContainerIndex = 0;
     private int tickCounter = 0;
     private int openTimeoutCounter = 0;
+    private int openInteractionAttempts = 0;
     private boolean containerDataReceived = false;
+    private final SneakReleaseGate containerOpenGate = new SneakReleaseGate();
+
+    // Cooperative ownership of Zenith's global Baritone and InventoryManager. Futures let us
+    // distinguish scanner work from a request submitted by PearlPlus or another plugin.
+    private CooperativePreemptionGate scannerPreemptionGate;
+    private @Nullable PathingRequestFuture ownedBaritoneRequest;
+    private OwnedBaritoneProcess ownedBaritoneProcess = OwnedBaritoneProcess.NONE;
+    private @Nullable RequestFuture ownedInventoryRequest;
+    private ScanResumeMode scanResumeMode = ScanResumeMode.RETRY_CURRENT;
+    private boolean resumeAbortedReturn = false;
+    private int lateOpenQuarantineTicks = 0;
+    private int scanPreemptionCount = 0;
+    private static final int SCAN_PREEMPTION_QUIET_TICKS = 40;
+    private static final int LATE_OPEN_QUARANTINE_TICKS = 100;
 
     // Starting position — used for return-to-start
     private double startX, startY, startZ;
     private boolean hasStartPosition = false;
     private boolean finishScanAfterReturn = false;
+
+    // A scanner target owns no inventory cargo, so a transient failure can safely move the
+    // untouched target to the tail. Counts stay tied to physical containers, not attempts.
+    private final Set<Long> discoveredContainerKeys = new HashSet<>();
+    private static final int MAX_CONTAINER_ATTEMPTS = 3;
+    private final TailRetryTracker<Long> containerRetries =
+        new TailRetryTracker<>(MAX_CONTAINER_ATTEMPTS);
+    private static final int MIN_CONTAINER_OPEN_TIMEOUT_TICKS = 400;
+    private static final int CONTAINER_OPEN_RETRY_INTERVAL_TICKS = 20;
 
     // Baritone config — saved/restored around scans
     private boolean savedAllowBreak = true;
@@ -100,6 +151,7 @@ public class StashManagerModule extends Module {
     public StashManagerModule(StashManagerConfig config, ContainerIndex index) {
         this.config = config;
         this.index = index;
+        this.scannerPreemptionGate = newScannerPreemptionGate();
         this.regionScanner = new RegionScanner();
         this.containerReader = new ContainerReader(index);
         this.retriever = new StashRetriever();
@@ -121,6 +173,12 @@ public class StashManagerModule extends Module {
 
     public StashOrganizer getOrganizer() {
         return organizer;
+    }
+
+    public LaneCapacityReport getLaneCapacityReport() {
+        return organizer == null
+                ? LaneCapacityReport.unavailable(LaneCapacityReport.Status.NO_SCANNED_CONTAINERS)
+                : organizer.calculateLaneCapacity();
     }
 
     public StashRetriever getRetriever() {
@@ -155,6 +213,15 @@ public class StashManagerModule extends Module {
                     if (state == ScanState.OPENING || state == ScanState.READING) {
                         containerDataReceived = true;
                         debug("Received container data packet (windowId={})", packet.getContainerId());
+                    } else if ((state == ScanState.CLOSING
+                            || (state == ScanState.YIELDED && lateOpenQuarantineTicks > 0))
+                            && packet.getContainerId() > 0) {
+                        // A response can arrive after its open attempt timed out. It no longer
+                        // owns scanner state, so quarantine it instead of leaving a stale GUI
+                        // open over the next target.
+                        session.send(new ServerboundContainerClosePacket(packet.getContainerId()));
+                        debugRecorder.record("scan_late_container_closed",
+                            "container_id=" + packet.getContainerId() + ", target=" + currentContainerPos());
                     }
                     // Forward container data to organizer
                     if (organizer != null && organizer.isActive()) {
@@ -189,7 +256,7 @@ public class StashManagerModule extends Module {
         tunnelNetworkSyncWorker.stop();
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             info("StashManager module disabled — aborting scan");
-            abortScan();
+            abortScan("module_disabled", false);
         }
         info("StashManager module disabled");
     }
@@ -211,8 +278,16 @@ public class StashManagerModule extends Module {
         return containersFailed;
     }
 
+    public int getScanPreemptionCount() {
+        return scanPreemptionCount;
+    }
+
+    public int getScanPreemptionCooldownRemainingSeconds() {
+        return (scannerPreemptionGate.remainingHoldTicks() + 19) / 20;
+    }
+
     public int getPendingCount() {
-        return Math.max(0, pendingContainers.size() - currentContainerIndex);
+        return Math.max(0, containersFound - getProcessedCount());
     }
 
     public int getProcessedCount() {
@@ -263,7 +338,23 @@ public class StashManagerModule extends Module {
         if (retriever.isActive()) {
             return "retriever is active";
         }
-        return getAutomationUnavailableReason();
+        String automationBlocker = getAutomationUnavailableReason();
+        if (automationBlocker != null) return automationBlocker;
+
+        LaneCapacityReport capacity = organizer.calculateLaneCapacity();
+        return switch (capacity.status()) {
+            case READY -> null;
+            case INSUFFICIENT_LANES -> "lane capacity is short by " + capacity.laneShortfall()
+                    + " dedicated lane(s); run /stash lanes for details";
+            case INSUFFICIENT_LANE_STORAGE -> capacity.laneStorage().unassigned().size()
+                    + " bulk class(es) do not fit any assignable lane; run /stash lanes for details";
+            case NEEDS_FRESH_SCAN -> "lane capacity data contains "
+                    + capacity.unclassifiedShulkers() + " unclassified shulker(s); run a fresh /stash scan";
+            case NEEDS_FRESH_CONTAINER_SCAN -> "double-chest inventory identities require a fresh /stash scan";
+            case REGION_NOT_DEFINED -> "region not defined (set pos1 and pos2 first)";
+            case NO_SCANNED_CONTAINERS -> "no scanned containers in the configured region";
+            case NO_LANES_DETECTED -> "no storage lanes detected in the configured region";
+        };
     }
 
     public boolean startOrganizer() {
@@ -351,7 +442,7 @@ public class StashManagerModule extends Module {
         String blocker = getScanStartBlocker();
         if (blocker != null) {
             warn("Cannot start scan: {}", blocker);
-            fireWebhookEvent("scan_start_blocked", Map.of("reason", blocker));
+            recordAndFireScanFailure("scan_start_blocked", Map.of("reason", blocker));
             return false;
         }
 
@@ -386,19 +477,29 @@ public class StashManagerModule extends Module {
         state = ScanState.ZONE_SCANNING;
         info("Starting container scan in region ({}) to ({})",
             formatPos(config.pos1), formatPos(config.pos2));
+        debugRecorder.record("scan_started",
+            "pos1=" + formatPos(config.pos1)
+                + ", pos2=" + formatPos(config.pos2)
+                + ", start_position=" + String.format("%.1f, %.1f, %.1f", startX, startY, startZ));
         return true;
     }
 
     // Abort scan in progress.
     public void abortScan() {
-        abortScan("manual_abort");
+        abortScan("manual_abort", true);
     }
 
     private void abortScan(String reason) {
+        abortScan(reason, false);
+    }
+
+    private void abortScan(String reason, boolean returnAfterAbort) {
         if (state == ScanState.IDLE) return;
 
+        boolean wasYielded = state == ScanState.YIELDED;
+
         // Close any open container
-        closeCurrentContainer();
+        if (!wasYielded) closeCurrentContainer();
 
         // Restore Baritone config
         restoreBaritoneBreaking();
@@ -416,10 +517,35 @@ public class StashManagerModule extends Module {
             }
         }
 
-        state = ScanState.IDLE;
         info("Scan aborted. Found={}, Indexed={}, Failed={}",
             containersFound, containersIndexed, containersFailed);
-        fireWebhookEvent("scan_aborted", Map.of("reason", reason));
+        recordAndFireScanFailure("scan_aborted", Map.of(
+            "reason", reason,
+            "found", containersFound,
+            "indexed", containersIndexed,
+            "failed", containersFailed));
+
+        if (returnAfterAbort && config.returnToStart && hasStartPosition) {
+            info("Returning to starting position after scan abort: {}, {}, {}",
+                String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+            if (wasYielded) {
+                // Do not steal shared control back from the task that interrupted us. The
+                // manual stop's return trip starts after the existing hold/quiet gate.
+                scanResumeMode = ScanResumeMode.RETURN_TO_START;
+                resumeAbortedReturn = true;
+                state = ScanState.YIELDED;
+            } else {
+                ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
+                state = ScanState.RETURNING;
+            }
+            fireWebhookEvent("return_to_start_started", Map.of(
+                "reason", "scan_aborted",
+                "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+        } else {
+            state = ScanState.IDLE;
+            scannerPreemptionGate.reset();
+            clearOwnedAutomation();
+        }
     }
 
     // Return to recorded start position. Returns true if nav started.
@@ -427,12 +553,12 @@ public class StashManagerModule extends Module {
         String blocker = getReturnToStartBlocker();
         if (blocker != null) {
             warn("Cannot return to start: {}", blocker);
-            fireWebhookEvent("return_to_start_blocked", Map.of("reason", blocker));
+            recordAndFireScanFailure("return_to_start_blocked", Map.of("reason", blocker));
             return false;
         }
         info("Returning to starting position: {}, {}, {}",
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
-        BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
+        ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
         state = ScanState.RETURNING;
         finishScanAfterReturn = false;
         fireWebhookEvent("return_to_start_started", Map.of("start_position",
@@ -461,6 +587,9 @@ public class StashManagerModule extends Module {
         }
         if (retriever.isActive()) {
             return "retriever is active";
+        }
+        if (hasAnyBaritoneProcessActive() || BARITONE.isActive() || INVENTORY.hasActiveRequest()) {
+            return "shared Baritone/inventory automation is active";
         }
         return getAutomationUnavailableReason();
     }
@@ -534,6 +663,16 @@ public class StashManagerModule extends Module {
 
         if (state == ScanState.IDLE || state == ScanState.DONE) return;
 
+        if (state == ScanState.YIELDED) {
+            tickScannerYielded();
+            return;
+        }
+
+        if (scannerWasPreempted()) {
+            beginScannerYield();
+            return;
+        }
+
         enforceBaritoneBreakingDisabled();
 
         switch (state) {
@@ -544,28 +683,48 @@ public class StashManagerModule extends Module {
             case CLOSING -> tickClosing();
             case WALKING_TO_ZONE -> tickWalkingToZone();
             case RETURNING -> tickReturning();
+            case YIELDED -> tickScannerYielded();
             default -> {}
         }
     }
 
     // State Implementations
     private void tickZoneScanning() {
-        List<ContainerLocation> found = regionScanner.scanRegion(
-            config.pos1, config.pos2, config.maxContainers, getReservedContainerKeys());
+        int remainingCapacity = Math.max(0, config.maxContainers - discoveredContainerKeys.size());
+        List<ContainerLocation> found = remainingCapacity > 0
+            ? regionScanner.scanRegion(
+                config.pos1, config.pos2, remainingCapacity, getReservedContainerKeys())
+            : List.of();
 
-        pendingContainers.addAll(found);
-        containersFound = pendingContainers.size();
+        int newlyQueued = 0;
+        for (ContainerLocation container : found) {
+            if ((container.type() == BlockEntityType.CHEST
+                    || container.type() == BlockEntityType.TRAPPED_CHEST)
+                    && isDoubleChestPartner(container)) {
+                continue;
+            }
+            if (discoveredContainerKeys.add(container.posKey())) {
+                pendingContainers.add(container);
+                newlyQueued++;
+            }
+        }
+        containersFound = discoveredContainerKeys.size();
 
-        info("Zone scan complete: {} containers discovered", found.size());
+        info("Zone scan complete: {} new containers queued ({} unique total)",
+            newlyQueued, containersFound);
+        debugRecorder.record("scan_zone_queued",
+            "new_targets=" + newlyQueued
+                + ", unique_total=" + containersFound
+                + ", queue_entries=" + Math.max(0, pendingContainers.size() - currentContainerIndex - 1));
 
         // Check for chunks beyond render distance
         var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
-        if (!unscanned.isEmpty() && pendingContainers.size() < config.maxContainers) {
+        if (!unscanned.isEmpty() && containersFound < config.maxContainers) {
             info("{} chunks still unloaded — will walk to load them", unscanned.size());
         }
 
         if (pendingContainers.isEmpty() && !unscanned.isEmpty()
-                && pendingContainers.size() < config.maxContainers) {
+                && containersFound < config.maxContainers) {
             startWalkingToUnscannedChunk(unscanned.get(0));
             return;
         }
@@ -579,7 +738,6 @@ public class StashManagerModule extends Module {
             return;
         }
 
-        currentContainerIndex = -1;
         advanceToNextContainer();
     }
 
@@ -595,14 +753,15 @@ public class StashManagerModule extends Module {
         double dist = distanceToContainer(target);
 
         // Always check distance — may have arrived regardless of Baritone state
-        if (dist <= 5.0) {
-            BARITONE.stop();
+        if (isAtContainerAccessPosition(target)) {
+            stopOwnedBaritoneProcess();
             walkRetryCount = 0;
             state = ScanState.OPENING;
+            containerOpenGate.reset();
             tickCounter = 0;
             openTimeoutCounter = 0;
+            openInteractionAttempts = 0;
             containerDataReceived = false;
-            interactWithContainer(target);
             return;
         }
 
@@ -610,11 +769,10 @@ public class StashManagerModule extends Module {
         if (walkingTickCount >= WALK_TIMEOUT_TICKS) {
             warn("Walking timeout for container at {} (dist={})",
                 currentContainerPos(), String.format("%.1f", dist));
-            fireWebhookEvent("container_walk_timeout", Map.of(
+            retryCurrentContainerAtTail("container_walk_timeout", Map.of(
                 "container", currentContainerPos(),
                 "distance", String.format("%.1f", dist)));
-            BARITONE.stop();
-            containersFailed++;
+            stopOwnedBaritoneProcess();
             advanceToNextContainer();
             return;
         }
@@ -630,34 +788,56 @@ public class StashManagerModule extends Module {
             } else {
                 warn("Failed to reach container at {}, {}, {} after {} attempts (dist={})",
                     target.x(), target.y(), target.z(), MAX_WALK_RETRIES, String.format("%.1f", dist));
-                fireWebhookEvent("container_unreachable", Map.of(
+                retryCurrentContainerAtTail("container_unreachable", Map.of(
                     "container", target.x() + ", " + target.y() + ", " + target.z(),
                     "distance", String.format("%.1f", dist),
                     "attempts", MAX_WALK_RETRIES));
-                containersFailed++;
                 advanceToNextContainer();
             }
         }
     }
 
     private void tickOpening() {
-        openTimeoutCounter++;
-
         if (containerDataReceived) {
+            if (openInteractionAttempts > 1) {
+                debugRecorder.record("scan_open_recovered",
+                    "container=" + currentContainerPos()
+                        + ", interaction_attempts=" + openInteractionAttempts
+                        + ", wait_ticks=" + openTimeoutCounter
+                        + ", distance=" + String.format("%.2f", distanceToCurrentContainer()));
+            }
             // Buffer ticks for container content
             state = ScanState.READING;
             tickCounter = 0;
             return;
         }
 
-        if (openTimeoutCounter >= config.openTimeoutTicks) {
+        if (!prepareStandingContainerInteraction()) return;
+        openTimeoutCounter++;
+
+        int effectiveOpenTimeoutTicks = Math.max(
+            config.openTimeoutTicks, MIN_CONTAINER_OPEN_TIMEOUT_TICKS);
+        if (openTimeoutCounter >= effectiveOpenTimeoutTicks) {
             warn("Timeout waiting for container open at {}", currentContainerPos());
-            fireWebhookEvent("container_open_timeout", Map.of(
+            retryCurrentContainerAtTail("container_open_timeout", Map.of(
                 "container", currentContainerPos(),
-                "timeout_ticks", config.openTimeoutTicks));
-            containersFailed++;
-            closeCurrentContainer();
-            advanceToNextContainer();
+                "timeout_ticks", effectiveOpenTimeoutTicks,
+                "interaction_attempts", openInteractionAttempts,
+                "distance", String.format("%.2f", distanceToCurrentContainer())));
+            state = ScanState.CLOSING;
+            tickCounter = 0;
+            return;
+        }
+
+        // Let Baritone's final movement/rotation settle for a tick, then retry the vanilla
+        // interaction periodically. Previously the scanner clicked exactly once on the same
+        // tick that movement stopped and waited 20 seconds even when that click was missed.
+        if (OpenRetryCadence.shouldInteract(
+                openTimeoutCounter,
+                effectiveOpenTimeoutTicks,
+                CONTAINER_OPEN_RETRY_INTERVAL_TICKS)) {
+            ContainerLocation target = currentContainer();
+            if (target != null) interactWithContainer(target);
         }
     }
 
@@ -678,10 +858,11 @@ public class StashManagerModule extends Module {
 
         if (success) {
             containersIndexed++;
+            markCurrentContainerRecovered();
         } else {
-            containersFailed++;
             warn("Failed to read container at {}", currentContainerPos());
-            fireWebhookEvent("container_read_failed", Map.of("container", currentContainerPos()));
+            retryCurrentContainerAtTail("container_read_failed", Map.of(
+                "container", currentContainerPos()));
         }
 
         state = ScanState.CLOSING;
@@ -728,7 +909,7 @@ public class StashManagerModule extends Module {
                     String.format("%.1f", dist));
                 inGameAlert("<yellow>Could not reach starting position</yellow> <gray>(dist="
                     + String.format("%.1f", dist) + "). Finishing scan.</gray>");
-                fireWebhookEvent("return_to_start_failed", Map.of(
+                recordAndFireScanFailure("return_to_start_failed", Map.of(
                     "distance", String.format("%.1f", dist),
                     "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 notifications.sendReturnToStartFailed(startX, startY, startZ, dist);
@@ -740,6 +921,179 @@ public class StashManagerModule extends Module {
                 state = ScanState.DONE;
             }
         }
+    }
+
+    private boolean scannerWasPreempted() {
+        boolean customGoalActive = BARITONE.getCustomGoalProcess().isActive();
+        boolean interactionActive = BARITONE.getInteractWithProcess().isActive();
+        boolean otherProcessActive = BARITONE.getFollowProcess().isActive()
+            || BARITONE.getGetToBlockProcess().isActive()
+            || BARITONE.getMineProcess().isActive()
+            || BARITONE.getClearAreaProcess().isActive();
+
+        boolean foreignBaritone = otherProcessActive;
+        if (ownedBaritoneProcess == OwnedBaritoneProcess.NONE) {
+            foreignBaritone |= customGoalActive || interactionActive;
+        } else if (ownedBaritoneProcess == OwnedBaritoneProcess.CUSTOM_GOAL) {
+            foreignBaritone |= interactionActive;
+            // A new CustomGoal request completes the scanner's old future as rejected before
+            // replacing it, so an active process with a completed future is foreign.
+            foreignBaritone |= customGoalActive
+                && (ownedBaritoneRequest == null || ownedBaritoneRequest.isCompleted());
+        } else {
+            foreignBaritone |= customGoalActive;
+            foreignBaritone |= interactionActive
+                && (ownedBaritoneRequest == null || ownedBaritoneRequest.isCompleted());
+        }
+
+        boolean foreignInventory = INVENTORY.hasActiveRequest()
+            && (ownedInventoryRequest == null || ownedInventoryRequest.isCompleted());
+        return foreignBaritone || foreignInventory;
+    }
+
+    private void beginScannerYield() {
+        ScanState interruptedState = state;
+        scanResumeMode = switch (interruptedState) {
+            case CLOSING -> ScanResumeMode.ADVANCE_CURRENT;
+            case ZONE_SCANNING, WALKING_TO_ZONE -> ScanResumeMode.RESCAN_ZONE;
+            case RETURNING -> ScanResumeMode.RETURN_TO_START;
+            default -> ScanResumeMode.RETRY_CURRENT;
+        };
+
+        // If our click was already accepted but its GUI packet has not arrived, quarantine a
+        // short late-response window so it cannot cover the interrupting task's screen state.
+        boolean acceptedOpenPending = interruptedState == ScanState.OPENING
+            && !containerDataReceived
+            && ownedBaritoneProcess == OwnedBaritoneProcess.INTERACTION
+            && ownedBaritoneRequest != null
+            && ownedBaritoneRequest.isCompleted()
+            && ownedBaritoneRequest.getNow();
+        lateOpenQuarantineTicks = acceptedOpenPending ? LATE_OPEN_QUARANTINE_TICKS : 0;
+
+        if (interruptedState == ScanState.READING || interruptedState == ScanState.CLOSING) {
+            closeCurrentContainer();
+        }
+
+        // Stop only a scanner-owned process that has not already been replaced. Calling the
+        // global BARITONE.stop() here would cancel the very task we are yielding to.
+        stopOwnedBaritoneProcess();
+        clearOwnedAutomation();
+        releaseBaritoneBreakingForYield();
+        scannerPreemptionGate.yield();
+        scanPreemptionCount++;
+        state = ScanState.YIELDED;
+
+        info("Scan yielded to shared automation for at least {} seconds (resume={})",
+            Math.max(1, config.scanPreemptionCooldownSeconds), scanResumeMode);
+        debugRecorder.record("scan_preempted",
+            "interrupted_state=" + interruptedState
+                + ", resume_mode=" + scanResumeMode
+                + ", target=" + currentContainerPos()
+                + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds)
+                + ", preemption_count=" + scanPreemptionCount);
+    }
+
+    private void tickScannerYielded() {
+        if (lateOpenQuarantineTicks > 0) lateOpenQuarantineTicks--;
+
+        var transition = scannerPreemptionGate.tick(isSharedAutomationBusy());
+        if (transition != CooperativePreemptionGate.Transition.RESUMED) return;
+
+        int pausedTicks = scannerPreemptionGate.elapsedTicks();
+        ScanResumeMode resumeMode = scanResumeMode;
+        boolean abortedReturn = resumeAbortedReturn;
+        resumeAbortedReturn = false;
+        lateOpenQuarantineTicks = 0;
+        clearOwnedAutomation();
+
+        info("Shared automation is quiet; resuming scan checkpoint {} after {} seconds",
+            resumeMode, pausedTicks / 20);
+        debugRecorder.record("scan_resumed",
+            "resume_mode=" + resumeMode
+                + ", paused_seconds=" + pausedTicks / 20
+                + ", target=" + currentContainerPos()
+                + ", preemption_count=" + scanPreemptionCount
+                + ", aborted_return=" + abortedReturn);
+
+        if (!abortedReturn) reacquireBaritoneBreakingAfterYield();
+
+        switch (resumeMode) {
+            case RETRY_CURRENT -> resumeCurrentContainer();
+            case ADVANCE_CURRENT -> advanceToNextContainer();
+            case RESCAN_ZONE -> state = ScanState.ZONE_SCANNING;
+            case RETURN_TO_START -> {
+                ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
+                state = ScanState.RETURNING;
+            }
+        }
+    }
+
+    private void resumeCurrentContainer() {
+        ContainerLocation target = currentContainer();
+        if (target == null) {
+            advanceToNextContainer();
+            return;
+        }
+
+        tickCounter = 0;
+        openTimeoutCounter = 0;
+        openInteractionAttempts = 0;
+        containerDataReceived = false;
+        walkRetryCount = 0;
+        walkingTickCount = 0;
+        if (isAtContainerAccessPosition(target)) {
+            containerOpenGate.reset();
+            state = ScanState.OPENING;
+        } else {
+            state = ScanState.WALKING;
+            pathToContainer(target);
+        }
+    }
+
+    private boolean isSharedAutomationBusy() {
+        return hasAnyBaritoneProcessActive() || BARITONE.isActive() || INVENTORY.hasActiveRequest();
+    }
+
+    private boolean hasAnyBaritoneProcessActive() {
+        return BARITONE.getCustomGoalProcess().isActive()
+            || BARITONE.getInteractWithProcess().isActive()
+            || BARITONE.getFollowProcess().isActive()
+            || BARITONE.getGetToBlockProcess().isActive()
+            || BARITONE.getMineProcess().isActive()
+            || BARITONE.getClearAreaProcess().isActive();
+    }
+
+    private void ownCustomGoal(PathingRequestFuture request) {
+        ownedBaritoneRequest = request;
+        ownedBaritoneProcess = OwnedBaritoneProcess.CUSTOM_GOAL;
+    }
+
+    private void ownInteraction(PathingRequestFuture request) {
+        ownedBaritoneRequest = request;
+        ownedBaritoneProcess = OwnedBaritoneProcess.INTERACTION;
+    }
+
+    private void stopOwnedBaritoneProcess() {
+        if (ownedBaritoneRequest != null && ownedBaritoneRequest.isCompleted()) {
+            // A completed/rejected future may mean another plugin replaced the same concrete
+            // process. Never stop that replacement by type.
+            ownedBaritoneRequest = null;
+            ownedBaritoneProcess = OwnedBaritoneProcess.NONE;
+            return;
+        }
+        if (ownedBaritoneProcess == OwnedBaritoneProcess.CUSTOM_GOAL) {
+            BARITONE.getCustomGoalProcess().stop();
+        } else if (ownedBaritoneProcess == OwnedBaritoneProcess.INTERACTION) {
+            BARITONE.getInteractWithProcess().stop();
+        }
+        ownedBaritoneRequest = null;
+        ownedBaritoneProcess = OwnedBaritoneProcess.NONE;
+    }
+
+    private void clearOwnedAutomation() {
+        ownedBaritoneRequest = null;
+        ownedBaritoneProcess = OwnedBaritoneProcess.NONE;
+        ownedInventoryRequest = null;
     }
 
     // Helpers
@@ -764,7 +1118,7 @@ public class StashManagerModule extends Module {
                 inGameAlert("<aqua>Scan complete!</aqua> <gray>Found=" + containersFound
                     + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed
                     + ". Returning to start position...</gray>");
-                BARITONE.pathTo((int) startX, (int) startY, (int) startZ);
+                ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
                 state = ScanState.RETURNING;
                 finishScanAfterReturn = true;
                 fireWebhookEvent("return_to_start_started", Map.of("start_position",
@@ -788,24 +1142,28 @@ public class StashManagerModule extends Module {
             if (isDoubleChestPartner(next)) {
                 debug("Skipping double chest partner at {}, {}, {}",
                     next.x(), next.y(), next.z());
+                if (discoveredContainerKeys.remove(next.posKey())) {
+                    containersFound = discoveredContainerKeys.size();
+                }
                 advanceToNextContainer();
                 return;
             }
         }
 
         // Stop any lingering Baritone process before starting new action
-        BARITONE.stop();
+        stopOwnedBaritoneProcess();
 
         double dist = distanceToContainer(next);
         walkRetryCount = 0;
         walkingTickCount = 0;
-        if (dist <= 5.0) {
+        if (isAtContainerAccessPosition(next)) {
             // Already in range
+            containerOpenGate.reset();
             state = ScanState.OPENING;
             tickCounter = 0;
             openTimeoutCounter = 0;
+            openInteractionAttempts = 0;
             containerDataReceived = false;
-            interactWithContainer(next);
         } else {
             state = ScanState.WALKING;
             pathToContainer(next);
@@ -833,7 +1191,7 @@ public class StashManagerModule extends Module {
         }
 
         info("Walking toward unscanned chunk via waypoint at {}, {}", targetX, targetZ);
-        BARITONE.pathTo(targetX, targetZ);
+        ownCustomGoal(BARITONE.pathTo(targetX, targetZ));
         state = ScanState.WALKING_TO_ZONE;
     }
 
@@ -857,18 +1215,42 @@ public class StashManagerModule extends Module {
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
     }
 
+    private boolean isAtContainerAccessPosition(ContainerLocation loc) {
+        var playerCache = CACHE.getPlayerCache();
+        return ContainerApproach.isAtAccessPosition(
+            playerCache.getX(), playerCache.getY(), playerCache.getZ(),
+            loc.x(), loc.y(), loc.z());
+    }
+
+    private double distanceToCurrentContainer() {
+        ContainerLocation target = currentContainer();
+        return target != null ? distanceToContainer(target) : Double.NaN;
+    }
+
     private void interactWithContainer(ContainerLocation loc) {
         // Right-click the container block at exact coordinates
-        BARITONE.rightClickBlock(loc.x(), loc.y(), loc.z());
+        openInteractionAttempts++;
+        ownInteraction(BARITONE.rightClickBlock(loc.x(), loc.y(), loc.z()));
+    }
+
+    private boolean prepareStandingContainerInteraction() {
+        stopOwnedBaritoneProcess();
+        if (containerOpenGate.tick(BOT.isSneaking())) return true;
+        INPUTS.submit(InputRequest.builder()
+            .owner(this)
+            .input(Input.builder().sneaking(false).build())
+            .priority(SneakReleaseGate.INPUT_PRIORITY)
+            .build());
+        return false;
     }
 
     private void pathToContainer(ContainerLocation loc) {
-        BARITONE.pathTo(new GoalGetToBlock(new BlockPos(loc.x(), loc.y(), loc.z())));
+        ownCustomGoal(BARITONE.pathTo(new GoalGetToBlock(new BlockPos(loc.x(), loc.y(), loc.z()))));
     }
 
     private void closeCurrentContainer() {
         try {
-            INVENTORY.submit(InventoryActionRequest.builder()
+            ownedInventoryRequest = INVENTORY.submit(InventoryActionRequest.builder()
                 .owner(this)
                 .actions(new CloseContainer())
                 .priority(5000)
@@ -878,59 +1260,92 @@ public class StashManagerModule extends Module {
         }
     }
 
+    /**
+     * A failed scanner target has not transferred any inventory, so it can be retried safely.
+     * Re-appending the same physical target implements a true tail retry without changing the
+     * discovered-container total or pretending a transient attempt was a terminal failure.
+     */
+    private void retryCurrentContainerAtTail(String event, Map<String, Object> details) {
+        ContainerLocation target = currentContainer();
+        if (target == null) {
+            containersFailed++;
+            recordAndFireScanFailure(event, details);
+            return;
+        }
+
+        long key = target.posKey();
+        TailRetryTracker.Decision retryDecision = containerRetries.recordFailure(key);
+        int attempt = retryDecision.attempt();
+        boolean retryQueued = retryDecision.shouldRetry();
+        if (retryQueued) {
+            pendingContainers.add(target);
+        } else {
+            containersFailed++;
+        }
+
+        Map<String, Object> payload = new HashMap<>(details);
+        payload.put("attempt", attempt);
+        payload.put("max_attempts", MAX_CONTAINER_ATTEMPTS);
+        payload.put("disposition", retryQueued ? "retry_tail" : "terminal_failure");
+        payload.put("unique_total", containersFound);
+        payload.put("queue_entries", Math.max(0, pendingContainers.size() - currentContainerIndex - 1));
+        recordAndFireScanFailure(event, payload);
+    }
+
+    private void markCurrentContainerRecovered() {
+        ContainerLocation target = currentContainer();
+        if (target == null) return;
+        int failedAttempts = containerRetries.recordSuccess(target.posKey());
+        if (failedAttempts > 0) {
+            debugRecorder.record("scan_target_recovered",
+                "container=" + currentContainerPos()
+                    + ", failed_attempts=" + failedAttempts
+                    + ", indexed=" + containersIndexed
+                    + ", unique_total=" + containersFound);
+        }
+    }
+
+    private void recordAndFireScanFailure(String event, Map<String, Object> payload) {
+        debugRecorder.record(event, formatPayloadDetail(payload));
+        fireWebhookEvent(event, payload);
+    }
+
     // Is this a double chest?
     private boolean isDoubleChest(ContainerLocation loc) {
         if (loc.type() != BlockEntityType.CHEST && loc.type() != BlockEntityType.TRAPPED_CHEST) {
             return false;
         }
-        // Check adjacent blocks
-        return hasAdjacentChest(loc.x() + 1, loc.y(), loc.z(), loc.type())
-            || hasAdjacentChest(loc.x() - 1, loc.y(), loc.z(), loc.type())
-            || hasAdjacentChest(loc.x(), loc.y(), loc.z() + 1, loc.type())
-            || hasAdjacentChest(loc.x(), loc.y(), loc.z() - 1, loc.type());
+        return DoubleChestIdentity.isDoubleChest(loc.x(), loc.y(), loc.z());
     }
 
     // Is this the partner half of a double chest? (skip to avoid double-indexing)
     private boolean isDoubleChestPartner(ContainerLocation loc) {
         if (!isDoubleChest(loc)) return false;
 
-        // Find the adjacent matching chest
-        int[][] offsets = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
-        for (int[] offset : offsets) {
-            int nx = loc.x() + offset[0];
-            int nz = loc.z() + offset[1];
-            if (hasAdjacentChest(nx, loc.y(), nz, loc.type())) {
-                // Keep lower x/z as primary
-                if (loc.x() > nx || (loc.x() == nx && loc.z() > nz)) {
-                    return true; // partner — skip
-                }
-                return false;
-            }
-        }
-        return false;
-    }
-
-    private boolean hasAdjacentChest(int x, int y, int z, BlockEntityType type) {
-        int chunkX = x >> 4;
-        int chunkZ = z >> 4;
-        if (!CACHE.getChunkCache().isChunkLoaded(chunkX, chunkZ)) return false;
-
-        var chunk = CACHE.getChunkCache().get(chunkX, chunkZ);
-        if (chunk == null) return false;
-
-        for (var be : chunk.getBlockEntities()) {
-            int wx = (chunkX * 16) + be.getX();
-            int wz = (chunkZ * 16) + be.getZ();
-            if (wx == x && be.getY() == y && wz == z && be.getType() == type) {
-                return true;
-            }
-        }
-        return false;
+        var identity = DoubleChestIdentity.resolve(loc.x(), loc.y(), loc.z(), true);
+        return identity.identityKnown()
+            && (loc.x() != identity.inventoryX() || loc.z() != identity.inventoryZ());
     }
 
     private void finishScan() {
         // Restore Baritone config
         restoreBaritoneBreaking();
+        scannerPreemptionGate = newScannerPreemptionGate();
+        clearOwnedAutomation();
+
+        // A scan is a snapshot of the configured region, not an append-only observation log.
+        // Remove entries no longer discovered, including obsolete double-chest partner rows.
+        // Failed targets remain in discoveredContainerKeys and therefore retain any prior data.
+        try {
+            int pruned = index.pruneRegionExcept(config.pos1, config.pos2, discoveredContainerKeys);
+            if (pruned > 0) {
+                info("Pruned {} stale container record(s) from the scanned region.", pruned);
+                debugRecorder.record("scan_stale_entries_pruned", "count=" + pruned);
+            }
+        } catch (Exception e) {
+            warn("Failed to prune stale scan rows: {}", e.getMessage());
+            debugRecorder.record("scan_stale_prune_failed", "Failed to prune stale scan rows", e);
+        }
 
         // Record scan completion in DB
         if (database != null && database.isInitialized() && currentScanId >= 0) {
@@ -951,9 +1366,50 @@ public class StashManagerModule extends Module {
             info("Detected {} FIFO lane(s) (chest -> hopper -> chest).", fifoLanes);
         }
 
+        if (organizer != null) {
+            LaneCapacityReport capacity = organizer.calculateLaneCapacity();
+            info("Lane capacity: status={}, detected={}, assignable={}, required={}, spare={}, shortfall={}, protected={}",
+                    capacity.status(), capacity.detectedLanes(), capacity.assignableLanes(),
+                    capacity.requiredStorageClasses(), capacity.spareLanes(), capacity.laneShortfall(),
+                    capacity.protectedLanes());
+            debugRecorder.record("lane_capacity_calculated",
+                    "status=" + capacity.status()
+                            + ", detected_lanes=" + capacity.detectedLanes()
+                            + ", assignable_lanes=" + capacity.assignableLanes()
+                            + ", required_storage_classes=" + capacity.requiredStorageClasses()
+                            + ", spare_lanes=" + capacity.spareLanes()
+                            + ", lane_shortfall=" + capacity.laneShortfall()
+                            + ", protected_lanes=" + capacity.protectedLanes()
+                            + ", assignable_shulker_slots=" + capacity.laneStorage().totalAssignableShulkerSlots()
+                            + ", required_shulker_slots=" + capacity.laneStorage().totalRequiredShulkerSlots()
+                            + ", unassigned_required_shulker_slots=" + capacity.laneStorage().unassignedRequiredShulkerSlots()
+                            + ", unclassified_shulkers=" + capacity.unclassifiedShulkers());
+            if (capacity.status() == LaneCapacityReport.Status.READY) {
+                inGameAlert("<green>Lane capacity ready.</green> <gray>Required="
+                        + capacity.requiredStorageClasses() + ", Assignable="
+                        + capacity.assignableLanes() + ", Spare=" + capacity.spareLanes() + "</gray>");
+            } else if (capacity.status() == LaneCapacityReport.Status.INSUFFICIENT_LANES) {
+                inGameAlert("<red>Insufficient storage lanes.</red> <gray>Create "
+                        + capacity.laneShortfall() + " additional dedicated lane(s).</gray>");
+            } else if (capacity.status() == LaneCapacityReport.Status.INSUFFICIENT_LANE_STORAGE) {
+                inGameAlert("<red>Insufficient per-lane storage.</red> <gray>"
+                        + capacity.laneStorage().unassigned().size()
+                        + " bulk class(es) cannot fit any assignable lane.</gray>");
+            } else if (capacity.status() == LaneCapacityReport.Status.NEEDS_FRESH_SCAN) {
+                inGameAlert("<yellow>Lane audit is not trusted.</yellow> <gray>Unclassified shulkers="
+                        + capacity.unclassifiedShulkers() + "; rescan before organizing.</gray>");
+            } else if (capacity.status() == LaneCapacityReport.Status.NEEDS_FRESH_CONTAINER_SCAN) {
+                inGameAlert("<yellow>Lane audit needs one fresh scan.</yellow> <gray>Legacy double-chest rows do not identify their shared inventory.</gray>");
+            }
+        }
+
         state = ScanState.DONE;
         info("Scan complete. Found={}, Indexed={}, Failed={}",
             containersFound, containersIndexed, containersFailed);
+        debugRecorder.record("scan_completed",
+            "found=" + containersFound
+                + ", indexed=" + containersIndexed
+                + ", failed=" + containersFailed);
         inGameAlert("<green>Scan complete.</green> <gray>Found=" + containersFound
             + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed + "</gray>");
     }
@@ -1013,9 +1469,12 @@ public class StashManagerModule extends Module {
     private void resetScanState() {
         regionScanner.reset();
         pendingContainers.clear();
-        currentContainerIndex = 0;
+        discoveredContainerKeys.clear();
+        containerRetries.clear();
+        currentContainerIndex = -1;
         tickCounter = 0;
         openTimeoutCounter = 0;
+        openInteractionAttempts = 0;
         containerDataReceived = false;
         containersFound = 0;
         containersIndexed = 0;
@@ -1025,6 +1484,18 @@ public class StashManagerModule extends Module {
         finishScanAfterReturn = false;
         walkRetryCount = 0;
         walkingTickCount = 0;
+        scannerPreemptionGate = newScannerPreemptionGate();
+        clearOwnedAutomation();
+        scanResumeMode = ScanResumeMode.RETRY_CURRENT;
+        resumeAbortedReturn = false;
+        lateOpenQuarantineTicks = 0;
+        scanPreemptionCount = 0;
+    }
+
+    private CooperativePreemptionGate newScannerPreemptionGate() {
+        return new CooperativePreemptionGate(
+            Math.max(1, config.scanPreemptionCooldownSeconds) * 20,
+            SCAN_PREEMPTION_QUIET_TICKS);
     }
 
     // Reasons that are expected/benign noise in a hopper-fed or actively-changing stash (the
@@ -1116,6 +1587,16 @@ public class StashManagerModule extends Module {
         if (baritoneConfigSaved) {
             CONFIG.client.extra.pathfinder.allowBreak = false;
         }
+    }
+
+    private void releaseBaritoneBreakingForYield() {
+        if (baritoneConfigSaved) {
+            CONFIG.client.extra.pathfinder.allowBreak = savedAllowBreak;
+        }
+    }
+
+    private void reacquireBaritoneBreakingAfterYield() {
+        enforceBaritoneBreakingDisabled();
     }
 
     // Restore Baritone allowBreak.

@@ -9,6 +9,11 @@ import com.zenith.command.api.Command;
 import com.zenith.command.api.CommandContext;
 import com.zenith.command.api.CommandUsage;
 import com.zenith.command.api.CommandCategory;
+import com.zenith.feature.player.raycast.RaycastHelper;
+import com.zenith.feature.player.World;
+import com.zenith.mc.block.BlockRegistry;
+import com.zenith.mc.block.properties.ChestType;
+import com.zenith.mc.block.properties.api.BlockStateProperties;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.StashManagerModule;
 import com.zenith.plugin.stashmanager.api.ApiServer;
@@ -16,7 +21,11 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
+import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
+import com.zenith.plugin.stashmanager.orchestration.LaneConstructionPlan;
+import com.zenith.plugin.stashmanager.orchestration.LaneReportExporter;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
+import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import com.zenith.plugin.stashmanager.util.ItemResolver;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
@@ -27,6 +36,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -34,6 +44,7 @@ import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
 import static com.mojang.brigadier.arguments.StringArgumentType.greedyString;
 import static com.mojang.brigadier.arguments.StringArgumentType.string;
 import static com.zenith.Globals.CACHE;
+import static com.zenith.Globals.BOT;
 import static com.zenith.Globals.DISCORD;
 
 // Main /stash command tree: pos1, pos2, scan, stop, status, list, export, clear, db, config.
@@ -77,13 +88,14 @@ public class StashCommand extends Command {
                 "list [page] / export / clear / clearall",
                 "debug <recent [count]|clear|export>",
                 "keep <add|remove|list> [count]",
+                "import [remove|list|purge [confirm]] (face a chest for add/remove)",
                 "label <x> <y> <z> <label> / labels",
                 "region <save|load|list|delete> [name]",
                 "kit <list|show|snap|delete|add|remove> <name>",
                 "get <item_id> [count] / kit <name> / status / stop",
-                "organize [stop|status]",
+                "lanes [export] / organize [stop|status]",
                 "db status / db clear",
-                "config <scanDelay|openTimeout|maxContainers|walkTimeout> <value>",
+                "config <scanDelay|openTimeout|maxContainers|walkTimeout|preemptionCooldown> <value>",
                 "config returnToStart <on|off>",
                 "config db <enable|disable|connect>",
                 "config db <url|user|password|poolSize> <value>",
@@ -232,6 +244,11 @@ public class StashCommand extends Command {
                         embed.addField("Indexed", String.valueOf(module.getContainersIndexed()), true);
                         embed.addField("Failed", String.valueOf(module.getContainersFailed()), true);
                         embed.addField("Pending", String.valueOf(module.getPendingCount()), true);
+                        embed.addField("Task Handoffs", String.valueOf(module.getScanPreemptionCount()), true);
+                        if (module.getState() == StashManagerModule.ScanState.YIELDED) {
+                            embed.addField("Minimum Resume Hold",
+                                module.getScanPreemptionCooldownRemainingSeconds() + "s", true);
+                        }
                     }
 
                     embed.addField("Return to Start", config.returnToStart ? "Enabled" : "Disabled", true);
@@ -481,6 +498,42 @@ public class StashCommand extends Command {
                     }
                     return OK;
                 })
+            )
+            .then(literal("import")
+                .executes((com.mojang.brigadier.Command<CommandContext>)
+                    c -> updateTargetedImportChest(c, true))
+                .then(literal("remove")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> updateTargetedImportChest(c, false)))
+                .then(literal("list")
+                    .executes(c -> {
+                        var positions = index.getImportChests();
+                        var embed = c.getSource().getEmbed()
+                            .title("Import Chests")
+                            .primaryColor();
+                        if (positions.isEmpty()) {
+                            embed.description("No import chests assigned. Face a chest and run `/stash import`.");
+                        } else {
+                            StringBuilder description = new StringBuilder();
+                            int shown = 0;
+                            for (int[] pos : positions) {
+                                if (shown++ >= 40) {
+                                    description.append("... and ").append(positions.size() - 40).append(" more block position(s)");
+                                    break;
+                                }
+                                description.append(pos[0]).append(", ").append(pos[1]).append(", ").append(pos[2]).append('\n');
+                            }
+                            embed.description(description.toString())
+                                .footer("Double chests are persisted as both block positions.", null);
+                        }
+                        return OK;
+                    }))
+                .then(literal("purge")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> purgeImportChests(c, false))
+                    .then(literal("confirm")
+                        .executes((com.mojang.brigadier.Command<CommandContext>)
+                            c -> purgeImportChests(c, true))))
             )
             .then(literal("label")
                 .then(argument("x", integer())
@@ -1083,6 +1136,140 @@ public class StashCommand extends Command {
                     })
                 )
             )
+            .then(literal("lanes")
+                .executes(c -> {
+                    LaneCapacityReport report = module.getLaneCapacityReport();
+                    LaneConstructionPlan construction = LaneConstructionPlan.assess(
+                            report.laneStorage());
+                    String friendlyStatus = switch (report.status()) {
+                        case READY -> "Good to go";
+                        case INSUFFICIENT_LANES -> "You need a few more lanes";
+                        case INSUFFICIENT_LANE_STORAGE -> "Some lanes are too small";
+                        case NEEDS_FRESH_SCAN -> "Run a fresh scan first";
+                        case NEEDS_FRESH_CONTAINER_SCAN -> "Scan the chests again first";
+                        case REGION_NOT_DEFINED -> "Set the stash area first";
+                        case NO_SCANNED_CONTAINERS -> "Scan the stash first";
+                        case NO_LANES_DETECTED -> "No lanes found yet";
+                    };
+                    var embed = c.getSource().getEmbed()
+                            .title("Your Stash Lane Plan")
+                            .addField("Where Things Stand", friendlyStatus, true)
+                            .addField("Lanes Found", String.valueOf(report.detectedLanes()), true)
+                            .addField("Lanes We're Leaving Alone", String.valueOf(report.protectedLanes()), true)
+                            .addField("Lanes We Can Use", String.valueOf(report.assignableLanes()), true)
+                            .addField("Item Lanes Needed", String.valueOf(report.requiredStorageClasses()), true)
+                            .addField("Import Chest Blocks", String.valueOf(index.getImportChestBlockCount()), true)
+                            .addField("Lanes Still Free", String.valueOf(report.spareLanes()), true)
+                            .addField("More Lanes Needed", String.valueOf(report.laneShortfall()), true)
+                            .addField("Shulker Spots Available",
+                                    String.valueOf(report.laneStorage().totalAssignableShulkerSlots()), true)
+                            .addField("Shulker Spots Needed",
+                                    String.valueOf(report.laneStorage().totalRequiredShulkerSlots()), true)
+                            .addField("Double-Chest Space Now",
+                                    String.format(Locale.ROOT, "%.2f",
+                                            construction.existingAssignableDoubleChestEquivalent()), true)
+                            .addField("Double Chests Needed Altogether",
+                                    String.valueOf(construction.requiredDedicatedDoubleChests()), true)
+                            .addField("New Lanes To Make",
+                                    String.valueOf(construction.newLanesToBuild()), true)
+                            .addField("Lanes To Make Bigger",
+                                    String.valueOf(construction.existingLanesToExpand()), true)
+                            .addField("Double Chests To Place",
+                                    String.valueOf(construction.doubleChestsToAdd()), true)
+                            .addField("Bulk / Empty Shulkers",
+                                    report.bulkShulkers() + " / " + report.emptyShulkers(), true)
+                            .addField("Mixed / Unclassified",
+                                    report.mixedShulkers() + " / " + report.unclassifiedShulkers(), true);
+
+                    switch (report.status()) {
+                        case READY -> embed.description("Everything has a lane with enough room. You're good to start organizing.")
+                                .successColor();
+                        case INSUFFICIENT_LANES -> embed.description("You're short " + report.laneShortfall()
+                                        + " lane(s). Make those, then scan again before you organize.")
+                                .errorColor();
+                        case INSUFFICIENT_LANE_STORAGE -> embed.description("You have enough lanes, but some of them are too small. Check the build list below for exactly what to add.")
+                                .errorColor();
+                        case NEEDS_FRESH_SCAN -> embed.description("Some shulkers still aren't identified. Run a fresh stash scan before you organize.")
+                                .errorColor();
+                        case NEEDS_FRESH_CONTAINER_SCAN -> embed.description("Some double chests came from an older scan. Scan the stash again so we can count them properly.")
+                                .errorColor();
+                        case REGION_NOT_DEFINED -> embed.description("Set the stash corners with pos1 and pos2 first.").errorColor();
+                        case NO_SCANNED_CONTAINERS -> embed.description("Scan the stash first so there's something to work from.").errorColor();
+                        case NO_LANES_DETECTED -> embed.description("The last scan didn't find any storage lanes.").errorColor();
+                    }
+
+                    if (!report.storageClasses().isEmpty()) {
+                        String classes = String.join(", ", report.storageClasses());
+                        if (classes.length() > 1000) classes = classes.substring(0, 997) + "...";
+                        embed.addField("Bulk Items We Found", classes, false);
+                    }
+                    if (!report.laneStorage().allocations().isEmpty()) {
+                        String allocations = report.laneStorage().allocations().stream()
+                                .limit(20)
+                                .map(allocation -> IndexExporter.toReadableName(
+                                            allocation.demand().storageClass())
+                                        + " → Lane " + allocation.lane().id() + ": "
+                                        + LaneConstructionPlan.doubleChestsForSlots(
+                                            allocation.demand().requiredShulkerSlots())
+                                        + " double chest(s) minimum ("
+                                        + allocation.demand().requiredShulkerSlots()
+                                        + "/" + allocation.lane().shulkerSlots()
+                                        + " shulker slots)")
+                                .collect(Collectors.joining("\n"));
+                        if (report.laneStorage().allocations().size() > 20) allocations += "\n...";
+                        embed.addField("How Big Each Lane Needs To Be", allocations, false);
+                    }
+                    if (!report.laneStorage().unassigned().isEmpty()) {
+                        String oversized = report.laneStorage().unassigned().stream()
+                                .limit(20)
+                                .map(demand -> demand.storageClass() + " (needs "
+                                        + demand.requiredShulkerSlots() + " slots)")
+                                .collect(Collectors.joining(", "));
+                        embed.addField("Items With Nowhere To Go Yet", oversized, false);
+                    }
+                    if (!construction.requirements().isEmpty()) {
+                        String recommendations = construction.requirements().stream()
+                                .limit(20)
+                                .map(requirement -> {
+                                    String itemName = IndexExporter.toReadableName(
+                                            requirement.demand().storageClass());
+                                    if (requirement.action()
+                                            == LaneConstructionPlan.Action.BUILD_NEW_LANE) {
+                                        return "Make a new " + itemName + " lane with at least "
+                                                + requirement.requiredDoubleChests()
+                                                + " double chest(s)";
+                                    }
+                                    return "Make Lane " + requirement.lane().id() + " bigger for "
+                                            + itemName + " by adding "
+                                            + requirement.doubleChestsToAdd()
+                                            + " double chest(s)";
+                                })
+                                .collect(Collectors.joining("\n"));
+                        if (construction.requirements().size() > 20) recommendations += "\n...";
+                        embed.addField("What You Need To Build", recommendations, false);
+                    }
+                    embed.footer("Want the full breakdown? Use /stash lanes export", null);
+                    return OK;
+                })
+                .then(literal("export")
+                    .executes(c -> {
+                        LaneCapacityReport report = module.getLaneCapacityReport();
+                        LaneConstructionPlan construction = LaneConstructionPlan.assess(
+                                report.laneStorage());
+                        byte[] workbook = LaneReportExporter.exportWorkbook(report);
+                        c.getSource().getEmbed()
+                            .title("Your Stash Lane Workbook")
+                            .description("Here you go — " + report.detectedLanes()
+                                    + " lane(s) found. The workbook says to make "
+                                    + construction.newLanesToBuild() + " new lane(s), make "
+                                    + construction.existingLanesToExpand() + " lane(s) bigger, and place "
+                                    + construction.doubleChestsToAdd() + " double chest(s) altogether.")
+                            .successColor()
+                            .fileAttachment(new com.zenith.discord.Embed.FileAttachment(
+                                    "stash_lane_report.xlsx", workbook));
+                        return OK;
+                    }))
+            )
             .then(literal("organize")
                 .executes(c -> {
                     var embed = c.getSource().getEmbed();
@@ -1337,6 +1524,7 @@ public class StashCommand extends Command {
                 embed.addField("Scan Delay", config.scanDelayTicks + " ticks", true);
                 embed.addField("Open Timeout", config.openTimeoutTicks + " ticks", true);
                 embed.addField("Max Containers", String.valueOf(config.maxContainers), true);
+                embed.addField("Preemption Cooldown", config.scanPreemptionCooldownSeconds + " seconds", true);
                 embed.addField("Organizer Walk Timeout", config.organizerWalkTimeoutTicks + " ticks ("
                     + (config.organizerWalkTimeoutTicks / 20) + "s)", true);
                 embed.addField("Waypoint Distance", String.valueOf(config.waypointDistance), true);
@@ -1407,6 +1595,20 @@ public class StashCommand extends Command {
                         c.getSource().getEmbed()
                             .title("Config Updated")
                             .description("maxContainers = " + config.maxContainers)
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("preemptionCooldown")
+                .then(argument("seconds", integer(1, 3600))
+                    .executes(c -> {
+                        config.scanPreemptionCooldownSeconds = IntegerArgumentType.getInteger(c, "seconds");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("scanPreemptionCooldownSeconds = "
+                                + config.scanPreemptionCooldownSeconds
+                                + " (applies to the next scan)")
                             .successColor();
                         return OK;
                     })
@@ -1764,6 +1966,246 @@ public class StashCommand extends Command {
             case STAGED, ALREADY_STAGED -> embed.successColor();
             case FAILED -> embed.errorColor();
         }
+    }
+
+    private int updateTargetedImportChest(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            boolean add) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Import Chest Failed")
+                .description("Database is not connected; import assignments must be persistent.")
+                .errorColor();
+            return OK;
+        }
+
+        String automationBlocker = importMutationBlocker();
+        if (automationBlocker != null) {
+            embed.title("Import Chest Failed")
+                .description("Cannot change import assignments while " + automationBlocker + ".")
+                .errorColor();
+            return OK;
+        }
+
+        ChestTarget target = targetedChest();
+        if (!target.valid()) {
+            embed.title("Import Chest Failed")
+                .description(target.failure())
+                .errorColor();
+            return OK;
+        }
+        List<int[]> positions = target.positions();
+
+        if (add && (config.pos1 == null || config.pos2 == null)) {
+            embed.title("Import Chest Failed")
+                .description("Set stash pos1 and pos2 before assigning imports so the target region can be validated.")
+                .errorColor();
+            return OK;
+        }
+        if (add && positions.stream().anyMatch(pos -> !isInsideConfiguredRegion(pos))) {
+            embed.title("Import Chest Failed")
+                .description("The targeted chest must be inside the configured stash region.")
+                .errorColor();
+            return OK;
+        }
+        if (add && positions.stream().anyMatch(this::isIndexedLanePosition)) {
+            embed.title("Import Chest Conflict")
+                .description("The targeted chest belongs to a detected storage lane. Lane inventories cannot also be intake-only imports.")
+                .errorColor();
+            return OK;
+        }
+
+        long alreadyRegistered = positions.stream()
+                .filter(pos -> index.isImportChest(pos[0], pos[1], pos[2]))
+                .count();
+        if (add && alreadyRegistered == positions.size()) {
+            embed.title("Import Chest Already Assigned")
+                .description("This chest is already registered as an import source; no changes were made.")
+                .primaryColor();
+            return OK;
+        }
+        if (add && alreadyRegistered > 0) {
+            embed.title("Import Chest Conflict")
+                .description("Only part of this double chest is already registered. Run `/stash import remove` while facing it, then add it again.")
+                .errorColor();
+            return OK;
+        }
+        if (!add && alreadyRegistered == 0) {
+            embed.title("Import Chest Not Assigned")
+                .description("This chest is not registered as an import source; no changes were made.")
+                .primaryColor();
+            return OK;
+        }
+
+        try {
+            if (add) index.addImportChests(positions);
+            else index.removeImportChests(positions);
+        } catch (Exception e) {
+            embed.title("Import Chest Failed")
+                .description("Database error: " + e.getMessage())
+                .errorColor();
+            return OK;
+        }
+
+        int[] primary = positions.get(0);
+        String inventoryType = positions.size() == 2 ? "Double chest" : "Chest";
+        embed.title(add ? "Import Chest Assigned" : "Import Chest Removed")
+            .description(inventoryType + " at " + formatPos(primary)
+                + (add
+                    ? " will be drained as intake during `/stash organize`."
+                    : " is no longer managed as intake."))
+            .successColor();
+        module.getDebugRecorder().record(add ? "import_chest_added" : "import_chest_removed",
+            "position=" + formatPos(primary) + ", block_positions=" + positions.size());
+        return OK;
+    }
+
+    private record ChestTarget(List<int[]> positions, String failure) {
+        private ChestTarget {
+            positions = positions == null ? List.of() : List.copyOf(positions);
+        }
+
+        boolean valid() {
+            return failure == null && !positions.isEmpty();
+        }
+
+        static ChestTarget failed(String failure) {
+            return new ChestTarget(List.of(), failure);
+        }
+    }
+
+    private ChestTarget targetedChest() {
+        if (Proxy.getInstance().hasActivePlayer()) BOT.syncFromCache(true);
+        var ray = RaycastHelper.playerBlockRaycast(BOT.getBlockReachDistance(), false);
+        if (!ray.hit() || !(BlockRegistry.CHEST.equals(ray.block())
+                || BlockRegistry.TRAPPED_CHEST.equals(ray.block()))) {
+            module.getDebugRecorder().record("import_chest_target_failed",
+                    "ray_hit=" + ray.hit()
+                            + ", block=" + ray.block().name()
+                            + ", reach=" + BOT.getBlockReachDistance()
+                            + ", yaw=" + BOT.getYaw()
+                            + ", pitch=" + BOT.getPitch());
+            return ChestTarget.failed("Face a chest or trapped chest within normal interaction range and try again.");
+        }
+
+        var state = World.getBlockState(ray.x(), ray.y(), ray.z());
+        ChestType chestType = state.getProperty(BlockStateProperties.CHEST_TYPE);
+        if (chestType == null) {
+            return ChestTarget.failed("The targeted chest state is incomplete; wait for the chunk to finish loading and try again.");
+        }
+        boolean expectedDouble = chestType != ChestType.SINGLE;
+        var resolution = DoubleChestIdentity.resolve(ray.x(), ray.y(), ray.z(), expectedDouble);
+        if (expectedDouble && !resolution.identityKnown()) {
+            return ChestTarget.failed("The other half of this double chest could not be verified. Wait for both blocks to load and try again.");
+        }
+
+        List<int[]> positions = resolution.blocks();
+        if (positions.size() != (expectedDouble ? 2 : 1)
+                || positions.stream().anyMatch(pos -> pos == null || pos.length < 3
+                    || !World.isInWorldBounds(pos[0], pos[1], pos[2]))) {
+            return ChestTarget.failed("The targeted chest resolved to invalid block coordinates; no assignment was written.");
+        }
+        long uniquePositions = positions.stream()
+                .map(pos -> pos[0] + ":" + pos[1] + ":" + pos[2])
+                .distinct()
+                .count();
+        if (uniquePositions != positions.size()) {
+            return ChestTarget.failed("The targeted double chest resolved to duplicate block positions; no assignment was written.");
+        }
+        for (int[] pos : positions) {
+            var block = World.getBlock(pos[0], pos[1], pos[2]);
+            if (!(BlockRegistry.CHEST.equals(block) || BlockRegistry.TRAPPED_CHEST.equals(block))) {
+                return ChestTarget.failed("Every resolved block must still be a chest or trapped chest; no assignment was written.");
+            }
+        }
+        return new ChestTarget(positions, null);
+    }
+
+    private boolean isInsideConfiguredRegion(int[] pos) {
+        int minX = Math.min(config.pos1[0], config.pos2[0]);
+        int minY = Math.min(config.pos1[1], config.pos2[1]);
+        int minZ = Math.min(config.pos1[2], config.pos2[2]);
+        int maxX = Math.max(config.pos1[0], config.pos2[0]);
+        int maxY = Math.max(config.pos1[1], config.pos2[1]);
+        int maxZ = Math.max(config.pos1[2], config.pos2[2]);
+        return pos[0] >= minX && pos[0] <= maxX
+                && pos[1] >= minY && pos[1] <= maxY
+                && pos[2] >= minZ && pos[2] <= maxZ;
+    }
+
+    private boolean isIndexedLanePosition(int[] target) {
+        return index.detectFifoLanes().stream().anyMatch(lane ->
+                samePosition(target, lane.inputPos()) || samePosition(target, lane.outputPos()));
+    }
+
+    private static boolean samePosition(int[] first, int[] second) {
+        return first[0] == second[0] && first[1] == second[1] && first[2] == second[2];
+    }
+
+    private String importMutationBlocker() {
+        var scanState = module.getState();
+        if (scanState != StashManagerModule.ScanState.IDLE
+                && scanState != StashManagerModule.ScanState.DONE) {
+            return "a stash scan is active (state=" + scanState + ")";
+        }
+        if (module.getOrganizer() != null && module.getOrganizer().isActive()) {
+            return "the organizer is active";
+        }
+        if (module.getRetriever() != null && module.getRetriever().isActive()) {
+            return "a retrieval job is active";
+        }
+        return null;
+    }
+
+    private int purgeImportChests(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            boolean confirmed) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Import Purge Failed")
+                .description("Database is not connected; persistent assignments cannot be changed safely.")
+                .errorColor();
+            return OK;
+        }
+
+        int count = index.getImportChestBlockCount();
+        if (count == 0) {
+            embed.title("No Import Chests")
+                .description("There are no import chest assignments to purge.")
+                .primaryColor();
+            return OK;
+        }
+        if (!confirmed) {
+            embed.title("Confirm Import Chest Purge")
+                .description("This will remove all **" + count + "** persisted import chest block assignment(s). Run `/stash import purge confirm` to continue. No chest contents will be deleted.")
+                .errorColor();
+            return OK;
+        }
+
+        String blocker = importMutationBlocker();
+        if (blocker != null) {
+            embed.title("Import Purge Failed")
+                .description("Cannot purge import assignments while " + blocker + ".")
+                .errorColor();
+            return OK;
+        }
+
+        try {
+            int removed = index.clearImportChests();
+            module.getDebugRecorder().record("import_chests_purged",
+                    "cached_blocks=" + count + ", persisted_blocks_removed=" + removed);
+            module.fireWebhookEvent("import_chests_purged", Map.of(
+                    "cached_blocks", count,
+                    "persisted_blocks_removed", removed));
+            embed.title("Import Chests Purged")
+                .description("Removed all import assignments (**" + removed + "** persisted block row(s)). Chest contents were not changed.")
+                .successColor();
+        } catch (Exception e) {
+            embed.title("Import Purge Failed")
+                .description("Database error: " + e.getMessage())
+                .errorColor();
+        }
+        return OK;
     }
 
     private String formatUpdaterState(final PluginUpdateService.StatusSnapshot snapshot) {

@@ -4,6 +4,7 @@ import com.zenith.cache.data.inventory.Container;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
 
@@ -38,11 +39,7 @@ public class ContainerReader {
         int containerSlotCount = Math.max(0, size - 36);
         Map<String, Integer> items = new LinkedHashMap<>();
         int shulkerCount = 0;
-        // Aggregate by color (matching DatabaseManager.buildContainerEntry()'s reconstruction)
-        // rather than one entry per physical shulker slot — otherwise a chest with N identical-
-        // colored shulkers produces N separate ShulkerDetail entries, and organizer planning
-        // then queues N near-duplicate relocation tasks for what should be a single move.
-        Map<String, Map<String, Integer>> shulkerItemsByColor = new LinkedHashMap<>();
+        var shulkerDetails = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
 
         for (int slot = 0; slot < containerSlotCount; slot++) {
             ItemStack stack = open.getItemStack(slot);
@@ -56,9 +53,9 @@ public class ContainerReader {
                 shulkerCount++;
                 var shulkerDetail = shulkerIntrospector.introspect(stack);
                 if (shulkerDetail != null) {
-                    var colorItems = shulkerItemsByColor.computeIfAbsent(shulkerDetail.color(), k -> new LinkedHashMap<>());
+                    shulkerDetails.add(new ContainerEntry.ShulkerDetail(
+                            slot, shulkerDetail.color(), shulkerDetail.items()));
                     for (var entry : shulkerDetail.items().entrySet()) {
-                        colorItems.merge(entry.getKey(), entry.getValue(), Integer::sum);
                         // Also add shulker contents to the container-level items
                         items.merge(entry.getKey(), entry.getValue(), Integer::sum);
                     }
@@ -66,25 +63,28 @@ public class ContainerReader {
             }
         }
 
-        var shulkerDetails = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
-        for (var entry : shulkerItemsByColor.entrySet()) {
-            shulkerDetails.add(new ContainerEntry.ShulkerDetail(entry.getKey(), entry.getValue()));
-        }
-
-
+        boolean actualDouble = (location.type() == BlockEntityType.CHEST
+                || location.type() == BlockEntityType.TRAPPED_CHEST)
+                && containerSlotCount == 54;
         String blockType = blockEntityTypeToId(location.type());
         String hopperFacing = location.hopperFacing() != null ? location.hopperFacing().name() : null;
+        var inventoryIdentity = DoubleChestIdentity.resolve(
+                location.x(), location.y(), location.z(), actualDouble);
 
         ContainerEntry containerEntry = new ContainerEntry(
             location.x(), location.y(), location.z(),
             blockType,
-            isDouble,
+            actualDouble,
             items,
             shulkerCount,
             shulkerDetails,
             System.currentTimeMillis(),
             null,
-            hopperFacing
+            hopperFacing,
+            inventoryIdentity.inventoryX(),
+            inventoryIdentity.inventoryY(),
+            inventoryIdentity.inventoryZ(),
+            inventoryIdentity.identityKnown()
         );
 
         index.put(containerEntry);

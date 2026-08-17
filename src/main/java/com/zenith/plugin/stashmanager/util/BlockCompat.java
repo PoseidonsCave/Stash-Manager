@@ -21,8 +21,10 @@ public final class BlockCompat {
     );
 
     public static boolean isAir(Block block) {
+        if (block == null) return false;
         return switch (block.name()) {
-            case "minecraft:air", "minecraft:cave_air", "minecraft:void_air" -> true;
+            case "air", "cave_air", "void_air",
+                 "minecraft:air", "minecraft:cave_air", "minecraft:void_air" -> true;
             default -> false;
         };
     }
