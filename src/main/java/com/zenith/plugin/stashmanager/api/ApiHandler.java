@@ -8,6 +8,8 @@ import com.zenith.plugin.stashmanager.StashManagerModule;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
+import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
+import com.zenith.plugin.stashmanager.orchestration.LaneConstructionPlan;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
 
 import java.io.IOException;
@@ -16,7 +18,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 
-// Handles JSON API requests and Prometheus metrics.
+// Serves JSON endpoints and Prometheus metrics.
 public class ApiHandler {
 
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
@@ -52,8 +54,14 @@ public class ApiHandler {
         body.put("scan_processed_ratio", module.getProcessedRatio());
         body.put("scan_success_rate", module.getSuccessRate());
         body.put("scan_failure_rate", module.getFailureRate());
+        body.put("scan_preemptions", module.getScanPreemptionCount());
+        body.put("scan_preemption_cooldown_remaining_seconds",
+            module.getScanPreemptionCooldownRemainingSeconds());
         body.put("last_scan", index.timeSinceLastScan());
         body.put("database_connected", database != null && database.isInitialized());
+        body.put("database_write_healthy", index.isDatabaseWriteHealthy());
+        body.put("database_write_failures", index.getDatabaseWriteFailures());
+        body.put("import_chest_blocks", index.getImportChestBlockCount());
 
         if (config.pos1 != null && config.pos2 != null) {
             body.put("region_pos1", Map.of("x", config.pos1[0], "y", config.pos1[1], "z", config.pos1[2]));
@@ -79,7 +87,7 @@ public class ApiHandler {
         List<ContainerEntry> entries;
         int totalCount;
 
-        // Prefer DB if available
+        // Query durable data first.
         if (database != null && database.isInitialized()) {
             try {
                 entries = database.getContainersPage(page, size);
@@ -157,7 +165,7 @@ public class ApiHandler {
                 return;
             }
         } else {
-            // Fallback to in-memory index stats
+            // Fall back to the in-memory index.
             body.put("total_containers", index.size());
             body.put("last_scan_timestamp", index.getLastScanTimestamp());
 
@@ -178,7 +186,7 @@ public class ApiHandler {
             body.put("containers_by_type", byType);
         }
 
-        // Include scanner state
+        // Add live scanner state.
         body.put("scanner_state", module.getState().name());
         body.put("scan_containers_found", module.getContainersFound());
         body.put("scan_containers_indexed", module.getContainersIndexed());
@@ -203,7 +211,7 @@ public class ApiHandler {
         sb.append("# TYPE stash_containers_total gauge\n");
         sb.append("stash_containers_total ").append(index.size()).append('\n');
 
-        sb.append("# HELP stash_scanner_state Current scanner state (0=IDLE,1=SCANNING,2=WALKING,3=OPENING,4=READING,5=CLOSING,6=WALKING_TO_ZONE,7=RETURNING,8=DONE)\n");
+        sb.append("# HELP stash_scanner_state Current scanner state (0=IDLE,1=ZONE_SCANNING,2=WALKING,3=OPENING,4=READING,5=CLOSING,6=WALKING_TO_ZONE,7=RETURNING,8=YIELDED,9=DONE)\n");
         sb.append("# TYPE stash_scanner_state gauge\n");
         sb.append("stash_scanner_state ").append(module.getState().ordinal()).append('\n');
 
@@ -218,6 +226,15 @@ public class ApiHandler {
         sb.append("# HELP stash_scan_containers_failed Containers failed to index in current/last scan\n");
         sb.append("# TYPE stash_scan_containers_failed gauge\n");
         sb.append("stash_scan_containers_failed ").append(module.getContainersFailed()).append('\n');
+
+        sb.append("# HELP stash_scan_preemptions_total Cooperative scanner handoffs in the current or last scan\n");
+        sb.append("# TYPE stash_scan_preemptions_total gauge\n");
+        sb.append("stash_scan_preemptions_total ").append(module.getScanPreemptionCount()).append('\n');
+
+        sb.append("# HELP stash_scan_preemption_cooldown_remaining_seconds Minimum scanner yield hold remaining\n");
+        sb.append("# TYPE stash_scan_preemption_cooldown_remaining_seconds gauge\n");
+        sb.append("stash_scan_preemption_cooldown_remaining_seconds ")
+            .append(module.getScanPreemptionCooldownRemainingSeconds()).append('\n');
 
         sb.append("# HELP stash_scan_containers_pending Containers pending in current scan\n");
         sb.append("# TYPE stash_scan_containers_pending gauge\n");
@@ -247,6 +264,14 @@ public class ApiHandler {
         sb.append("# TYPE stash_database_connected gauge\n");
         sb.append("stash_database_connected ").append(database != null && database.isInitialized() ? 1 : 0).append('\n');
 
+        sb.append("# HELP stash_database_write_healthy Whether the latest attempted container persistence succeeded (1=yes, 0=no)\n");
+        sb.append("# TYPE stash_database_write_healthy gauge\n");
+        sb.append("stash_database_write_healthy ").append(index.isDatabaseWriteHealthy() ? 1 : 0).append('\n');
+
+        sb.append("# HELP stash_database_write_failures_total Container persistence failures since plugin startup\n");
+        sb.append("# TYPE stash_database_write_failures_total counter\n");
+        sb.append("stash_database_write_failures_total ").append(index.getDatabaseWriteFailures()).append('\n');
+
         if (database != null && database.isInitialized()) {
             try {
                 Map<String, Object> stats = database.getStatistics();
@@ -266,11 +291,11 @@ public class ApiHandler {
                     sb.append("stash_shulkers_total ").append(stats.get("total_shulkers")).append('\n');
                 }
             } catch (Exception ignored) {
-                // Metrics should not fail due to DB issues
+                // Keep metrics available when the database fails.
             }
         }
 
-        // Organizer metrics
+        // Organizer
         var organizer = module.getOrganizer();
         if (organizer != null) {
             sb.append("# HELP stash_organizer_active Whether the organizer is running (1=yes, 0=no)\n");
@@ -286,7 +311,63 @@ public class ApiHandler {
             sb.append("stash_organizer_tasks_total ").append(organizer.getTotalTasks()).append('\n');
         }
 
+        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        sb.append("# HELP stash_lane_capacity_ready Whether the latest scan is trusted and has enough dedicated lanes\n");
+        sb.append("# TYPE stash_lane_capacity_ready gauge\n");
+        sb.append("stash_lane_capacity_ready ").append(capacity.canOrganize() ? 1 : 0).append('\n');
+
+        sb.append("# HELP stash_lane_capacity_status Current lane audit status as a labeled one-hot gauge\n");
+        sb.append("# TYPE stash_lane_capacity_status gauge\n");
+        sb.append("stash_lane_capacity_status{status=\"")
+                .append(capacity.status().name().toLowerCase(Locale.ROOT)).append("\"} 1\n");
+
+        appendGauge(sb, "stash_lanes_detected", "Storage lanes detected in the configured region",
+                capacity.detectedLanes());
+        appendGauge(sb, "stash_lanes_protected", "Storage lanes reserved by mixed, empty, or unclassified shulkers",
+                capacity.protectedLanes());
+        appendGauge(sb, "stash_lanes_assignable", "Storage lanes available for exact bulk item classes",
+                capacity.assignableLanes());
+        appendGauge(sb, "stash_lanes_required", "Unique exact bulk item classes requiring dedicated lanes",
+                capacity.requiredStorageClasses());
+        appendGauge(sb, "stash_lanes_spare", "Assignable lanes remaining after one lane per bulk class",
+                capacity.spareLanes());
+        appendGauge(sb, "stash_lanes_shortfall", "Additional dedicated lanes required before organizing",
+                capacity.laneShortfall());
+        appendGauge(sb, "stash_lane_shulker_slots_assignable", "Total shulker-box slots across assignable lanes",
+                capacity.laneStorage().totalAssignableShulkerSlots());
+        appendGauge(sb, "stash_lane_shulker_slots_required", "Shulker-box slots required by managed bulk classes",
+                capacity.laneStorage().totalRequiredShulkerSlots());
+        appendGauge(sb, "stash_lane_storage_classes_unassigned", "Bulk classes which cannot fit any assignable lane",
+                capacity.laneStorage().unassigned().size());
+        appendGauge(sb, "stash_lane_shulker_slots_unassigned_required", "Required slots belonging to unassigned bulk classes",
+                capacity.laneStorage().unassignedRequiredShulkerSlots());
+        LaneConstructionPlan construction = LaneConstructionPlan.assess(capacity.laneStorage());
+        appendGauge(sb, "stash_lane_construction_new_lanes", "New dedicated storage lanes which must be built",
+                construction.newLanesToBuild());
+        appendGauge(sb, "stash_lane_construction_expansions", "Existing lanes which require additional double chests",
+                construction.existingLanesToExpand());
+        appendGauge(sb, "stash_lane_construction_double_chests_to_add", "Total double chests required by the current construction plan",
+                construction.doubleChestsToAdd());
+        appendGauge(sb, "stash_lane_required_dedicated_double_chests", "Minimum double chests required across all dedicated item lanes",
+                construction.requiredDedicatedDoubleChests());
+        appendGauge(sb, "stash_shulkers_bulk", "Physical homogeneous bulk shulkers in the latest index",
+                capacity.bulkShulkers());
+        appendGauge(sb, "stash_shulkers_empty", "Physical empty shulkers in the latest index",
+                capacity.emptyShulkers());
+        appendGauge(sb, "stash_shulkers_mixed", "Physical mixed-content shulkers preserved from bulk organization",
+                capacity.mixedShulkers());
+        appendGauge(sb, "stash_shulkers_unclassified", "Legacy or incomplete shulkers requiring a fresh scan",
+                capacity.unclassifiedShulkers());
+        appendGauge(sb, "stash_import_chest_blocks", "Block positions assigned as organizer intake inventories",
+                index.getImportChestBlockCount());
+
         sendText(exchange, 200, sb.toString());
+    }
+
+    private static void appendGauge(StringBuilder output, String name, String help, Number value) {
+        output.append("# HELP ").append(name).append(' ').append(help).append('\n');
+        output.append("# TYPE ").append(name).append(" gauge\n");
+        output.append(name).append(' ').append(value).append('\n');
     }
 
     // POST /api/v1/webhook/test
@@ -319,6 +400,65 @@ public class ApiHandler {
             body.put("total_tasks", organizer.getTotalTasks());
             body.put("status", organizer.getStatus());
         }
+        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        body.put("import_chest_blocks", index.getImportChestBlockCount());
+        body.put("import_chests", index.getImportChests().stream()
+                .map(pos -> Map.of("x", pos[0], "y", pos[1], "z", pos[2]))
+                .toList());
+        body.put("lane_capacity", Map.ofEntries(
+                Map.entry("status", capacity.status().name()),
+                Map.entry("detected_lanes", capacity.detectedLanes()),
+                Map.entry("protected_lanes", capacity.protectedLanes()),
+                Map.entry("assignable_lanes", capacity.assignableLanes()),
+                Map.entry("required_storage_classes", capacity.requiredStorageClasses()),
+                Map.entry("spare_lanes", capacity.spareLanes()),
+                Map.entry("lane_shortfall", capacity.laneShortfall()),
+                Map.entry("bulk_shulkers", capacity.bulkShulkers()),
+                Map.entry("empty_shulkers", capacity.emptyShulkers()),
+                Map.entry("mixed_shulkers", capacity.mixedShulkers()),
+                Map.entry("unclassified_shulkers", capacity.unclassifiedShulkers()),
+                Map.entry("storage_classes", capacity.storageClasses())
+        ));
+        body.put("lane_storage", Map.of(
+                "assignable_shulker_slots", capacity.laneStorage().totalAssignableShulkerSlots(),
+                "required_shulker_slots", capacity.laneStorage().totalRequiredShulkerSlots(),
+                "unassigned_required_shulker_slots", capacity.laneStorage().unassignedRequiredShulkerSlots(),
+                "allocations", capacity.laneStorage().allocations().stream().map(allocation -> Map.ofEntries(
+                        Map.entry("storage_class", allocation.demand().storageClass()),
+                        Map.entry("lane_id", allocation.lane().id()),
+                        Map.entry("required_shulker_slots", allocation.demand().requiredShulkerSlots()),
+                        Map.entry("lane_shulker_slots", allocation.lane().shulkerSlots()),
+                        Map.entry("spare_shulker_slots", allocation.spareShulkerSlots())
+                )).toList(),
+                "unassigned", capacity.laneStorage().unassigned().stream().map(demand -> Map.of(
+                        "storage_class", demand.storageClass(),
+                        "required_shulker_slots", demand.requiredShulkerSlots(),
+                        "existing_bulk_shulkers", demand.existingBulkShulkers(),
+                        "loose_items", demand.looseItems()
+                )).toList()
+        ));
+        LaneConstructionPlan construction = LaneConstructionPlan.assess(capacity.laneStorage());
+        body.put("lane_construction", Map.of(
+                "new_lanes_to_build", construction.newLanesToBuild(),
+                "existing_lanes_to_expand", construction.existingLanesToExpand(),
+                "double_chests_to_add", construction.doubleChestsToAdd(),
+                "existing_assignable_double_chest_equivalent",
+                construction.existingAssignableDoubleChestEquivalent(),
+                "required_dedicated_double_chests", construction.requiredDedicatedDoubleChests(),
+                "requirements", construction.requirements().stream().map(requirement -> {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("storage_class", requirement.demand().storageClass());
+                    row.put("action", requirement.action().name());
+                    if (requirement.lane() != null) {
+                        row.put("lane_id", requirement.lane().id());
+                    }
+                    row.put("current_shulker_slots", requirement.currentShulkerSlots());
+                    row.put("target_shulker_slots", requirement.targetShulkerSlots());
+                    row.put("required_double_chests", requirement.requiredDoubleChests());
+                    row.put("double_chests_to_add", requirement.doubleChestsToAdd());
+                    return row;
+                }).toList()
+        ));
         sendJson(exchange, 200, body);
     }
 
@@ -351,7 +491,7 @@ public class ApiHandler {
         }
         sendJson(exchange, 200, body);
     }
-    // Utility
+    // Response helpers
     private Map<String, Object> containerToMap(ContainerEntry entry) {
         Map<String, Object> map = new LinkedHashMap<>();
         map.put("x", entry.x());
@@ -366,8 +506,11 @@ public class ApiHandler {
         if (entry.label() != null) {
             map.put("label", entry.label());
         }
+        if (index.isImportChest(entry)) {
+            map.put("role", "import");
+        }
 
-        // Items summary
+        // Flatten item counts.
         List<Map<String, Object>> itemsList = new ArrayList<>();
         for (var item : entry.items().entrySet()) {
             Map<String, Object> itemMap = new LinkedHashMap<>();
@@ -378,7 +521,7 @@ public class ApiHandler {
         }
         map.put("items", itemsList);
 
-        // Shulker details
+        // Include shulker contents.
         if (!entry.shulkerDetails().isEmpty()) {
             List<Map<String, Object>> shulkersList = new ArrayList<>();
             for (ContainerEntry.ShulkerDetail shulker : entry.shulkerDetails()) {

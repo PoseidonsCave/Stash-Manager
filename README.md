@@ -1,31 +1,61 @@
-# Stash Manager
+<div align="center">
 
-A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, indexes, and provides Discord-queryable access to container inventories in a Minecraft world. Supports PostgreSQL persistence, a built-in REST API with Prometheus metrics, webhook notifications, and full configuration via Discord commands.
+# 📦 Stash Manager
 
-![Build](https://github.com/PoseidonsCave/Stash-Manager/actions/workflows/build.yml/badge.svg)
-![Downloads](https://img.shields.io/github/downloads/PoseidonsCave/Stash-Manager/total)
+**Give a ZenithProxy bot a stash and let it scan, search, organize, and report what it finds.**
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/6v5greuSp)
-## Features
+[![Build](https://github.com/PoseidonsCave/Stash-Manager/actions/workflows/build.yml/badge.svg)](https://github.com/PoseidonsCave/Stash-Manager/actions/workflows/build.yml)
+[![Downloads](https://img.shields.io/github/downloads/PoseidonsCave/Stash-Manager/total)](https://github.com/PoseidonsCave/Stash-Management/releases)
+[![License](https://img.shields.io/badge/license-AGPL%20v3-blue.svg)](LICENSE)
 
-- **Region-based container scanning** — tick-driven state machine walks to, opens, and reads every container in a defined area
-- **Container types** — chests, barrels, shulker boxes, hoppers, dispensers, droppers
-- **Shulker introspection** — reads nested inventory contents via NBT
-- **Double chest deduplication** — large chests are merged into a single entry
-- **Return-to-start** — bot pathfinds back to its original position after a scan completes
-- **Container labels** — assign custom names to containers for easy identification
-- **Saved regions** — name and persist scan regions in the database for reuse
-- **Stash organizer** — automated item sorting across containers by type with column detection, shulker packing, and overflow handling
-- **PostgreSQL persistence** — all scanned containers stored in a database for long-term querying
-- **REST API** — embedded HTTP server with JSON endpoints and Prometheus-format metrics
-- **Webhook notifications** — POST JSON payloads to external services (n8n, etc.) on scan completion
-- **Safe staged updates** — checks GitHub releases, optionally downloads the next plugin JAR, and loads it on the next restart
-- **Full Discord configuration** — every setting is viewable and changeable via Discord commands
-- **CSV export** — export the full index as a CSV file attachment in Discord
+[![Join the Discord](https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/6v5greuSp)
 
----
+[Quick start](#-quick-start) • [Commands](#-commands) • [Database setup](#-database-setup) • [API](#-rest-api)
 
-## Installation
+</div>
+
+Stash Manager is a [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin for people who
+want a bot to understand a Minecraft storage system instead of treating it like a pile of random
+chests. It remembers scanned inventories, finds items from Discord, plans dedicated storage lanes,
+and produces a shareable workbook that tells you what needs to be built.
+
+## ✨ What it can do
+
+| | Capability | What you get |
+|:--:|------------|--------------|
+| 🔎 | **Scan a stash** | The bot walks the region, opens supported containers, and records their contents. |
+| 📦 | **Understand shulkers** | Nested items, empty boxes, bulk boxes, and mixed kits are kept distinct. |
+| 🧭 | **Plan storage lanes** | See how many lanes and double chests each exact item type needs. |
+| 🗂️ | **Organize safely** | Known bulk shulkers are sorted first, then loose items are packed into matching boxes. |
+| 🔍 | **Find and retrieve items** | Search the index or ask the bot to collect an item or saved kit. |
+| 💾 | **Remember everything** | PostgreSQL keeps scans, labels, regions, assignments, and kits across restarts. |
+| 📊 | **Share useful reports** | Download a styled XLSX lane plan without exposing stash coordinates. |
+| 🤖 | **Connect your stack** | Use the JSON API, Prometheus metrics, Grafana, or webhook events. |
+
+> [!IMPORTANT]
+> Run `stash scan` before `stash organize`. The organizer uses the latest scan to protect mixed
+> shulkers, size every lane, and stop before moving anything when the layout is not ready.
+
+## 🚀 Quick start
+
+1. Install the JAR that matches your ZenithProxy target.
+2. Stand at one corner of the stash and run `stash pos1`.
+3. Stand at the opposite corner and run `stash pos2`.
+4. Run `stash scan`, then check the layout with `stash lanes`.
+5. When the report says **Good to go**, run `stash organize`.
+
+```text
+stash pos1
+stash pos2
+stash scan
+stash lanes
+stash organize
+```
+
+Use `stash lanes export` whenever you want the full **Overview**, **What to Build**, and
+**All Lanes** workbook.
+
+## 📥 Installation
 
 1. Build the plugin JAR (or download from [Releases](https://github.com/PoseidonsCave/Stash-Management/releases))
 2. Choose the JAR whose `+<target>` suffix exactly matches your ZenithProxy Minecraft target and place it in ZenithProxy's `plugins/` directory
@@ -33,7 +63,7 @@ A [ZenithProxy](https://github.com/rfresh2/ZenithProxy) plugin that scans, index
 
 Supported targets are `1.21.4`, `1.21.8`, `1.21.11`, `26.1.2` (the 26.1 family), and `26.2.0` (the 26.2 family).
 
-## Building
+## 🛠️ Building from source
 
 Requires Java 25. Builds for older targets still emit Java 21 bytecode.
 
@@ -41,56 +71,53 @@ Requires Java 25. Builds for older targets still emit Java 21 bytecode.
 ./gradlew test collectVersionJars
 ```
 
-Stonecutter builds all five targets and collects the target-qualified JARs in `build/libs/`. To build one target, run a task such as `./gradlew :1.21.4:shadowJar`.
+Stonecutter builds all five targets and collects the JARs in `build/libs/`. Each filename includes
+its Minecraft target. To build one target, run a task such as `./gradlew :1.21.4:shadowJar`.
 
 ### CI Notes
 
-GitHub Actions now enforces a few supply-chain integrity checks during CI and release builds.
+GitHub Actions protects release builds with dependency review, Gradle wrapper validation, SHA-256
+checksums, and artifact provenance. Release tags must match `plugin_version` in
+`gradle.properties`. Artifact attestations require a public repository unless the organization
+uses a qualifying GitHub plan.
 
-- Pull requests run dependency review and may fail if a new dependency introduces a moderate-or-higher known vulnerability.
-- Build jobs validate the Gradle wrapper, generate SHA-256 checksums for release JARs, and create GitHub artifact provenance attestations.
-- Tag builds verify that the pushed tag matches `plugin_version` in `gradle.properties`. For example, `v2.0.1` must match `plugin_version=2.0.1`.
-- Artifact attestations only work on public repositories for GitHub Free/Pro/Team plans. If you copy this workflow to a private repo, the attestation step may need to be removed or gated unless you are on a premium GitHub tier.
+## 🎮 Commands
 
----
+All commands work through **Discord**, the **terminal**, and **in game chat**.
 
-## Commands
-
-All commands work via **Discord**, **terminal**, and **in-game chat**.
-
-### Scanning
+### 🔎 Scanning
 
 | Command | Description |
 |---------|-------------|
 | `stash pos1 [x y z]` | Set scan region corner 1 (defaults to player position) |
 | `stash pos2 [x y z]` | Set scan region corner 2 (defaults to player position) |
 | `stash scan` | Start scanning containers in the defined region |
-| `stash stop` | Abort an in-progress scan |
+| `stash stop` | Stop the active scan |
 | `stash update` | Check GitHub releases and stage the latest JAR for the next restart |
 | `stash update check` | Check whether a newer release exists without downloading it |
 | `stash status` | Show scan state, region, container counts, DB/API status |
 
-### Index
+### 📚 Index and search
 
 | Command | Description |
 |---------|-------------|
 | `stash list [page]` | Paginated list of indexed containers |
 | `stash export` | Export index to CSV (file attachment in Discord) |
-| `stash clear` | Clear the in-memory index (region positions retained) |
+| `stash clear` | Clear the memory index while keeping region positions |
 | `stash clearall` | Clear both memory index and database |
 | `stash summary` | Detailed index summary with item type breakdown |
 | `stash label <x> <y> <z> <label>` | Assign a label to a container |
 | `stash labels` | List all labeled containers |
 | `stashsearch <item>` | Search for containers holding matching items |
 
-### Database
+### 💾 Database
 
 | Command | Description |
 |---------|-------------|
 | `stash db status` | Show database connection info and row counts |
 | `stash db clear` | Delete all data from the database |
 
-### Regions
+### 🗺️ Saved regions
 
 | Command | Description |
 |---------|-------------|
@@ -99,7 +126,7 @@ All commands work via **Discord**, **terminal**, and **in-game chat**.
 | `stash region list` | List all saved regions |
 | `stash region delete <name>` | Delete a saved region |
 
-### Kits & Retrieval
+### 🎒 Kits and retrieval
 
 These commands use the indexed container data stored in PostgreSQL, so the database must be enabled and connected first.
 
@@ -116,15 +143,61 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stash get status` | Show retrieval progress and remaining items |
 | `stash get stop` | Stop the active retrieval task |
 
-### Organizer
+### 🧭 Organizer
 
 | Command | Description |
 |---------|-------------|
 | `stash organize` | Start sorting items across containers by type |
-| `stash organize stop` | Stop the organizer mid-run |
+| `stash organize stop` | Stop the organizer during a run |
 | `stash organize status` | Show organizer state and progress |
+| `stash lanes` | Show lane count, per item lane sizes, and required double chest construction |
+| `stash lanes export` | Download the styled, coordinate free lane planning workbook as XLSX |
+| `stash import` | Assign the chest currently being faced as an organizer intake chest |
+| `stash import remove` | Remove the intake role from the chest currently being faced |
+| `stash import list` | List persisted intake chest block positions |
+| `stash import purge` | Preview removal of every persisted import assignment |
+| `stash import purge confirm` | Remove every import assignment without altering chest contents |
 
-### Supply Chests
+#### How it stays safe
+
+| Step | What happens |
+|:---:|--------------|
+| 1 | The scan identifies empty, bulk, mixed, and unknown shulkers. |
+| 2 | Mixed shulkers and premade kits are left alone. The bot never guesses what they should become. |
+| 3 | Every exact bulk item type gets its own lane. Fortune and Silk Touch tools remain separate. |
+| 4 | Existing lanes are reused when they are large enough. Otherwise, the bot tells you exactly what to build. |
+| 5 | Loose items are packed only after the lane plan passes. Partial matching shulkers are filled before empty ones are used. |
+
+The capacity check uses each item's real stack size and the free room inside matching shulkers.
+`stash lanes` turns that into plain lane and double chest counts. `stash lanes export` gives you a
+styled workbook with a summary, a build list, and the full lane breakdown.
+
+> [!CAUTION]
+> After upgrading from an older version that grouped shulkers by color, run a fresh `stash scan`
+> before organizing. Old records stay unclassified so a kit is never mistaken for bulk storage.
+
+#### Import chests
+
+Normal standalone chests are left alone. Face a chest and run `stash import` when you want the
+organizer to drain it into the storage lanes. Import chests are always sources, never destinations.
+Facing either half of a double chest assigns or removes the whole chest.
+
+#### Keeping lane assignments stable
+
+Enable PostgreSQL if you want an item to keep the same lane across future runs. Without the
+database, assignments last only for the current proxy session.
+
+<details>
+<summary><strong>API fields for lane planning</strong></summary>
+
+The organizer endpoint exposes the same report under `lane_capacity`, `lane_storage`, and
+`lane_construction`. These objects include readiness, per item capacity, missing lanes, and the
+recommended number of double chests. Coordinates are excluded from the shareable construction
+report.
+
+</details>
+
+### 📤 Supply chests
 
 | Command | Description |
 |---------|-------------|
@@ -132,7 +205,7 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stashsupply remove <id>` | Remove a supply chest by index |
 | `stashsupply list` | List all registered supply chests |
 
-### Configuration
+### ⚙️ Live configuration
 
 All settings can be viewed and changed at runtime via Discord. Changes are saved automatically.
 
@@ -140,10 +213,11 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 |---------|-------------|
 | `stash config` | Show all current configuration values |
 | **Scanner** | |
-| `stash config scanDelay <ticks>` | Ticks between container reads (1–200) |
-| `stash config openTimeout <ticks>` | Max wait ticks for container open response (1–600) |
-| `stash config maxContainers <count>` | Container cap per scan session (1–100000) |
-| `stash config waypointDistance <blocks>` | Walk distance for unloaded chunks (1–256) |
+| `stash config scanDelay <ticks>` | Ticks between container reads (1 to 200) |
+| `stash config openTimeout <ticks>` | Max wait ticks for container open response (1 to 600) |
+| `stash config maxContainers <count>` | Container cap per scan session (1 to 100000) |
+| `stash config preemptionCooldown <seconds>` | Minimum scanner pause after another automation task takes control (1 to 3600) |
+| `stash config waypointDistance <blocks>` | Walk distance for unloaded chunks (1 to 256) |
 | `stash config returnToStart <on\|off>` | Return bot to start position after scan |
 | **Database** | |
 | `stash config db enable` | Enable PostgreSQL persistence |
@@ -151,15 +225,15 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config db url <jdbc-url>` | Set JDBC connection URL |
 | `stash config db user <username>` | Set database username |
 | `stash config db password <password>` | Set database password |
-| `stash config db poolSize <size>` | Connection pool size (1–20) |
+| `stash config db poolSize <size>` | Connection pool size (1 to 20) |
 | `stash config db connect` | Connect (or reconnect) to the database |
 | **API** | |
 | `stash config api enable` | Enable the REST API |
 | `stash config api disable` | Disable API and stop the server |
-| `stash config api port <port>` | Set API listen port (1–65535) |
+| `stash config api port <port>` | Set API listen port (1 to 65535) |
 | `stash config api bind <address>` | Set API bind address |
 | `stash config api key <key>` | Set Bearer token for API authentication |
-| `stash config api threads <count>` | Set HTTP thread pool size (1–16) |
+| `stash config api threads <count>` | Set HTTP thread pool size (1 to 16) |
 | `stash config api start` | Start the API server |
 | `stash config api stop` | Stop the API server |
 | **Webhook** | |
@@ -169,33 +243,33 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config updates checkOnLoad <on\|off>` | Enable/disable startup update checks |
 | `stash config updates autoDownload <on\|off>` | Automatically stage new releases during startup checks |
 
----
-
-## Configuration Reference
+## ⚙️ Configuration reference
 
 Saved automatically via ZenithProxy's plugin config system.
 
-### Scanner
+### 🔎 Scanner
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Enable/disable the module |
 | `scanDelayTicks` | `5` | Ticks between container reads |
-| `openTimeoutTicks` | `60` | Max wait for container open response |
+| `openTimeoutTicks` | `400` | Max wait for container open response |
 | `maxContainers` | `2048` | Container cap per scan session |
 | `waypointDistance` | `48` | Walk distance for unloaded chunks |
+| `scanPreemptionCooldownSeconds` | `300` | Minimum pause after yielding to another automation task |
 | `returnToStart` | `true` | Pathfind back to starting position after scan |
 
-### Organizer
+### 🧭 Organizer
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `organizerEnabled` | `true` | Enable/disable the stash organizer |
-| `organizerClickCooldownTicks` | `3` | Ticks between inventory slot clicks |
+| `organizerClickCooldownTicks` | `6` | Ticks between inventory slot clicks |
 | `organizerOpenTimeoutTicks` | `60` | Max wait ticks for container open |
+| `organizerWalkTimeoutTicks` | `1200` | Max walk time for dense storage layouts |
 | `condenseMinItems` | `1` | Minimum loose items to justify shulker packing |
 
-### Database (PostgreSQL)
+### 💾 Database
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -205,7 +279,7 @@ Saved automatically via ZenithProxy's plugin config system.
 | `databasePassword` | *(empty)* | Database password |
 | `databasePoolSize` | `3` | HikariCP connection pool size |
 
-### API Server
+### 🌐 API server
 
 | Setting | Default | Description |
 |---------|---------|-------------|
@@ -215,33 +289,35 @@ Saved automatically via ZenithProxy's plugin config system.
 | `apiThreads` | `2` | HTTP handler thread pool size |
 | `apiKey` | *(empty)* | Bearer token for authentication (empty = no auth) |
 
-### Webhook
+### 🔔 Webhook
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `webhookUrl` | *(empty)* | URL to POST scan-completion payloads to |
+| `webhookUrl` | *(empty)* | URL that receives completed scan payloads |
 
-### Plugin Updates
+### 🔄 Plugin updates
 
-The updater reads ZenithProxy's native Minecraft codec version at runtime, then only stages a release asset whose `+<target>.jar` suffix and embedded plugin metadata match that target. If the installed plugin was built for a different target, an equal-version compatible JAR can replace it on restart.
+The updater reads ZenithProxy's native Minecraft codec version at runtime, then stages only a
+release asset whose `+<target>.jar` suffix and plugin metadata match that target. If the installed
+plugin targets another version, a compatible JAR with the same release version can replace it on
+restart.
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `updateCheckOnLoad` | `true` | Check GitHub for a newer plugin release during startup |
 | `updateAutoDownload` | `false` | Download and stage a newer plugin JAR automatically during startup checks |
 
----
+## 🗄️ Database setup
 
-## Database Setup
+The database keeps scanned containers available across restarts, so you can search them from
+Discord whenever you need them. No separate database tools are required after setup.
 
-The database lets your scanned containers persist across restarts so you can search them anytime via Discord — no external tools required.
-
-### Step 1: Install PostgreSQL
+### 1. Install PostgreSQL
 
 **Windows:**
 
 1. Download the installer from [postgresql.org/download/windows](https://www.postgresql.org/download/windows/)
-2. Run the installer. Use the defaults — just set a password for the `postgres` superuser when prompted (remember this password)
+2. Run the installer. Keep the defaults and set a password for the `postgres` superuser when prompted.
 3. The installer includes **pgAdmin** (a GUI) and adds PostgreSQL as a Windows service that starts automatically
 
 **Linux (Debian/Ubuntu):**
@@ -258,7 +334,7 @@ brew install postgresql@16
 brew services start postgresql@16
 ```
 
-### Step 2: Create the database
+### 2. Create the database
 
 Open a terminal (or **SQL Shell (psql)** on Windows, found in your Start menu after installing PostgreSQL).
 
@@ -268,7 +344,7 @@ Connect as the superuser:
 # Linux / macOS
 sudo -u postgres psql
 
-# Windows (SQL Shell will prompt you — press Enter for defaults, then enter
+# Windows (SQL Shell will prompt you; press Enter for defaults, then enter
 # the superuser password you set during install)
 ```
 
@@ -280,11 +356,11 @@ CREATE DATABASE stashmanager OWNER stashmanager;
 \q
 ```
 
-That's it for the database side — the plugin creates all tables automatically.
+That is all you need on the database side. The plugin creates its tables automatically.
 
-### Step 3: Connect the plugin
+### 3. Connect the plugin
 
-Run these commands in Discord (or terminal / in-game chat):
+Run these commands in Discord, the terminal, or in game chat:
 
 ```
 stash config db url jdbc:postgresql://localhost:5432/stashmanager
@@ -296,7 +372,7 @@ stash config db connect
 
 You should see a **"Database Connected"** confirmation. From this point on, every scan saves its results to the database and all `stash list`, `stash export`, and `stashsearch` commands query from it automatically.
 
-### Verify it's working
+### ✅ Check the connection
 
 ```
 stash db status
@@ -306,26 +382,35 @@ This shows the connection state and how many containers/items are stored.
 
 ### What the database gives you
 
-- **Persistence** — container data survives plugin/proxy restarts
-- **Faster searches** — `stashsearch` queries the database instead of scanning memory
-- **History** — `scan_history` table tracks every scan run with timestamps and counts
-- **Bulk export** — `stash export` pulls from the database for complete CSV dumps
+| | Benefit | What it means |
+|:--:|---------|---------------|
+| 💾 | **Persistence** | Container data survives plugin and proxy restarts. |
+| 🔍 | **Faster searches** | `stashsearch` queries stored data instead of scanning memory. |
+| 🕒 | **History** | `scan_history` records every run with timestamps and counts. |
+| 📄 | **Complete exports** | `stash export` can pull the full index from PostgreSQL. |
+| 🧭 | **Stable lane assignments** | Each exact bulk item keeps the same dedicated lane on future organization runs. |
 
-### Database tables (created automatically)
+<details>
+<summary><strong>Database tables created automatically</strong></summary>
+
+The plugin owns and updates these tables. You do not need to create them by hand.
 
 | Table | Contents |
 |-------|----------|
 | `containers` | Position, type, dimension, item count, first/last seen timestamps, label |
 | `container_items` | Slot, item ID, display name, count per container |
+| `container_shulkers` | Physical shulker slot and color per container, including empty boxes |
 | `scan_history` | Start/end time, container count, status per scan run |
 | `regions` | Named scan regions with pos1/pos2 coordinates |
-| `config` | Key-value plugin configuration pairs |
+| `config` | Plugin configuration keys and values |
 | `storage_chests` | Registered supply chest positions |
 | `keep_items` | Items the organizer should leave in place |
+| `column_assignments` | Item type -> assigned organize column (top chest position), kept stable across runs |
 
----
 
-## REST API
+</details>
+
+## 🌐 REST API
 
 When enabled, the API server exposes the following endpoints. All endpoints require a `Authorization: Bearer <apiKey>` header if an API key is configured.
 
@@ -337,18 +422,18 @@ When enabled, the API server exposes the following endpoints. All endpoints requ
 | `GET` | `/api/v1/containers?page=1&size=50` | Paginated container list |
 | `GET` | `/api/v1/search?item=diamond` | Search containers by item name |
 | `GET` | `/api/v1/stats` | Aggregate statistics (totals, types, top items) |
-| `GET` | `/api/v1/metrics` | Prometheus-format metrics |
+| `GET` | `/api/v1/metrics` | Prometheus metrics |
 | `GET` | `/api/v1/organizer` | Organizer state and task progress |
 | `GET` | `/api/v1/regions` | Saved region list |
 | `POST` | `/api/v1/webhook/test` | Send a test webhook payload |
 
-### Example
+### Example request
 
 ```sh
 curl -H "Authorization: Bearer mykey" http://localhost:8585/api/v1/stats
 ```
 
-### Prometheus / Grafana
+### 📊 Prometheus and Grafana
 
 The `/api/v1/metrics` endpoint returns metrics in Prometheus exposition format:
 
@@ -361,11 +446,19 @@ stashmanager_api_uptime_seconds 3600
 stash_organizer_active 0
 stash_organizer_tasks_completed 0
 stash_organizer_tasks_total 0
+stash_lane_capacity_ready 1
+stash_lanes_detected 24
+stash_lanes_assignable 22
+stash_lanes_required 18
+stash_lanes_spare 4
+stash_lanes_shortfall 0
+stash_shulkers_mixed 3
+stash_shulkers_unclassified 0
 ```
 
 Add this as a Prometheus scrape target and build Grafana dashboards from the `stashmanager_*` metrics.
 
-### n8n / Webhook Integration
+### 🔔 n8n and webhook integration
 
 Set a webhook URL and the plugin will POST a JSON payload when each scan completes:
 
@@ -383,8 +476,6 @@ Payload format:
 }
 ```
 
----
-
-## License
+## 📜 License
 
 This project is licensed under the [GNU Affero General Public License v3.0 only](LICENSE).

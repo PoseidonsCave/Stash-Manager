@@ -14,16 +14,31 @@ public record ContainerEntry(
     int shulkerCount,
     List<ShulkerDetail> shulkerDetails,
     long timestamp,
-    String label
+    String label,
+    // Direction a hopper's spout feeds into (e.g. "NORTH"); null for non-hoppers.
+    String hopperFacing,
+    // Canonical physical-inventory position. Both double-chest halves share this identity.
+    int inventoryX, int inventoryY, int inventoryZ,
+    boolean inventoryIdentityKnown
 ) {
 
     // Per-shulker breakdown: color and items inside.
     public record ShulkerDetail(
+        int slot,
         String color,
         Map<String, Integer> items
     ) {
         public ShulkerDetail {
             items = items == null ? Collections.emptyMap() : new LinkedHashMap<>(items);
+        }
+
+        // Legacy scans/database rows were aggregated by color and have no physical slot.
+        public ShulkerDetail(String color, Map<String, Integer> items) {
+            this(-1, color, items);
+        }
+
+        public boolean isPhysicalInstance() {
+            return slot >= 0;
         }
     }
 
@@ -36,7 +51,25 @@ public record ContainerEntry(
     public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
                           Map<String, Integer> items, int shulkerCount,
                           List<ShulkerDetail> shulkerDetails, long timestamp) {
-        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, null);
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
+                null, null, x, y, z, !isDouble);
+    }
+
+    // Convenience constructor without hopperFacing (backwards compatible).
+    public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
+                          Map<String, Integer> items, int shulkerCount,
+                          List<ShulkerDetail> shulkerDetails, long timestamp, String label) {
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
+                label, null, x, y, z, !isDouble);
+    }
+
+    // Convenience constructor used by older call sites without persisted inventory identity.
+    public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
+                          Map<String, Integer> items, int shulkerCount,
+                          List<ShulkerDetail> shulkerDetails, long timestamp,
+                          String label, String hopperFacing) {
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
+                label, hopperFacing, x, y, z, !isDouble);
     }
 
     // Unique position key for deduplication.
@@ -91,6 +124,14 @@ public record ContainerEntry(
 
     // Create a copy with a new label.
     public ContainerEntry withLabel(String newLabel) {
-        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp, newLabel);
+        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
+                shulkerDetails, timestamp, newLabel, hopperFacing,
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown);
+    }
+
+    public long inventoryKey() {
+        return ((long) inventoryX & 0x3FFFFFFL) << 38
+                | ((long) inventoryY & 0xFFFL) << 26
+                | ((long) inventoryZ & 0x3FFFFFFL);
     }
 }

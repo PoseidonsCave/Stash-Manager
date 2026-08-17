@@ -60,6 +60,12 @@ public class DatabaseManager implements AutoCloseable {
                     shulker_count INTEGER NOT NULL DEFAULT 0,
                     total_items INTEGER NOT NULL DEFAULT 0,
                     scan_timestamp BIGINT NOT NULL,
+                    label VARCHAR(128),
+                    hopper_facing VARCHAR(16),
+                    inventory_x INTEGER,
+                    inventory_y INTEGER,
+                    inventory_z INTEGER,
+                    inventory_identity_known BOOLEAN NOT NULL DEFAULT FALSE,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(x, y, z)
@@ -73,7 +79,18 @@ public class DatabaseManager implements AutoCloseable {
                     item_id VARCHAR(128) NOT NULL,
                     quantity INTEGER NOT NULL,
                     in_shulker BOOLEAN NOT NULL DEFAULT FALSE,
-                    shulker_color VARCHAR(32)
+                    shulker_color VARCHAR(32),
+                    shulker_instance INTEGER
+                )
+                """);
+
+            // One row per physical shulker, including empty boxes that have no content rows.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS container_shulkers (
+                    container_id BIGINT NOT NULL REFERENCES containers(id) ON DELETE CASCADE,
+                    slot INTEGER NOT NULL,
+                    color VARCHAR(32) NOT NULL,
+                    PRIMARY KEY (container_id, slot)
                 )
                 """);
 
@@ -129,10 +146,37 @@ public class DatabaseManager implements AutoCloseable {
                 )
                 """);
 
+            // Explicit intake inventories. These coordinates are configuration rather than
+            // scan data, so they deliberately have no foreign key to containers and survive
+            // index clears/rescans. Both halves of a double chest are registered together.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS import_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+
             // Keep-items set (items the organizer should not move)
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS keep_items (
-                    item_id VARCHAR(128) PRIMARY KEY
+                    item_id VARCHAR(128) PRIMARY KEY,
+                    keep_quantity INTEGER
+                )
+                """);
+
+            // Organizer column assignments (item_id -> the top chest position of the column it's
+            // assigned to). Persisted so item->column mapping stays stable across organize runs
+            // instead of being recomputed greedily from scratch (and potentially reshuffled) every time.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS column_assignments (
+                    item_id VARCHAR(128) PRIMARY KEY,
+                    col_x INTEGER NOT NULL,
+                    col_y INTEGER NOT NULL,
+                    col_z INTEGER NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """);
 
@@ -157,6 +201,7 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_kit_items_kit ON kit_items(kit_name)");
 
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_items_item_id ON container_items(item_id)");
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_shulkers_container ON container_shulkers(container_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_position ON containers(x, y, z)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_block_type ON containers(block_type)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_containers_scan_ts ON containers(scan_timestamp)");
@@ -172,17 +217,44 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     private void migrateSchema() throws SQLException {
-        try (Connection conn = dataSource.getConnection()) {
-            // Add label column to containers if missing
-            boolean hasLabel = false;
-            try (ResultSet rs = conn.getMetaData().getColumns(null, null, "containers", "label")) {
-                hasLabel = rs.next();
-            }
-            if (!hasLabel) {
-                try (Statement stmt = conn.createStatement()) {
-                    stmt.execute("ALTER TABLE containers ADD COLUMN label VARCHAR(128)");
-                }
-            }
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement()) {
+            // PostgreSQL metadata searches without a schema pattern can see another bot's
+            // same-named table. That made a migrated schema suppress migrations in every new
+            // bot schema. Execute idempotent DDL against the connection's active search_path
+            // instead, so each schema is upgraded independently.
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS label VARCHAR(128)");
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS hopper_facing VARCHAR(16)");
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_x INTEGER");
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_y INTEGER");
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_z INTEGER");
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_identity_known BOOLEAN NOT NULL DEFAULT FALSE");
+            // NULL means keep unlimited.
+            stmt.execute("ALTER TABLE keep_items ADD COLUMN IF NOT EXISTS keep_quantity INTEGER");
+            // Older rows remain NULL and are treated as legacy aggregate data until rescanned.
+            stmt.execute("ALTER TABLE container_items ADD COLUMN IF NOT EXISTS shulker_instance INTEGER");
+
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS import_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+
+            // Installations upgrading from schemas created before physical shulker persistence
+            // still need the side table that can represent empty boxes.
+                stmt.execute("""
+                    CREATE TABLE IF NOT EXISTS container_shulkers (
+                        container_id BIGINT NOT NULL REFERENCES containers(id) ON DELETE CASCADE,
+                        slot INTEGER NOT NULL,
+                        color VARCHAR(32) NOT NULL,
+                        PRIMARY KEY (container_id, slot)
+                    )
+                    """);
+            stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_shulkers_container ON container_shulkers(container_id)");
         }
     }
 
@@ -206,8 +278,9 @@ public class DatabaseManager implements AutoCloseable {
 
     private long upsertContainerRow(Connection conn, ContainerEntry entry) throws SQLException {
         String sql = """
-            INSERT INTO containers (x, y, z, block_type, is_double, shulker_count, total_items, scan_timestamp, label, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO containers (x, y, z, block_type, is_double, shulker_count, total_items, scan_timestamp, label, hopper_facing,
+                                    inventory_x, inventory_y, inventory_z, inventory_identity_known, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (x, y, z) DO UPDATE SET
                 block_type = EXCLUDED.block_type,
                 is_double = EXCLUDED.is_double,
@@ -215,6 +288,11 @@ public class DatabaseManager implements AutoCloseable {
                 total_items = EXCLUDED.total_items,
                 scan_timestamp = EXCLUDED.scan_timestamp,
                 label = EXCLUDED.label,
+                hopper_facing = EXCLUDED.hopper_facing,
+                inventory_x = EXCLUDED.inventory_x,
+                inventory_y = EXCLUDED.inventory_y,
+                inventory_z = EXCLUDED.inventory_z,
+                inventory_identity_known = EXCLUDED.inventory_identity_known,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """;
@@ -229,6 +307,11 @@ public class DatabaseManager implements AutoCloseable {
             ps.setInt(7, entry.totalItems());
             ps.setLong(8, entry.timestamp());
             ps.setString(9, entry.label());
+            ps.setString(10, entry.hopperFacing());
+            ps.setInt(11, entry.inventoryX());
+            ps.setInt(12, entry.inventoryY());
+            ps.setInt(13, entry.inventoryZ());
+            ps.setBoolean(14, entry.inventoryIdentityKnown());
 
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
@@ -243,16 +326,46 @@ public class DatabaseManager implements AutoCloseable {
             ps.setLong(1, containerId);
             ps.executeUpdate();
         }
+        try (PreparedStatement ps = conn.prepareStatement("DELETE FROM container_shulkers WHERE container_id = ?")) {
+            ps.setLong(1, containerId);
+            ps.executeUpdate();
+        }
 
-        // Insert direct container items
-        String insertSql = "INSERT INTO container_items (container_id, item_id, quantity, in_shulker, shulker_color) VALUES (?, ?, ?, ?, ?)";
+        // Persist the physical box independently from its contents so empty boxes survive a
+        // database reload. Legacy aggregate details deliberately have no physical slot.
+        try (PreparedStatement ps = conn.prepareStatement(
+                "INSERT INTO container_shulkers (container_id, slot, color) VALUES (?, ?, ?)")) {
+            for (ContainerEntry.ShulkerDetail shulker : entry.shulkerDetails()) {
+                if (!shulker.isPhysicalInstance()) continue;
+                ps.setLong(1, containerId);
+                ps.setInt(2, shulker.slot());
+                ps.setString(3, shulker.color());
+                ps.addBatch();
+            }
+            ps.executeBatch();
+        }
+
+        // entry.items() is the merged total (loose items + everything inside shulkers).
+        // Subtract out what's already itemized per-shulker below so each unit is only
+        // counted once, rather than once here and again in the shulker breakdown rows.
+        Map<String, Integer> directItems = new LinkedHashMap<>(entry.items());
+        for (ContainerEntry.ShulkerDetail shulker : entry.shulkerDetails()) {
+            for (var item : shulker.items().entrySet()) {
+                directItems.merge(item.getKey(), -item.getValue(), Integer::sum);
+            }
+        }
+        directItems.values().removeIf(qty -> qty <= 0);
+
+        // Insert direct (non-shulker) container items
+        String insertSql = "INSERT INTO container_items (container_id, item_id, quantity, in_shulker, shulker_color, shulker_instance) VALUES (?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
-            for (var item : entry.items().entrySet()) {
+            for (var item : directItems.entrySet()) {
                 ps.setLong(1, containerId);
                 ps.setString(2, item.getKey());
                 ps.setInt(3, item.getValue());
                 ps.setBoolean(4, false);
                 ps.setNull(5, Types.VARCHAR);
+                ps.setNull(6, Types.INTEGER);
                 ps.addBatch();
             }
 
@@ -264,6 +377,8 @@ public class DatabaseManager implements AutoCloseable {
                     ps.setInt(3, item.getValue());
                     ps.setBoolean(4, true);
                     ps.setString(5, shulker.color());
+                    if (shulker.isPhysicalInstance()) ps.setInt(6, shulker.slot());
+                    else ps.setNull(6, Types.INTEGER);
                     ps.addBatch();
                 }
             }
@@ -276,7 +391,7 @@ public class DatabaseManager implements AutoCloseable {
     public List<ContainerEntry> getAllContainers() throws SQLException {
         if (!initialized) return Collections.emptyList();
 
-        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label FROM containers ORDER BY scan_timestamp DESC";
+        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known FROM containers ORDER BY scan_timestamp DESC";
         List<ContainerEntry> results = new ArrayList<>();
 
         try (Connection conn = dataSource.getConnection();
@@ -294,7 +409,7 @@ public class DatabaseManager implements AutoCloseable {
     public List<ContainerEntry> getContainersPage(int page, int pageSize) throws SQLException {
         if (!initialized) return Collections.emptyList();
 
-        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
+        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
         List<ContainerEntry> results = new ArrayList<>();
 
         try (Connection conn = dataSource.getConnection();
@@ -316,7 +431,8 @@ public class DatabaseManager implements AutoCloseable {
         if (!initialized) return Collections.emptyList();
 
         String sql = """
-            SELECT DISTINCT c.id, c.x, c.y, c.z, c.block_type, c.is_double, c.shulker_count, c.scan_timestamp, c.label
+            SELECT DISTINCT c.id, c.x, c.y, c.z, c.block_type, c.is_double, c.shulker_count, c.scan_timestamp, c.label, c.hopper_facing,
+                            c.inventory_x, c.inventory_y, c.inventory_z, c.inventory_identity_known
             FROM containers c
             JOIN container_items ci ON c.id = ci.container_id
             WHERE LOWER(ci.item_id) LIKE ?
@@ -425,6 +541,33 @@ public class DatabaseManager implements AutoCloseable {
         try (Connection conn = dataSource.getConnection();
              Statement stmt = conn.createStatement()) {
             stmt.execute("TRUNCATE container_items, containers RESTART IDENTITY CASCADE");
+        }
+    }
+
+    /** Deletes obsolete scan rows atomically; child item/shulker rows cascade. */
+    public void deleteContainers(Collection<ContainerEntry> containers) throws SQLException {
+        if (!initialized || containers == null || containers.isEmpty()) return;
+
+        String sql = "DELETE FROM containers WHERE x = ? AND y = ? AND z = ?";
+        try (Connection conn = dataSource.getConnection()) {
+            boolean originalAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
+                for (ContainerEntry entry : containers) {
+                    if (entry == null) continue;
+                    ps.setInt(1, entry.x());
+                    ps.setInt(2, entry.y());
+                    ps.setInt(3, entry.z());
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(originalAutoCommit);
+            }
         }
     }
 
@@ -542,6 +685,70 @@ public class DatabaseManager implements AutoCloseable {
         return labels;
     }
 
+    // Import Chests
+    public void addImportChests(Collection<int[]> positions) throws SQLException {
+        if (!initialized || positions == null || positions.isEmpty()) return;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO import_chests (x, y, z) VALUES (?, ?, ?) ON CONFLICT (x, y, z) DO NOTHING")) {
+                for (int[] pos : positions) {
+                    if (pos == null || pos.length < 3) continue;
+                    ps.setInt(1, pos[0]);
+                    ps.setInt(2, pos[1]);
+                    ps.setInt(3, pos[2]);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    public void removeImportChests(Collection<int[]> positions) throws SQLException {
+        if (!initialized || positions == null || positions.isEmpty()) return;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM import_chests WHERE x = ? AND y = ? AND z = ?")) {
+                for (int[] pos : positions) {
+                    if (pos == null || pos.length < 3) continue;
+                    ps.setInt(1, pos[0]);
+                    ps.setInt(2, pos[1]);
+                    ps.setInt(3, pos[2]);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    public List<int[]> loadImportChests() throws SQLException {
+        if (!initialized) return Collections.emptyList();
+
+        List<int[]> positions = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT x, y, z FROM import_chests ORDER BY x, y, z")) {
+            while (rs.next()) {
+                positions.add(new int[]{rs.getInt("x"), rs.getInt("y"), rs.getInt("z")});
+            }
+        }
+        return positions;
+    }
+
+    /** Removes every persisted import assignment and returns the number of chest blocks removed. */
+    public int clearImportChests() throws SQLException {
+        if (!initialized) return 0;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM import_chests")) {
+            return ps.executeUpdate();
+        }
+    }
+
     // Config Key-Value Store
     public void setConfig(String key, String value) throws SQLException {
         if (!initialized) return;
@@ -638,7 +845,8 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     // Keep Items
-    public void saveKeepItems(Collection<String> itemIds) throws SQLException {
+    // Value is the max quantity to keep in inventory during organize; null/absent means keep all.
+    public void saveKeepItems(Map<String, Integer> itemQuantities) throws SQLException {
         if (!initialized) return;
 
         try (Connection conn = dataSource.getConnection()) {
@@ -646,9 +854,14 @@ public class DatabaseManager implements AutoCloseable {
             try (Statement del = conn.createStatement()) {
                 del.executeUpdate("DELETE FROM keep_items");
             }
-            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO keep_items (item_id) VALUES (?)")) {
-                for (String id : itemIds) {
-                    ps.setString(1, id);
+            try (PreparedStatement ps = conn.prepareStatement("INSERT INTO keep_items (item_id, keep_quantity) VALUES (?, ?)")) {
+                for (var entry : itemQuantities.entrySet()) {
+                    ps.setString(1, entry.getKey());
+                    if (entry.getValue() == null) {
+                        ps.setNull(2, Types.INTEGER);
+                    } else {
+                        ps.setInt(2, entry.getValue());
+                    }
                     ps.addBatch();
                 }
                 ps.executeBatch();
@@ -657,15 +870,64 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    public Set<String> loadKeepItems() throws SQLException {
-        if (!initialized) return Collections.emptySet();
+    // Returns item_id -> max quantity to keep (null value means keep all of that item).
+    public Map<String, Integer> loadKeepItems() throws SQLException {
+        if (!initialized) return Collections.emptyMap();
 
-        Set<String> result = new LinkedHashSet<>();
+        Map<String, Integer> result = new LinkedHashMap<>();
         try (Connection conn = dataSource.getConnection();
              Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT item_id FROM keep_items")) {
+             ResultSet rs = stmt.executeQuery("SELECT item_id, keep_quantity FROM keep_items")) {
             while (rs.next()) {
-                result.add(rs.getString("item_id"));
+                int qty = rs.getInt("keep_quantity");
+                result.put(rs.getString("item_id"), rs.wasNull() ? null : qty);
+            }
+        }
+        return result;
+    }
+
+    // Column Assignments
+    // Persists which column (identified by its top chest position) each item type is assigned
+    // to, so the organizer reuses the same column on future runs instead of recomputing a fresh
+    // greedy assignment each time. Requires the plugin's Postgres connection to be configured —
+    // if it isn't, this silently no-ops and the organizer falls back to in-memory-only behavior
+    // for that run (see README for how to configure persistent storage).
+    public void saveColumnAssignments(Map<String, int[]> assignments) throws SQLException {
+        if (!initialized || assignments.isEmpty()) return;
+
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    INSERT INTO column_assignments (item_id, col_x, col_y, col_z, updated_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT (item_id) DO UPDATE SET
+                        col_x = EXCLUDED.col_x, col_y = EXCLUDED.col_y, col_z = EXCLUDED.col_z,
+                        updated_at = EXCLUDED.updated_at
+                    """)) {
+                for (var entry : assignments.entrySet()) {
+                    int[] pos = entry.getValue();
+                    ps.setString(1, entry.getKey());
+                    ps.setInt(2, pos[0]);
+                    ps.setInt(3, pos[1]);
+                    ps.setInt(4, pos[2]);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    // Returns item_id -> {x, y, z} of the persisted column's top chest.
+    public Map<String, int[]> loadColumnAssignments() throws SQLException {
+        if (!initialized) return Collections.emptyMap();
+
+        Map<String, int[]> result = new LinkedHashMap<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT item_id, col_x, col_y, col_z FROM column_assignments")) {
+            while (rs.next()) {
+                result.put(rs.getString("item_id"), new int[]{rs.getInt("col_x"), rs.getInt("col_y"), rs.getInt("col_z")});
             }
         }
         return result;
@@ -899,14 +1161,53 @@ public class DatabaseManager implements AutoCloseable {
         long scanTimestamp = rs.getLong("scan_timestamp");
         String label = null;
         try { label = rs.getString("label"); } catch (SQLException ignored) {}
+        String hopperFacing = null;
+        try { hopperFacing = rs.getString("hopper_facing"); } catch (SQLException ignored) {}
+        int inventoryX = x;
+        int inventoryY = y;
+        int inventoryZ = z;
+        boolean inventoryIdentityKnown = !isDouble;
+        try {
+            Object storedX = rs.getObject("inventory_x");
+            Object storedY = rs.getObject("inventory_y");
+            Object storedZ = rs.getObject("inventory_z");
+            if (storedX != null && storedY != null && storedZ != null) {
+                inventoryX = ((Number) storedX).intValue();
+                inventoryY = ((Number) storedY).intValue();
+                inventoryZ = ((Number) storedZ).intValue();
+            }
+            inventoryIdentityKnown = rs.getBoolean("inventory_identity_known");
+        } catch (SQLException ignored) {
+            // Compatibility with a database that has not run the identity migration yet.
+        }
+        if (!isDouble) {
+            inventoryX = x;
+            inventoryY = y;
+            inventoryZ = z;
+            inventoryIdentityKnown = true;
+        }
 
         // Load items
         Map<String, Integer> items = new LinkedHashMap<>();
         List<ContainerEntry.ShulkerDetail> shulkerDetails = new ArrayList<>();
-        Map<String, Map<String, Integer>> shulkerItemsByColor = new LinkedHashMap<>();
+        Map<Integer, String> physicalShulkerColors = new LinkedHashMap<>();
+        Map<Integer, Map<String, Integer>> physicalShulkerItems = new LinkedHashMap<>();
+        Map<String, Map<String, Integer>> legacyShulkerItemsByColor = new LinkedHashMap<>();
+
+        try (PreparedStatement shulkerPs = conn.prepareStatement(
+                "SELECT slot, color FROM container_shulkers WHERE container_id = ? ORDER BY slot")) {
+            shulkerPs.setLong(1, containerId);
+            try (ResultSet shulkerRs = shulkerPs.executeQuery()) {
+                while (shulkerRs.next()) {
+                    int slot = shulkerRs.getInt("slot");
+                    physicalShulkerColors.put(slot, shulkerRs.getString("color"));
+                    physicalShulkerItems.put(slot, new LinkedHashMap<>());
+                }
+            }
+        }
 
         try (PreparedStatement itemPs = conn.prepareStatement(
-                 "SELECT item_id, quantity, in_shulker, shulker_color FROM container_items WHERE container_id = ?")) {
+                 "SELECT item_id, quantity, in_shulker, shulker_color, shulker_instance FROM container_items WHERE container_id = ?")) {
             itemPs.setLong(1, containerId);
 
             try (ResultSet itemRs = itemPs.executeQuery()) {
@@ -915,10 +1216,18 @@ public class DatabaseManager implements AutoCloseable {
                     int quantity = itemRs.getInt("quantity");
                     boolean inShulker = itemRs.getBoolean("in_shulker");
                     String shulkerColor = itemRs.getString("shulker_color");
+                    int shulkerInstance = itemRs.getInt("shulker_instance");
+                    boolean physicalInstance = !itemRs.wasNull();
 
                     if (inShulker && shulkerColor != null) {
-                        shulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
-                            .merge(itemId, quantity, Integer::sum);
+                        if (physicalInstance) {
+                            physicalShulkerColors.putIfAbsent(shulkerInstance, shulkerColor);
+                            physicalShulkerItems.computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
+                                    .merge(itemId, quantity, Integer::sum);
+                        } else {
+                            legacyShulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
+                                    .merge(itemId, quantity, Integer::sum);
+                        }
                     }
                     // All items go into the main map (same as the in-memory behavior)
                     items.merge(itemId, quantity, Integer::sum);
@@ -926,11 +1235,17 @@ public class DatabaseManager implements AutoCloseable {
             }
         }
 
-        for (var entry : shulkerItemsByColor.entrySet()) {
+        for (var entry : physicalShulkerItems.entrySet()) {
+            shulkerDetails.add(new ContainerEntry.ShulkerDetail(
+                    entry.getKey(), physicalShulkerColors.get(entry.getKey()), entry.getValue()));
+        }
+        for (var entry : legacyShulkerItemsByColor.entrySet()) {
             shulkerDetails.add(new ContainerEntry.ShulkerDetail(entry.getKey(), entry.getValue()));
         }
 
-        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, scanTimestamp, label);
+        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
+                shulkerDetails, scanTimestamp, label, hopperFacing,
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown);
     }
 
     @Override

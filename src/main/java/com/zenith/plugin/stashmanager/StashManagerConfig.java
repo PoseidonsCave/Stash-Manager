@@ -9,9 +9,14 @@ public class StashManagerConfig {
     public int[] pos1 = null;
     public int[] pos2 = null;
     public int scanDelayTicks = 5;
-    public int openTimeoutTicks = 60;
+    // 2b2t/container responses regularly exceed three seconds under load. The scanner also
+    // enforces this 20-second minimum at runtime for existing config files created with 60.
+    public int openTimeoutTicks = 400;
     public int maxContainers = 2048;
     public int waypointDistance = 48;
+    // A scan yields shared Baritone/inventory control to other plugins, then waits at least
+    // this long before resuming. This leaves enough time for distant pearl-stasis jobs.
+    public int scanPreemptionCooldownSeconds = 300;
     public List<int[]> supplyChests = new ArrayList<>();
 
     // Return-to-start: pathfind the bot back to its initial position after scanning
@@ -19,9 +24,14 @@ public class StashManagerConfig {
 
     // Organizer
     public boolean organizerEnabled = true;
-    public int organizerClickCooldownTicks = 3;
+    // Zenith's own InventoryManager only executes a queued action every actionDelayTicks (5
+    // by default) — submitting faster than that gets silently rejected, so this must stay
+    // at or above that value.
+    public int organizerClickCooldownTicks = 6;
     public int organizerOpenTimeoutTicks = 60;
-    public int organizerWalkTimeoutTicks = 400;
+    // Dense shelving/silo layouts can need well over 20s for Baritone to compute+execute a
+    // path without block-breaking rights — raised from 400 after repeated real-world timeouts.
+    public int organizerWalkTimeoutTicks = 1200;
     // Minimum loose item count to justify packing into a shulker box
     public int condenseMinItems = 1;
 
@@ -38,9 +48,6 @@ public class StashManagerConfig {
     public int apiPort = 8585;
     public int apiThreads = 2;
     public String apiKey = "";
-
-    // Webhook (n8n, etc.) — POST JSON on scan completion
-    public String webhookUrl = "";
 
     // Plugin updates
     public boolean updateCheckOnLoad = true;

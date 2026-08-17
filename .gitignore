@@ -1,21 +1,51 @@
-# Build outputs
+# Build output
 build/
 bin/
 out/
+*.class
+/test/
+/src/test/
 
 # Gradle
 .gradle/
+local.properties
+gradle-local.properties
 
-# IDE
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+
+# Editors
 .idea/
+.vscode/
 *.iml
 *.ipr
 *.iws
-.vscode/
+*.swp
+*.swo
+*~
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Runtime
+# Runtime and diagnostics
 *.log
+*.pid
+hs_err_pid*
+replay_pid*
+
+# Temporary files
+*.bak
+*.tmp
+*.temp
+.cache/
+
+# Operating systems
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
