@@ -4,6 +4,9 @@ import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
 import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
+import com.zenith.event.client.ClientDisconnectEvent;
+import com.zenith.event.client.ClientTickEvent;
+import com.zenith.event.player.PlayerLoginEvent;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
@@ -18,6 +21,7 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.debug.DebugRecorder;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.orchestration.CooperativePreemptionGate;
+import com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
 import com.zenith.plugin.stashmanager.orchestration.OpenRetryCadence;
@@ -99,6 +103,8 @@ public class StashManagerModule extends Module {
     // Cooperative ownership of Zenith's global Baritone and InventoryManager. Futures let us
     // distinguish scanner work from a request submitted by PearlPlus or another plugin.
     private CooperativePreemptionGate scannerPreemptionGate;
+    private CooperativePreemptionGate organizerPreemptionGate;
+    private final JobContinuanceManager jobContinuanceManager = new JobContinuanceManager();
     private @Nullable PathingRequestFuture ownedBaritoneRequest;
     private OwnedBaritoneProcess ownedBaritoneProcess = OwnedBaritoneProcess.NONE;
     private @Nullable RequestFuture ownedInventoryRequest;
@@ -106,6 +112,9 @@ public class StashManagerModule extends Module {
     private boolean resumeAbortedReturn = false;
     private int lateOpenQuarantineTicks = 0;
     private int scanPreemptionCount = 0;
+    private int organizerPreemptionCount = 0;
+    private boolean organizerPickupRecoveryDeferred = false;
+    private volatile @Nullable String controllingPlayerName;
     private static final int SCAN_PREEMPTION_QUIET_TICKS = 40;
     private static final int LATE_OPEN_QUARANTINE_TICKS = 100;
 
@@ -152,6 +161,7 @@ public class StashManagerModule extends Module {
         this.config = config;
         this.index = index;
         this.scannerPreemptionGate = newScannerPreemptionGate();
+        this.organizerPreemptionGate = newOrganizerPreemptionGate();
         this.regionScanner = new RegionScanner();
         this.containerReader = new ContainerReader(index);
         this.retriever = new StashRetriever();
@@ -197,9 +207,12 @@ public class StashManagerModule extends Module {
     @Override
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
+            of(ClientTickEvent.class, this::onClientTick),
             of(ClientBotTick.class, this::onTick),
             of(ClientBotTick.Starting.class, this::onTickStarting),
-            of(ClientBotTick.Stopped.class, this::onTickStopped)
+            of(ClientBotTick.Stopped.class, this::onTickStopped),
+            of(PlayerLoginEvent.Post.class, this::onControllingPlayerLogin),
+            of(ClientDisconnectEvent.class, this::onClientDisconnect)
         );
     }
 
@@ -250,6 +263,13 @@ public class StashManagerModule extends Module {
 
     @Override
     public void onDisable() {
+        jobContinuanceManager.clear();
+        controllingPlayerName = null;
+        if (organizer != null && organizer.isActive()) {
+            if (!organizer.isYielded()) organizer.yieldToAutomation("module_disabled");
+            organizer.abortYielded("module_disabled");
+            organizerPreemptionGate.reset();
+        }
         if (retriever.isActive()) {
             retriever.stop();
         }
@@ -284,6 +304,22 @@ public class StashManagerModule extends Module {
 
     public int getScanPreemptionCooldownRemainingSeconds() {
         return (scannerPreemptionGate.remainingHoldTicks() + 19) / 20;
+    }
+
+    public int getOrganizerPreemptionCount() {
+        return organizerPreemptionCount;
+    }
+
+    public int getOrganizerPreemptionCooldownRemainingSeconds() {
+        return (organizerPreemptionGate.remainingHoldTicks() + 19) / 20;
+    }
+
+    public int getProxyControlGraceRemainingSeconds() {
+        return jobContinuanceManager.remainingSeconds(System.nanoTime());
+    }
+
+    public JobContinuanceManager.Job getControlledJob() {
+        return jobContinuanceManager.job();
     }
 
     public int getPendingCount() {
@@ -342,19 +378,32 @@ public class StashManagerModule extends Module {
         if (automationBlocker != null) return automationBlocker;
 
         LaneCapacityReport capacity = organizer.calculateLaneCapacity();
+        boolean importStagingAvailable = hasImportStagingInventory();
+        boolean shortageCanStage = capacity.canOrganizeWithImportStaging(importStagingAvailable);
         return switch (capacity.status()) {
             case READY -> null;
-            case INSUFFICIENT_LANES -> "lane capacity is short by " + capacity.laneShortfall()
-                    + " dedicated lane(s); run /stash lanes for details";
-            case INSUFFICIENT_LANE_STORAGE -> capacity.laneStorage().unassigned().size()
-                    + " bulk class(es) do not fit any assignable lane; run /stash lanes for details";
+            case INSUFFICIENT_LANES -> shortageCanStage
+                    ? null
+                    : "lane capacity is short by " + capacity.laneShortfall()
+                            + " dedicated lane(s); register an import chest for temporary staging or run /stash lanes for details";
+            case INSUFFICIENT_LANE_STORAGE -> shortageCanStage
+                    ? null
+                    : capacity.laneStorage().unassigned().size()
+                            + " bulk class(es) do not fit any assignable lane; register an import chest for temporary staging or run /stash lanes for details";
             case NEEDS_FRESH_SCAN -> "lane capacity data contains "
                     + capacity.unclassifiedShulkers() + " unclassified shulker(s); run a fresh /stash scan";
             case NEEDS_FRESH_CONTAINER_SCAN -> "double-chest inventory identities require a fresh /stash scan";
             case REGION_NOT_DEFINED -> "region not defined (set pos1 and pos2 first)";
             case NO_SCANNED_CONTAINERS -> "no scanned containers in the configured region";
-            case NO_LANES_DETECTED -> "no storage lanes detected in the configured region";
+            case NO_LANES_DETECTED -> shortageCanStage
+                    ? null
+                    : "no storage lanes detected in the configured region; register an import chest for temporary staging";
         };
+    }
+
+    private boolean hasImportStagingInventory() {
+        if (config.pos1 == null || config.pos2 == null) return false;
+        return index.getInRegion(config.pos1, config.pos2).stream().anyMatch(index::isImportChest);
     }
 
     public boolean startOrganizer() {
@@ -364,6 +413,9 @@ public class StashManagerModule extends Module {
             fireWebhookEvent("organize_start_blocked", Map.of("reason", blocker));
             return false;
         }
+        organizerPreemptionGate = newOrganizerPreemptionGate();
+        organizerPreemptionCount = 0;
+        organizerPickupRecoveryDeferred = false;
         return organizer.start();
     }
 
@@ -524,6 +576,7 @@ public class StashManagerModule extends Module {
             "found", containersFound,
             "indexed", containersIndexed,
             "failed", containersFailed));
+        clearProxyControlCheckpoint(JobContinuanceManager.Job.SCAN, reason);
 
         if (returnAfterAbort && config.returnToStart && hasStartPosition) {
             info("Returning to starting position after scan abort: {}, {}, {}",
@@ -621,27 +674,163 @@ public class StashManagerModule extends Module {
     }
 
     // Tick Handlers
+    private void onControllingPlayerLogin(PlayerLoginEvent.Post event) {
+        if (!event.session().isActivePlayer()) return;
+
+        JobContinuanceManager.Job job = activeResumableJob();
+        if (job == JobContinuanceManager.Job.NONE) return;
+
+        long now = System.nanoTime();
+        var update = jobContinuanceManager.beginControl(
+                job, now, Math.max(1, config.proxyControlGraceSeconds));
+        if (update.transition() != JobContinuanceManager.Transition.CONTROL_STARTED) return;
+
+        controllingPlayerName = event.session().getName();
+
+        int graceSeconds = Math.max(1, config.proxyControlGraceSeconds);
+        int cooldownSeconds = Math.max(1, config.scanPreemptionCooldownSeconds);
+        boolean temporaryShulkerOutstanding = job == JobContinuanceManager.Job.ORGANIZE
+                && organizer != null && organizer.hasTemporaryShulkerOutstanding();
+        String detail = "job=" + job.name().toLowerCase()
+                + ", controller=" + controllingPlayerName
+                + ", grace_seconds=" + graceSeconds
+                + ", cooldown_seconds=" + cooldownSeconds
+                + (job == JobContinuanceManager.Job.ORGANIZE
+                        ? ", " + organizerCheckpointDetail()
+                        : ", scan_state=" + state + ", resume_mode=" + scanResumeMode
+                            + ", completed=" + getProcessedCount() + ", total=" + containersFound);
+        debugRecorder.record("proxy_control_grace_started", detail);
+        notifications.sendProxyControlWarning(
+                controllingPlayerName, job.name().toLowerCase(), graceSeconds, cooldownSeconds,
+                temporaryShulkerOutstanding);
+        event.session().sendAsyncAlert(
+                "<yellow>Stash " + job.name().toLowerCase()
+                        + " paused.</yellow> <gray>Run <white>/swap</white> within "
+                        + graceSeconds
+                        + " seconds or the job checkpoint will be aborted.</gray>"
+                        + (temporaryShulkerOutstanding
+                                ? " <red>A temporary shulker is mid-recovery; switch now.</red>"
+                                : ""));
+    }
+
+    private void onClientTick(ClientTickEvent event) {
+        if (!jobContinuanceManager.isActive()) return;
+
+        long now = System.nanoTime();
+        var update = jobContinuanceManager.tick(Proxy.getInstance().hasActivePlayer(), now);
+        if (update.transition() == JobContinuanceManager.Transition.CONTROL_RELEASED) {
+            debugRecorder.record("proxy_control_released",
+                    "job=" + update.job().name().toLowerCase()
+                            + ", controller=" + controllingPlayerName
+                            + ", resume_cooldown_seconds="
+                            + Math.max(getScanPreemptionCooldownRemainingSeconds(),
+                                    getOrganizerPreemptionCooldownRemainingSeconds()));
+            notifications.sendProxyControlReleased(
+                    controllingPlayerName, update.job().name().toLowerCase());
+            controllingPlayerName = null;
+            return;
+        }
+        if (update.transition() != JobContinuanceManager.Transition.ABORT_REQUIRED) return;
+
+        JobContinuanceManager.Job expiredJob = update.job();
+        String controller = controllingPlayerName;
+        int elapsedSeconds = jobContinuanceManager.elapsedSeconds(now);
+        // Clear first so the job's abort callback cannot report this expected expiry as a
+        // separate manual checkpoint cancellation.
+        jobContinuanceManager.clear();
+        if (expiredJob == JobContinuanceManager.Job.ORGANIZE
+                && organizer != null && organizer.isActive()) {
+            if (!organizer.isYielded()) organizer.yieldToAutomation("proxy_control_grace_expired");
+            organizer.abortYielded("proxy_control_grace_expired");
+            organizerPreemptionGate.reset();
+        } else if (expiredJob == JobContinuanceManager.Job.SCAN
+                && state != ScanState.IDLE && state != ScanState.DONE) {
+            abortScan("proxy_control_grace_expired");
+        }
+
+        debugRecorder.record("proxy_control_grace_expired",
+                "job=" + expiredJob.name().toLowerCase()
+                        + ", controller=" + controller
+                        + ", elapsed_seconds=" + elapsedSeconds
+                        + ", lost_progress=true");
+        notifications.sendProxyControlAbort(
+                controller, expiredJob.name().toLowerCase(), config.proxyControlGraceSeconds);
+        var activePlayer = Proxy.getInstance().getActivePlayer();
+        if (activePlayer != null) {
+            activePlayer.sendAsyncAlert("<red>Stash " + expiredJob.name().toLowerCase()
+                    + " aborted.</red> <gray>The proxy-control grace period expired.</gray>");
+        }
+        controllingPlayerName = null;
+    }
+
     private void onTickStarting(ClientBotTick.Starting event) {
-        // Re-init on reconnect
-        if (state != ScanState.IDLE && state != ScanState.DONE) {
-            warn("Bot reconnected during scan — resetting state");
-            abortScan("bot_reconnected");
+        long now = System.nanoTime();
+        if (state == ScanState.YIELDED && scannerPreemptionGate.isClockSuspended()) {
+            int suspendedTicks = scannerPreemptionGate.resumeClock(now);
+            info("Bot control returned after {} seconds; scan checkpoint remains gated until cooldown and quiet checks pass",
+                suspendedTicks / 20);
+            debugRecorder.record("scan_bot_control_returned",
+                "suspended_seconds=" + suspendedTicks / 20
+                    + ", cooldown_remaining_seconds=" + getScanPreemptionCooldownRemainingSeconds()
+                    + ", resume_mode=" + scanResumeMode
+                    + ", target=" + currentContainerPos());
+        }
+        if (organizer != null && organizer.isYielded()
+                && organizerPreemptionGate.isClockSuspended()) {
+            int suspendedTicks = organizerPreemptionGate.resumeClock(now);
+            info("Bot control returned after {} seconds; organizer checkpoint remains gated until cooldown and quiet checks pass",
+                    suspendedTicks / 20);
+            debugRecorder.record("organize_bot_control_returned",
+                    organizerCheckpointDetail()
+                            + ", suspended_seconds=" + suspendedTicks / 20
+                            + ", cooldown_remaining_seconds="
+                            + getOrganizerPreemptionCooldownRemainingSeconds());
         }
     }
 
     private void onTickStopped(ClientBotTick.Stopped event) {
-        // Bot ticks stop whenever a player takes control, which also pauses Baritone.
+        // Direct player control stops bot ticks and cancels Baritone. Preserve either long job
+        // at a reconstructable checkpoint; wall time still counts toward the resume hold.
         if (organizer != null && organizer.isActive()) {
-            warn("Bot ticks stopped while organizer was active — stopping organizer");
-            organizer.stop();
+            if (!organizer.isYielded()) {
+                beginOrganizerYield("proxy_control");
+            }
+            organizerPreemptionGate.suspendClock(System.nanoTime());
+            info("Bot control taken; organizer checkpoint suspended");
+            debugRecorder.record("organize_bot_control_suspended",
+                    organizerCheckpointDetail()
+                            + ", cooldown_seconds="
+                            + Math.max(1, config.scanPreemptionCooldownSeconds));
         }
         if (retriever.isActive()) {
             warn("Bot ticks stopped while retriever was active — stopping retriever");
             retriever.stop();
         }
         if (state != ScanState.IDLE && state != ScanState.DONE) {
-            warn("Bot ticks stopped while scan was active — aborting scan");
-            abortScan("bot_ticks_stopped");
+            if (state != ScanState.YIELDED) {
+                beginScannerYield();
+            }
+            scannerPreemptionGate.suspendClock(System.nanoTime());
+            info("Bot control taken; scan checkpoint suspended (resume={})", scanResumeMode);
+            debugRecorder.record("scan_bot_control_suspended",
+                "resume_mode=" + scanResumeMode
+                    + ", target=" + currentContainerPos()
+                    + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
+        }
+    }
+
+    private void onClientDisconnect(ClientDisconnectEvent event) {
+        jobContinuanceManager.clear();
+        controllingPlayerName = null;
+        if (organizer != null && organizer.isActive()) {
+            warn("Upstream client disconnected while organizer was active — aborting stale checkpoint");
+            if (!organizer.isYielded()) organizer.yieldToAutomation("client_disconnected");
+            organizer.abortYielded("client_disconnected");
+            organizerPreemptionGate.reset();
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            warn("Upstream client disconnected while scan was active — aborting stale checkpoint");
+            abortScan("client_disconnected");
         }
     }
 
@@ -652,6 +841,30 @@ public class StashManagerModule extends Module {
 
         // Delegate tick to organizer when active
         if (organizer != null && organizer.isActive()) {
+            if (organizer.isYielded()) {
+                tickOrganizerYielded();
+                return;
+            }
+            if (organizer.wasAutomationPreempted()) {
+                if (!beginOrganizerYield("shared_automation")) {
+                    if (!organizerPickupRecoveryDeferred) {
+                        organizerPickupRecoveryDeferred = true;
+                        organizerPreemptionCount++;
+                        debugRecorder.record("organize_preemption_deferred",
+                                organizerCheckpointDetail()
+                                        + ", reason=temporary_shulker_drop_exposed"
+                                        + ", disposition=wait_for_foreign_task_then_recover"
+                                        + ", preemption_count=" + organizerPreemptionCount);
+                    }
+                }
+                return;
+            }
+            if (organizerPickupRecoveryDeferred) {
+                organizerPickupRecoveryDeferred = false;
+                debugRecorder.record("organize_preemption_recovery_started",
+                        organizerCheckpointDetail()
+                                + ", reason=foreign_task_released");
+            }
             organizer.tick();
             return;
         }
@@ -949,6 +1162,91 @@ public class StashManagerModule extends Module {
         boolean foreignInventory = INVENTORY.hasActiveRequest()
             && (ownedInventoryRequest == null || ownedInventoryRequest.isCompleted());
         return foreignBaritone || foreignInventory;
+    }
+
+    private JobContinuanceManager.Job activeResumableJob() {
+        if (organizer != null && organizer.isActive()) {
+            return JobContinuanceManager.Job.ORGANIZE;
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            return JobContinuanceManager.Job.SCAN;
+        }
+        return JobContinuanceManager.Job.NONE;
+    }
+
+    private boolean beginOrganizerYield(String reason) {
+        if (organizer == null || !organizer.yieldToAutomation(reason)) return false;
+
+        organizerPreemptionGate.yield();
+        organizerPreemptionCount++;
+        String detail = organizerCheckpointDetail()
+                + ", reason=" + reason
+                + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds)
+                + ", preemption_count=" + organizerPreemptionCount;
+        info("Organizer yielded to {} for at least {} seconds (checkpoint={})",
+                reason, Math.max(1, config.scanPreemptionCooldownSeconds),
+                organizer.getYieldedFromState());
+        debugRecorder.record("organize_preempted", detail);
+        fireWebhookEvent("organize_preempted", Map.ofEntries(
+                Map.entry("reason", reason),
+                Map.entry("interrupted_state", String.valueOf(organizer.getYieldedFromState())),
+                Map.entry("completed_tasks", organizer.getCompletedTasks()),
+                Map.entry("total_tasks", organizer.getTotalTasks()),
+                Map.entry("temporary_shulker_outstanding", organizer.hasTemporaryShulkerOutstanding()),
+                Map.entry("cooldown_seconds", Math.max(1, config.scanPreemptionCooldownSeconds))
+        ));
+        return true;
+    }
+
+    private void tickOrganizerYielded() {
+        organizer.tickYieldMaintenance();
+        var transition = organizerPreemptionGate.tick(isSharedAutomationBusy());
+        if (transition != CooperativePreemptionGate.Transition.RESUMED) return;
+
+        int pausedTicks = organizerPreemptionGate.elapsedTicks();
+        String interruptedState = String.valueOf(organizer.getYieldedFromState());
+        if (!organizer.resumeFromYield()) {
+            debugRecorder.record("organize_resume_failed",
+                    "interrupted_state=" + interruptedState
+                            + ", paused_seconds=" + pausedTicks / 20);
+            return;
+        }
+
+        info("Shared automation is quiet; resuming organizer checkpoint {} after {} seconds",
+                interruptedState, pausedTicks / 20);
+        String detail = organizerCheckpointDetail()
+                + ", interrupted_state=" + interruptedState
+                + ", paused_seconds=" + pausedTicks / 20
+                + ", preemption_count=" + organizerPreemptionCount;
+        debugRecorder.record("organize_resumed", detail);
+        fireWebhookEvent("organize_resumed", Map.of(
+                "interrupted_state", interruptedState,
+                "resume_state", organizer.getState().name(),
+                "paused_seconds", pausedTicks / 20,
+                "preemption_count", organizerPreemptionCount
+        ));
+    }
+
+    private String organizerCheckpointDetail() {
+        if (organizer == null) return "organizer=unavailable";
+        return "organizer_state=" + organizer.getState()
+                + ", interrupted_state=" + organizer.getYieldedFromState()
+                + ", completed_tasks=" + organizer.getCompletedTasks()
+                + ", total_tasks=" + organizer.getTotalTasks()
+                + ", temporary_shulker_outstanding="
+                + organizer.hasTemporaryShulkerOutstanding();
+    }
+
+    private void clearProxyControlCheckpoint(JobContinuanceManager.Job job, String reason) {
+        if (jobContinuanceManager.job() != job) return;
+
+        debugRecorder.record("proxy_control_checkpoint_cleared",
+                "job=" + job.name().toLowerCase()
+                        + ", controller=" + controllingPlayerName
+                        + ", reason=" + reason
+                        + ", lost_progress=false");
+        jobContinuanceManager.clear();
+        controllingPlayerName = null;
     }
 
     private void beginScannerYield() {
@@ -1410,6 +1708,7 @@ public class StashManagerModule extends Module {
             "found=" + containersFound
                 + ", indexed=" + containersIndexed
                 + ", failed=" + containersFailed);
+        clearProxyControlCheckpoint(JobContinuanceManager.Job.SCAN, "scan_completed");
         inGameAlert("<green>Scan complete.</green> <gray>Found=" + containersFound
             + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed + "</gray>");
     }
@@ -1498,6 +1797,12 @@ public class StashManagerModule extends Module {
             SCAN_PREEMPTION_QUIET_TICKS);
     }
 
+    private CooperativePreemptionGate newOrganizerPreemptionGate() {
+        return new CooperativePreemptionGate(
+                Math.max(1, config.scanPreemptionCooldownSeconds) * 20,
+                SCAN_PREEMPTION_QUIET_TICKS);
+    }
+
     // Reasons that are expected/benign noise in a hopper-fed or actively-changing stash (the
     // planned target simply isn't there anymore by the time the bot looks) — still worth
     // recording for /stash debug, but not worth a Discord ping every single occurrence.
@@ -1511,11 +1816,9 @@ public class StashManagerModule extends Module {
         if (!suppressWebhook) {
             fireWebhookEvent(event, payload);
         }
-        // Organizer/retriever failures (pathfinding, shulker open/close/break, etc.) only ever
-        // reached Discord via fireWebhookEvent above — the debug recorder never saw them.
-        if (isFailureEvent(event)) {
-            debugRecorder.record(event, formatPayloadDetail(payload));
-        }
+        // Keep successful transitions too. Long headless jobs need a usable baseline even when
+        // nothing has failed yet, especially before a pause/resume handoff.
+        debugRecorder.record(event, formatPayloadDetail(payload));
         switch (event) {
             case "retrieve_completed" -> notifications.sendRetrievalFinished(
                 stringValue(payload, "request_name"),
@@ -1533,11 +1836,25 @@ public class StashManagerModule extends Module {
                 intValue(payload, "remaining_total"),
                 stringValue(payload, "reason")
             );
-            case "organize_completed" -> notifications.sendOrganizerFinished(
-                intValue(payload, "completed_tasks"),
-                intValue(payload, "total_tasks"),
-                intValue(payload, "overflow_types")
-            );
+            case "organize_completed" -> {
+                organizerPreemptionGate.reset();
+                organizerPickupRecoveryDeferred = false;
+                clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE,
+                        "organize_completed");
+                notifications.sendOrganizerFinished(
+                    intValue(payload, "completed_tasks"),
+                    intValue(payload, "total_tasks"),
+                    intValue(payload, "overflow_types"),
+                    intValue(payload, "staged_shulkers"),
+                    intValue(payload, "staged_storage_classes"),
+                    intValue(payload, "permanent_lane_gaps")
+                );
+            }
+            case "organize_aborted", "organize_stopped" -> {
+                organizerPreemptionGate.reset();
+                organizerPickupRecoveryDeferred = false;
+                clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE, event);
+            }
             default -> {
             }
         }

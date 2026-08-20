@@ -110,6 +110,15 @@ public record LaneCapacityReport(
         return status == Status.READY;
     }
 
+    /** Lane shortages may reconcile into explicit import staging; stale scan states never may. */
+    public boolean canOrganizeWithImportStaging(boolean importStagingAvailable) {
+        if (canOrganize()) return true;
+        if (!importStagingAvailable) return false;
+        return status == Status.INSUFFICIENT_LANES
+                || status == Status.INSUFFICIENT_LANE_STORAGE
+                || status == Status.NO_LANES_DETECTED;
+    }
+
     /** Override status without discarding calculated capacity. */
     public LaneCapacityReport withStatus(Status replacement) {
         return new LaneCapacityReport(

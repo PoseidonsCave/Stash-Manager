@@ -13,8 +13,15 @@ public final class OrganizerOwnershipPolicy {
         return laneInventory || importInventory;
     }
 
-    /** Imports are intake-only and can never be selected as organizer destinations. */
+    /** Imports are never permanent lane destinations. */
     public static boolean isDestination(boolean laneInventory, boolean importInventory) {
         return laneInventory && !importInventory;
+    }
+
+    /** A produced bulk shulker may wait in an import only when no permanent lane was assigned. */
+    public static boolean isReconciliationStagingDestination(
+            boolean importInventory,
+            boolean permanentLaneAssigned) {
+        return importInventory && !permanentLaneAssigned;
     }
 }

@@ -43,6 +43,9 @@ replay_pid*
 *.temp
 .cache/
 
+# Local Headroom harness and project knowledge index
+/docs/*
+
 # Operating systems
 .DS_Store
 .AppleDouble

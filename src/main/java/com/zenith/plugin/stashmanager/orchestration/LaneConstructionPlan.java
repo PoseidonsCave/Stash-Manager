@@ -13,9 +13,11 @@ public record LaneConstructionPlan(
         int existingLanesToExpand,
         int doubleChestsToAdd,
         double existingAssignableDoubleChestEquivalent,
-        int requiredDedicatedDoubleChests) {
+        int requiredDedicatedDoubleChests,
+        int compactedRequiredDedicatedDoubleChests) {
 
-    public static final int SHULKER_SLOTS_PER_DOUBLE_CHEST = 54;
+    public static final int SHULKER_SLOTS_PER_DOUBLE_CHEST =
+            LaneStorageCapacity.SHULKERS_PER_DOUBLE_CHEST;
 
     public enum Action {
         BUILD_NEW_LANE,
@@ -37,7 +39,7 @@ public record LaneConstructionPlan(
 
     public static LaneConstructionPlan assess(LaneStorageCapacity.Report report) {
         if (report == null) {
-            return new LaneConstructionPlan(List.of(), 0, 0, 0, 0, 0);
+            return new LaneConstructionPlan(List.of(), 0, 0, 0, 0, 0, 0);
         }
 
         List<LaneStorageCapacity.Demand> unassigned = new ArrayList<>(report.unassigned());
@@ -75,15 +77,20 @@ public record LaneConstructionPlan(
 
         Set<String> countedClasses = new HashSet<>();
         int requiredChests = 0;
+        int compactedRequiredChests = 0;
         for (LaneStorageCapacity.Allocation allocation : report.allocations()) {
             if (countedClasses.add(allocation.demand().storageClass())) {
                 requiredChests += doubleChestsForSlots(
                         allocation.demand().requiredShulkerSlots());
+                compactedRequiredChests += doubleChestsForSlots(
+                        allocation.demand().compactedShulkerSlots());
             }
         }
         for (LaneStorageCapacity.Demand demand : report.unassigned()) {
             if (countedClasses.add(demand.storageClass())) {
                 requiredChests += doubleChestsForSlots(demand.requiredShulkerSlots());
+                compactedRequiredChests += doubleChestsForSlots(
+                        demand.compactedShulkerSlots());
             }
         }
 
@@ -93,7 +100,8 @@ public record LaneConstructionPlan(
                 expansions,
                 chestsToAdd,
                 report.totalAssignableShulkerSlots() / (double) SHULKER_SLOTS_PER_DOUBLE_CHEST,
-                requiredChests);
+                requiredChests,
+                compactedRequiredChests);
     }
 
     public static int doubleChestsForSlots(int shulkerSlots) {

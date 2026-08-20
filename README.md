@@ -34,7 +34,8 @@ and produces a shareable workbook that tells you what needs to be built.
 
 > [!IMPORTANT]
 > Run `stash scan` before `stash organize`. The organizer uses the latest scan to protect mixed
-> shulkers, size every lane, and stop before moving anything when the layout is not ready.
+> shulkers and size every lane. If permanent space is short, registered import chests can hold
+> newly reconciled bulk shulkers until you expand the stash.
 
 ## 🚀 Quick start
 
@@ -42,7 +43,8 @@ and produces a shareable workbook that tells you what needs to be built.
 2. Stand at one corner of the stash and run `stash pos1`.
 3. Stand at the opposite corner and run `stash pos2`.
 4. Run `stash scan`, then check the layout with `stash lanes`.
-5. When the report says **Good to go**, run `stash organize`.
+5. Run `stash organize`. A **Good to go** report means everything has permanent space; otherwise,
+   make sure import chests are registered for temporary staging.
 
 ```text
 stash pos1
@@ -165,8 +167,9 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | 1 | The scan identifies empty, bulk, mixed, and unknown shulkers. |
 | 2 | Mixed shulkers and premade kits are left alone. The bot never guesses what they should become. |
 | 3 | Every exact bulk item type gets its own lane. Fortune and Silk Touch tools remain separate. |
-| 4 | Existing lanes are reused when they are large enough. Otherwise, the bot tells you exactly what to build. |
-| 5 | Loose items are packed only after the lane plan passes. Partial matching shulkers are filled before empty ones are used. |
+| 4 | Existing lanes are reused when they are large enough. The bot reports the permanent lane gaps when they are not. |
+| 5 | Loose items with lanes are packed into permanent storage. Items without suitable lanes are packed into bulk shulkers and staged in registered import chests. |
+| 6 | Partial matching shulkers are filled before empty ones are used. Mixed boxes and kits remain untouched. |
 
 The capacity check uses each item's real stack size and the free room inside matching shulkers.
 `stash lanes` turns that into plain lane and double chest counts. `stash lanes export` gives you a
@@ -179,8 +182,30 @@ styled workbook with a summary, a build list, and the full lane breakdown.
 #### Import chests
 
 Normal standalone chests are left alone. Face a chest and run `stash import` when you want the
-organizer to drain it into the storage lanes. Import chests are always sources, never destinations.
-Facing either half of a double chest assigns or removes the whole chest.
+organizer to drain it into the storage lanes. When permanent lane space is short, an import chest
+may also hold newly reconciled bulk shulkers as temporary staging. It never becomes a permanent
+lane, and a later scan and organize run can move those boxes once suitable lanes exist. Facing
+either half of a double chest assigns or removes the whole chest.
+
+The completion message calls out how many boxes and item types are waiting in imports. If every
+registered import is full or unreachable, the organizer stops with the packed box still safely in
+the bot inventory.
+
+#### Pausing for other work
+
+Scans and organizer runs yield when another Zenith automation request needs Baritone or the
+inventory manager. The job keeps a checkpoint, waits through the configured five minute cooldown,
+then rebuilds its live container or reconciliation state before continuing.
+
+When someone connects as the controlling proxy client, the active job pauses immediately and sends
+a warning in game and on Discord. Use `/swap` to move into spectator mode within ten minutes. If
+control is still active when that grace period ends, the in-memory job checkpoint is discarded;
+container moves already completed in the world are not rolled back.
+
+`stash debug recent` records successful job starts and progress as well as failures. Handoffs add
+`organize_preempted`, `organize_resumed`, `proxy_control_grace_started`,
+`proxy_control_released`, or `proxy_control_grace_expired`, including the saved state and task
+counts needed to trace a resume.
 
 #### Keeping lane assignments stable
 
@@ -191,9 +216,9 @@ database, assignments last only for the current proxy session.
 <summary><strong>API fields for lane planning</strong></summary>
 
 The organizer endpoint exposes the same report under `lane_capacity`, `lane_storage`, and
-`lane_construction`. These objects include readiness, per item capacity, missing lanes, and the
-recommended number of double chests. Coordinates are excluded from the shareable construction
-report.
+`lane_construction`. Live organizer fields also show whether import staging is active, how many
+boxes were staged, and how many permanent lane gaps remain. Coordinates are excluded from the
+shareable construction report.
 
 </details>
 
@@ -216,7 +241,8 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config scanDelay <ticks>` | Ticks between container reads (1 to 200) |
 | `stash config openTimeout <ticks>` | Max wait ticks for container open response (1 to 600) |
 | `stash config maxContainers <count>` | Container cap per scan session (1 to 100000) |
-| `stash config preemptionCooldown <seconds>` | Minimum scanner pause after another automation task takes control (1 to 3600) |
+| `stash config preemptionCooldown <seconds>` | Minimum scan/organize pause after another automation task takes control (1 to 3600) |
+| `stash config controlGrace <seconds>` | Time a controlling proxy client has to use `/swap` before the job is aborted (60 to 3600) |
 | `stash config waypointDistance <blocks>` | Walk distance for unloaded chunks (1 to 256) |
 | `stash config returnToStart <on\|off>` | Return bot to start position after scan |
 | **Database** | |
@@ -256,7 +282,8 @@ Saved automatically via ZenithProxy's plugin config system.
 | `openTimeoutTicks` | `400` | Max wait for container open response |
 | `maxContainers` | `2048` | Container cap per scan session |
 | `waypointDistance` | `48` | Walk distance for unloaded chunks |
-| `scanPreemptionCooldownSeconds` | `300` | Minimum pause after yielding to another automation task |
+| `scanPreemptionCooldownSeconds` | `300` | Minimum scan/organize pause after yielding to another automation task |
+| `proxyControlGraceSeconds` | `600` | Grace period for a controlling client to switch to spectator |
 | `returnToStart` | `true` | Pathfind back to starting position after scan |
 
 ### 🧭 Organizer
@@ -446,6 +473,11 @@ stashmanager_api_uptime_seconds 3600
 stash_organizer_active 0
 stash_organizer_tasks_completed 0
 stash_organizer_tasks_total 0
+stash_organizer_preemptions_total 0
+stash_organizer_preemption_cooldown_remaining_seconds 0
+stash_organizer_staged_shulkers 0
+stash_organizer_staging_storage_classes 0
+stash_organizer_permanent_lane_gaps 0
 stash_lane_capacity_ready 1
 stash_lanes_detected 24
 stash_lanes_assignable 22
@@ -454,6 +486,8 @@ stash_lanes_spare 4
 stash_lanes_shortfall 0
 stash_shulkers_mixed 3
 stash_shulkers_unclassified 0
+stash_proxy_control_active 0
+stash_proxy_control_grace_remaining_seconds 0
 ```
 
 Add this as a Prometheus scrape target and build Grafana dashboards from the `stashmanager_*` metrics.

@@ -65,23 +65,85 @@ public final class StashManagerNotifications {
         DISCORD.sendEmbedMessage(embed);
     }
 
-    public void sendOrganizerFinished(int completedTasks, int totalTasks, int overflowTypes) {
-        boolean alreadyOrganized = totalTasks == 0 && completedTasks == 0 && overflowTypes == 0;
+    public void sendOrganizerFinished(int completedTasks, int totalTasks, int overflowTypes,
+                                      int stagedShulkers, int stagedStorageClasses,
+                                      int permanentLaneGaps) {
+        boolean waitingForLanes = permanentLaneGaps > 0;
+        boolean alreadyOrganized = totalTasks == 0 && completedTasks == 0
+                && overflowTypes == 0 && !waitingForLanes;
         var embed = Embed.builder()
             .title("Organizer Finished")
-            .description(alreadyOrganized
-                ? "No moves were needed. The stash was already organized."
-                : "Stash organizer finished processing move tasks.")
+            .description(waitingForLanes
+                ? stagedShulkers > 0
+                    ? "I packed the loose items I could, but the stash needs more permanent lane space. The new bulk shulkers are waiting in your import chests."
+                    : "The current items are safe, but some item types still need suitable permanent lanes."
+                : alreadyOrganized
+                    ? "No moves were needed. The stash was already organized."
+                    : "Stash organizer finished processing move tasks.")
             .addField("Completed Tasks", completedTasks, true)
             .addField("Planned Tasks", totalTasks, true)
             .addField("Overflow Types", overflowTypes, true)
+            .addField("Boxes Waiting in Imports", stagedShulkers, true)
+            .addField("Staged Item Types", stagedStorageClasses, true)
+            .addField("Permanent Lane Gaps", permanentLaneGaps, true)
+            .color(waitingForLanes
+                ? com.zenith.Globals.CONFIG.theme.inQueue.color()
+                : com.zenith.Globals.CONFIG.theme.success.color());
+        DISCORD.sendEmbedMessage(embed);
+    }
+
+    public void sendProxyControlWarning(@Nullable String playerName, String job,
+                                        int graceSeconds, int cooldownSeconds,
+                                        boolean temporaryShulkerOutstanding) {
+        var embed = Embed.builder()
+            .title("Stash Job Paused for Proxy Control")
+            .description(temporaryShulkerOutstanding
+                ? "A controlling client connected during temporary shulker recovery. Use `/swap` now so the bot can secure the box."
+                : "A controlling client connected while a long stash job was running. Switch to spectator with `/swap` before the grace period expires to keep the checkpoint.")
+            .addField("Job", job, true)
+            .addField("Controller", displayName(playerName), true)
+            .addField("Grace Period", duration(graceSeconds), true)
+            .addField("Resume Cooldown", duration(cooldownSeconds), true)
+            .color(com.zenith.Globals.CONFIG.theme.inQueue.color());
+        if (temporaryShulkerOutstanding) {
+            embed.addField("Temporary Shulker", "Mid-recovery — switch promptly", false);
+        }
+        DISCORD.sendEmbedMessage(embed);
+    }
+
+    public void sendProxyControlReleased(@Nullable String playerName, String job) {
+        var embed = Embed.builder()
+            .title("Stash Job Checkpoint Kept")
+            .description("Proxy control was released in time. The job will resume after the automation cooldown and quiet check.")
+            .addField("Job", job, true)
+            .addField("Controller", displayName(playerName), true)
             .successColor();
+        DISCORD.sendEmbedMessage(embed);
+    }
+
+    public void sendProxyControlAbort(@Nullable String playerName, String job, int graceSeconds) {
+        var embed = Embed.builder()
+            .title("Stash Job Aborted")
+            .description("The controlling client stayed active past the grace period. The in-memory job checkpoint was discarded; completed container moves remain in place.")
+            .addField("Job", job, true)
+            .addField("Controller", displayName(playerName), true)
+            .addField("Grace Period", duration(graceSeconds), true)
+            .errorColor();
         DISCORD.sendEmbedMessage(embed);
     }
 
     // Helpers
     private String formatPosition(double x, double y, double z) {
         return String.format("%.1f, %.1f, %.1f", x, y, z);
+    }
+
+    private String displayName(@Nullable String playerName) {
+        return playerName == null || playerName.isBlank() ? "Unknown" : playerName;
+    }
+
+    private String duration(int seconds) {
+        if (seconds % 60 == 0) return (seconds / 60) + " minutes";
+        return seconds + " seconds";
     }
 
 }
