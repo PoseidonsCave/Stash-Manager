@@ -19,7 +19,9 @@ public record ContainerEntry(
     String hopperFacing,
     // Canonical physical-inventory position. Both double-chest halves share this identity.
     int inventoryX, int inventoryY, int inventoryZ,
-    boolean inventoryIdentityKnown
+    boolean inventoryIdentityKnown,
+    // X or Z for a known double-chest footprint; null for singles and legacy rows.
+    String doubleChestAxis
 ) {
 
     // Per-shulker breakdown: color and items inside.
@@ -45,6 +47,7 @@ public record ContainerEntry(
     public ContainerEntry {
         items = items == null ? Collections.emptyMap() : new LinkedHashMap<>(items);
         shulkerDetails = shulkerDetails == null ? Collections.emptyList() : List.copyOf(shulkerDetails);
+        doubleChestAxis = normalizeDoubleChestAxis(isDouble, doubleChestAxis);
     }
 
     // Convenience constructor without label (backwards compatible).
@@ -52,7 +55,7 @@ public record ContainerEntry(
                           Map<String, Integer> items, int shulkerCount,
                           List<ShulkerDetail> shulkerDetails, long timestamp) {
         this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
-                null, null, x, y, z, !isDouble);
+                null, null, x, y, z, !isDouble, null);
     }
 
     // Convenience constructor without hopperFacing (backwards compatible).
@@ -60,7 +63,7 @@ public record ContainerEntry(
                           Map<String, Integer> items, int shulkerCount,
                           List<ShulkerDetail> shulkerDetails, long timestamp, String label) {
         this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
-                label, null, x, y, z, !isDouble);
+                label, null, x, y, z, !isDouble, null);
     }
 
     // Convenience constructor used by older call sites without persisted inventory identity.
@@ -69,7 +72,19 @@ public record ContainerEntry(
                           List<ShulkerDetail> shulkerDetails, long timestamp,
                           String label, String hopperFacing) {
         this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
-                label, hopperFacing, x, y, z, !isDouble);
+                label, hopperFacing, x, y, z, !isDouble, null);
+    }
+
+    // Compatibility constructor for callers created before physical footprint persistence.
+    public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
+                          Map<String, Integer> items, int shulkerCount,
+                          List<ShulkerDetail> shulkerDetails, long timestamp,
+                          String label, String hopperFacing,
+                          int inventoryX, int inventoryY, int inventoryZ,
+                          boolean inventoryIdentityKnown) {
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
+                label, hopperFacing, inventoryX, inventoryY, inventoryZ,
+                inventoryIdentityKnown, null);
     }
 
     // Unique position key for deduplication.
@@ -126,12 +141,22 @@ public record ContainerEntry(
     public ContainerEntry withLabel(String newLabel) {
         return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
                 shulkerDetails, timestamp, newLabel, hopperFacing,
-                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown);
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis);
     }
 
     public long inventoryKey() {
         return ((long) inventoryX & 0x3FFFFFFL) << 38
                 | ((long) inventoryY & 0xFFFL) << 26
                 | ((long) inventoryZ & 0x3FFFFFFL);
+    }
+
+    public boolean inventoryFootprintKnown() {
+        return !isDouble || (inventoryIdentityKnown && doubleChestAxis != null);
+    }
+
+    private static String normalizeDoubleChestAxis(boolean isDouble, String axis) {
+        if (!isDouble || axis == null) return null;
+        String normalized = axis.trim().toUpperCase(java.util.Locale.ROOT);
+        return "X".equals(normalized) || "Z".equals(normalized) ? normalized : null;
     }
 }

@@ -36,15 +36,14 @@ gradle-local.properties
 *.pid
 hs_err_pid*
 replay_pid*
+/plugins/config/stash-manager-organizer-plan.json
+/plugins/config/stash-manager-organizer-checkpoint.json
 
 # Temporary files
 *.bak
 *.tmp
 *.temp
 .cache/
-
-# Local Headroom harness and project knowledge index
-/docs/*
 
 # Operating systems
 .DS_Store

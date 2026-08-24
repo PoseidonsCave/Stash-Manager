@@ -1,47 +1,65 @@
-# Monitor Stash Manager with Grafana
+# Run Stash Manager, PostgreSQL, and Grafana Locally
 
 Stash Manager can expose live Prometheus metrics for scans, database health, organization jobs,
 shulker reconciliation, and storage-lane capacity. Prometheus saves the history and Grafana turns
-it into dashboards and alerts.
+it into dashboards and alerts. PostgreSQL stores the bot's scanned containers, item index, regions,
+import chests, lane assignments, and kits.
 
 You can use this guide with one bot or an entire fleet. Docker Compose is included as the simplest
 starting point, but the same configuration works with Dokploy, Portainer, Kubernetes, or native
 services.
 
+Before starting, install Docker Desktop or Docker Engine with the Compose plugin, install Stash
+Manager in each ZenithProxy bot, and choose strong passwords plus a separate Stash Manager API key.
+The examples use `docker compose`, which works on Windows, macOS, and Linux.
+
+This distinction matters:
+
+- **PostgreSQL** receives Stash Manager's persistent inventory and configuration records.
+- **Prometheus** scrapes live numeric metrics from each bot's Stash Manager API.
+- **Grafana** reads Prometheus for operational dashboards and can also read PostgreSQL for inventory
+  reports.
+
 ## What connects to what
 
 ```text
-ZenithProxy + Stash Manager
-       │
-       │  /api/v1/metrics
-       ▼
-   Prometheus
-       │
-       ▼
-     Grafana
+                         ┌──────────────┐
+ZenithProxy              │ PostgreSQL   │  persistent stash records
++ Stash Manager ────────►│ database     │◄─────────┐
+       │                 └──────────────┘          │ optional SQL panels
+       │ /api/v1/metrics                           │
+       ▼                                           │
+  Prometheus ──────────────────────────────────► Grafana
+        metric history                         dashboards and alerts
 ```
 
 Stash Manager serves the metrics. Prometheus must be able to reach each bot's API address and port.
-Grafana only needs to reach Prometheus.
+Grafana must be able to reach Prometheus. It only needs direct PostgreSQL access when you want SQL
+panels or inventory reports.
+
+> [!IMPORTANT]
+> Several bots may share one PostgreSQL database, but they must not share one PostgreSQL schema.
+> Stash Manager records are bot-local and do not have a bot ID column. Use one schema per bot as
+> shown in the multi-bot tutorial below.
 
 ## Choose the setup that looks like yours
 
-| Your setup | Prometheus target example | Notes |
+| Your setup | Prometheus target example | PostgreSQL host in the JDBC URL |
 |---|---|---|
-| Everything runs directly on one machine | `127.0.0.1:8585` | Simplest network path |
-| Bot runs on the host, Prometheus runs in Docker | `host.docker.internal:8585` | Add the Linux host-gateway mapping shown below |
-| Bot and Prometheus share a Docker network | `zenithproxy:8585` | Use the bot's service name, not localhost |
-| Several host-networked bots share one machine | `host.docker.internal:8585`, `:8586`, `:8587` | Give every bot a unique API port |
-| Several bridge-networked bots share one Docker network | `bot-one:8585`, `bot-two:8585` | They may reuse the same internal port because their DNS names differ |
-| Prometheus and the bot are on different machines | `<private-ip>:8585` | Prefer a VPN or private network; do not expose the API publicly |
+| Everything runs directly on one machine | `127.0.0.1:8585` | `127.0.0.1` |
+| Bot runs on the host; data stack runs in Docker | `host.docker.internal:8585` | `127.0.0.1` because PostgreSQL is published to the host |
+| Bot and data stack share a Docker network | `zenithproxy:8585` | `postgres`, the Compose service name |
+| Several host-networked bots share one machine | `host.docker.internal:8585`, `:8586`, `:8587` | `127.0.0.1`; use a different schema for every bot |
+| Several bridge-networked bots share one Docker network | `bot-one:8585`, `bot-two:8585` | `postgres`; use a different schema for every bot |
+| Prometheus and the bot are on different machines | `<private-ip>:8585` | The database's private IP or VPN name |
 
 If you are unsure, start with one bot on port `8585`. Add the fleet configuration only after that
 target reports `UP` in Prometheus.
 
 > [!TIP]
-> The usual one-bot setup is ZenithProxy on the host with Prometheus and Grafana in Docker. For
-> that setup, use `0.0.0.0` as the API bind address, `host.docker.internal:8585` as the Prometheus
-> target, and the Docker Compose example in this guide.
+> The easiest one-bot setup is ZenithProxy on the host with PostgreSQL, Prometheus, and Grafana in
+> Docker. Use `0.0.0.0` as the API bind address, `host.docker.internal:8585` as the Prometheus
+> target, and `jdbc:postgresql://127.0.0.1:5432/stashmanager` as the database URL.
 
 ## 1. Enable the Stash Manager API
 
@@ -205,14 +223,40 @@ scrape_configs:
 Do not commit real keys to a repository. For a long-lived deployment, mount the Prometheus
 configuration from a protected file or use the secret mechanism provided by your platform.
 
-## 3. Run Prometheus and Grafana
+## 3. Run the local data stack
 
 ### Docker Compose
 
-Create this `docker-compose.yml` beside `prometheus.yml`:
+Create a new directory for the stack and place `prometheus.yml` from the previous section inside it.
+Then create a local `.env` file:
+
+```dotenv
+POSTGRES_PASSWORD=replace-with-a-long-random-password
+GRAFANA_ADMIN_USER=admin
+GRAFANA_ADMIN_PASSWORD=replace-with-another-long-random-password
+```
+
+Do not commit this file. Create `docker-compose.yml` beside it:
 
 ```yaml
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: stashmanager
+      POSTGRES_USER: stashmanager
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stashmanager -d stashmanager"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     ports:
@@ -226,15 +270,20 @@ services:
 
   grafana:
     image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
       - grafana_data:/var/lib/grafana
     depends_on:
       - prometheus
+      - postgres
     restart: unless-stopped
 
 volumes:
+  postgres_data:
   prometheus_data:
   grafana_data:
 ```
@@ -248,34 +297,139 @@ Start the stack:
 docker compose up -d
 ```
 
-Open Prometheus at `http://localhost:9090/targets`. Do not continue until the Stash Manager target
-shows `UP`.
+Check that all three services started:
 
-The example binds both web interfaces to the local machine. If this is a remote server, use an SSH
-tunnel, VPN, or authenticated reverse proxy to reach Grafana. Do not remove the `127.0.0.1` binding
-and expose either service directly to the public internet.
+```sh
+docker compose ps
+```
+
+Open Grafana at `http://localhost:3000` and sign in with `GRAFANA_ADMIN_USER` and
+`GRAFANA_ADMIN_PASSWORD` from `.env`.
+
+Open Prometheus at `http://localhost:9090/targets`. The Stash Manager target will remain `DOWN`
+until its API is running and reachable, but PostgreSQL and Grafana can be configured immediately.
+
+The example binds PostgreSQL and both web interfaces to the local machine. If this is a remote
+server, use an SSH tunnel, VPN, or authenticated reverse proxy to reach Grafana. Do not remove the
+`127.0.0.1` bindings and expose these services directly to the public internet.
+
+### Connect one bot to PostgreSQL
+
+When ZenithProxy runs directly on the same host, configure the bot with:
+
+```text
+stash config db url jdbc:postgresql://127.0.0.1:5432/stashmanager
+stash config db user stashmanager
+stash config db password <the-POSTGRES_PASSWORD-from-.env>
+stash config db poolSize 3
+stash config db enable
+stash config db connect
+stash db status
+```
+
+If ZenithProxy is a container on the same Docker network, use the PostgreSQL service name instead:
+
+```text
+stash config db url jdbc:postgresql://postgres:5432/stashmanager
+```
+
+`stash db status` should report that the database is connected. Stash Manager creates and migrates
+its own tables after it connects; users do not need to create those tables by hand.
+
+For a brand-new database, set the stash region and run a fresh scan so the database receives its
+first container and item records. Merely connecting PostgreSQL does not invent or rediscover stash
+contents.
+
+### Connect multiple bots to one PostgreSQL database
+
+Create one schema per bot before configuring their JDBC URLs. Use simple lowercase names containing
+letters, numbers, and underscores:
+
+```sh
+docker compose exec postgres psql -U stashmanager -d stashmanager
+```
+
+At the `psql` prompt:
+
+```sql
+CREATE SCHEMA bot_one AUTHORIZATION stashmanager;
+CREATE SCHEMA bot_two AUTHORIZATION stashmanager;
+CREATE SCHEMA bot_three AUTHORIZATION stashmanager;
+\q
+```
+
+Point every bot at the same database but a different schema:
+
+```text
+# Bot one
+stash config db url jdbc:postgresql://127.0.0.1:5432/stashmanager?currentSchema=bot_one
+
+# Bot two
+stash config db url jdbc:postgresql://127.0.0.1:5432/stashmanager?currentSchema=bot_two
+
+# Bot three
+stash config db url jdbc:postgresql://127.0.0.1:5432/stashmanager?currentSchema=bot_three
+```
+
+Use `postgres` instead of `127.0.0.1` when the bots share the Compose network. On each bot, also set
+the shared database username and password, enable the database, connect, and check `stash db status`
+as shown in the single-bot example.
+
+Do not connect two bots to `public` or to the same named schema. Their container positions, scans,
+regions, kits, imports, and lane assignments would become one shared set of records. Prometheus
+`bot` labels do not protect PostgreSQL data; they only separate metrics in charts.
+
+The default pool size is three connections per bot. A small fleet can keep that default. For a
+larger fleet, plan PostgreSQL's connection limit around `bot count × pool size`, plus Grafana and
+administrative connections.
+
+### Confirm that scans are reaching PostgreSQL
+
+After a scan starts writing data, a single-bot setup should list tables in `public`:
+
+```sh
+docker compose exec postgres psql -U stashmanager -d stashmanager -c '\dt public.*'
+docker compose exec postgres psql -U stashmanager -d stashmanager -c 'SELECT COUNT(*) AS indexed_containers FROM public.containers;'
+```
+
+For a multi-bot setup, replace `public` with the bot's schema:
+
+```sh
+docker compose exec postgres psql -U stashmanager -d stashmanager -c '\dt bot_one.*'
+docker compose exec postgres psql -U stashmanager -d stashmanager -c 'SELECT COUNT(*) AS indexed_containers FROM bot_one.containers;'
+```
+
+A zero count is valid before the first successful scan. A missing table usually means the bot has
+not connected with that schema in its JDBC URL.
 
 ### Dokploy, Portainer, or another container platform
 
-Deploy `prom/prometheus:latest` and `grafana/grafana:latest` as separate services.
+Deploy `postgres:16-alpine`, `prom/prometheus:latest`, and `grafana/grafana:latest` as separate
+services.
 
+- Persist `/var/lib/postgresql/data` for the database.
 - Persist `/prometheus` for Prometheus history.
 - Persist `/var/lib/grafana` for dashboards and users.
 - Mount `prometheus.yml` at `/etc/prometheus/prometheus.yml`.
 - Attach Grafana and Prometheus to the same private Docker network.
+- Attach each bot that uses a Docker service name to the database's private network.
 - Give Prometheus a stable service name or network alias.
 - Add a host-gateway mapping when Prometheus must scrape a host-networked bot.
+- Create one PostgreSQL schema per bot and use `?currentSchema=<bot_schema>` in each JDBC URL.
 
 Use your platform's generated domain only for the Grafana interface. Prometheus and bot API ports
 should normally remain private.
 
 ### Native services
 
-If Prometheus and Grafana run directly on the same machine, point Prometheus at
-`127.0.0.1:<bot-port>` and point Grafana at `http://127.0.0.1:9090`. Use the operating system's
-service manager to keep both processes running and store their data outside temporary directories.
+If PostgreSQL, Prometheus, and Grafana run directly on the same machine, point each bot at
+`jdbc:postgresql://127.0.0.1:5432/stashmanager`, point Prometheus at `127.0.0.1:<bot-port>`, and
+point Grafana at `http://127.0.0.1:9090`. Use the operating system's service manager to keep all
+three processes running and store their data outside temporary directories.
 
-## 4. Connect Grafana to Prometheus
+## 4. Connect Grafana to the data sources
+
+### Prometheus
 
 In Grafana, open **Connections → Data sources → Add data source → Prometheus**.
 
@@ -288,6 +442,76 @@ In Grafana, open **Connections → Data sources → Add data source → Promethe
 
 Select **Save & test**. Do not use `localhost` when Grafana is a container and Prometheus is a
 different container; `localhost` would point back to Grafana itself.
+
+### PostgreSQL for inventory panels
+
+Prometheus is enough for all dashboards in this guide. Add PostgreSQL when you also want Grafana to
+query indexed stash records or scan history.
+
+First create a read-only Grafana login. For a single bot using `public`, open `psql`:
+
+```sh
+docker compose exec postgres psql -U stashmanager -d stashmanager
+```
+
+Then run:
+
+```sql
+CREATE USER grafana_reader WITH PASSWORD 'replace-with-another-random-password';
+GRANT CONNECT ON DATABASE stashmanager TO grafana_reader;
+GRANT USAGE ON SCHEMA public TO grafana_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO grafana_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE stashmanager IN SCHEMA public
+    GRANT SELECT ON TABLES TO grafana_reader;
+\q
+```
+
+For multiple bots, grant access only to the bot schemas Grafana should report on:
+
+```sql
+GRANT USAGE ON SCHEMA bot_one, bot_two, bot_three TO grafana_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA bot_one, bot_two, bot_three TO grafana_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE stashmanager IN SCHEMA bot_one
+    GRANT SELECT ON TABLES TO grafana_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE stashmanager IN SCHEMA bot_two
+    GRANT SELECT ON TABLES TO grafana_reader;
+ALTER DEFAULT PRIVILEGES FOR ROLE stashmanager IN SCHEMA bot_three
+    GRANT SELECT ON TABLES TO grafana_reader;
+```
+
+In Grafana, open **Connections → Data sources → Add data source → PostgreSQL** and use:
+
+| Setting | Local Compose value |
+|---|---|
+| Host URL | `postgres:5432` |
+| Database | `stashmanager` |
+| Username | `grafana_reader` |
+| Password | The reader password created above |
+| TLS/SSL mode | `disable` for this private local Docker network only |
+
+Select **Save & test**. Keep Stash Manager's write-capable database password out of Grafana.
+
+A single-bot table panel can start with:
+
+```sql
+SELECT started_at AS "time",
+       containers_indexed AS "Indexed",
+       containers_failed AS "Failed"
+FROM public.scan_history
+ORDER BY started_at;
+```
+
+For a fleet summary, qualify every table with its bot schema:
+
+```sql
+SELECT 'bot-one' AS bot, COUNT(*) AS indexed_containers FROM bot_one.containers
+UNION ALL
+SELECT 'bot-two' AS bot, COUNT(*) AS indexed_containers FROM bot_two.containers
+UNION ALL
+SELECT 'bot-three' AS bot, COUNT(*) AS indexed_containers FROM bot_three.containers;
+```
+
+These examples intentionally return totals rather than Minecraft coordinates.
 
 ## 5. Add a bot selector
 
@@ -351,6 +575,20 @@ Scanner state mappings:
 `Yielded` is healthy during cooperative task handoff. Pair it with the cooldown panel rather than
 treating it as a stalled scan.
 
+### Connection recovery
+
+| Panel | PromQL | Display |
+|---|---|---|
+| Reconnect pending | `stash_connection_recovery_pending{service="stashmanager",bot=~"$bot"}` | Stat; green for `0`, red for `1` |
+| Current outage duration | `stash_connection_outage_elapsed_seconds{service="stashmanager",bot=~"$bot"}` | Gauge, seconds |
+| Connection outages | `stash_connection_outages_total{service="stashmanager",bot=~"$bot"}` | Stat |
+| Recovered outages | `stash_connection_recoveries_total{service="stashmanager",bot=~"$bot"}` | Stat |
+
+An outage is counted only when a scan or organizer job is active. The pending value remains `1`
+through automatic reconnect delays, manual reconnect attempts, and failed logins. It returns to
+`0` after Zenith reports a fully online game session; the saved job then completes its cooldown and
+quiet-window checks.
+
 ### Organizer and temporary import storage
 
 | Panel | PromQL | Display |
@@ -409,8 +647,9 @@ are conservatively treated as non-stackable.
 | Mixed or kit shulkers | `stash_shulkers_mixed{bot=~"$bot"}` | Stat |
 | Unclassified shulkers | `stash_shulkers_unclassified{bot=~"$bot"}` | Stat |
 
-Unclassified shulkers are a safety blocker and require a fresh scan. Mixed shulkers are deliberately
-preserved and should not be treated as failures.
+Unclassified shulkers are a safety blocker and require a fresh scan. Mixed shulkers and returned
+kits wait for exact-item reconciliation through registered import chests; they are not treated as
+ordinary bulk boxes.
 
 ## 7. Add alerts
 
@@ -423,6 +662,7 @@ Use a waiting period so normal restarts and scan transitions do not trigger unne
 | Database writes unhealthy | `stash_database_write_healthy{service="stashmanager"} == 0` | 2 minutes |
 | Active scan stopped progressing | `(stash_scanner_state{service="stashmanager"} > 0 and stash_scanner_state{service="stashmanager"} < 8) and changes(stash_scan_containers_processed{service="stashmanager"}[15m]) == 0` | 5 minutes |
 | Proxy control grace nearly expired | `stash_proxy_control_active{service="stashmanager"} == 1 and stash_proxy_control_grace_remaining_seconds{service="stashmanager"} < 120` | 1 minute |
+| Reconnect has not recovered | `stash_connection_recovery_pending{service="stashmanager"} == 1 and stash_connection_outage_elapsed_seconds{service="stashmanager"} > 600` | 5 minutes |
 | Permanent lanes missing | `stash_lanes_shortfall{service="stashmanager"} > 0 or stash_lane_storage_classes_unassigned{service="stashmanager"} > 0` | 15 minutes |
 | Unclassified shulkers found | `stash_shulkers_unclassified{service="stashmanager"} > 0` | 15 minutes |
 
@@ -442,6 +682,7 @@ connected PostgreSQL database.
 | Database | `stash_database_connected`, `stash_database_write_healthy`, `stash_database_write_failures_total` | No |
 | Organizer | `stash_organizer_active`, `stash_organizer_tasks_completed`, `stash_organizer_tasks_total`, `stash_organizer_preemptions_total`, `stash_organizer_preemption_cooldown_remaining_seconds`, `stash_organizer_staged_shulkers`, `stash_organizer_staging_storage_classes`, `stash_organizer_permanent_lane_gaps` | No |
 | Proxy control | `stash_proxy_control_active`, `stash_proxy_control_grace_remaining_seconds` | No |
+| Connection recovery | `stash_connection_recovery_pending`, `stash_connection_outage_elapsed_seconds`, `stash_connection_outages_total`, `stash_connection_recoveries_total` | No |
 | Lane counts | `stash_lane_capacity_ready`, `stash_lane_capacity_status`, `stash_lanes_detected`, `stash_lanes_protected`, `stash_lanes_assignable`, `stash_lanes_required`, `stash_lanes_spare`, `stash_lanes_shortfall` | No |
 | Lane storage | `stash_lane_shulker_slots_assignable`, `stash_lane_shulker_slots_required`, `stash_lane_shulker_slots_compacted`, `stash_lane_shulker_slots_reclaimable`, `stash_lane_stack_sizes_unresolved`, `stash_lane_storage_classes_unassigned`, `stash_lane_shulker_slots_unassigned_required` | No |
 | Construction | `stash_lane_construction_new_lanes`, `stash_lane_construction_expansions`, `stash_lane_construction_double_chests_to_add`, `stash_lane_required_dedicated_double_chests`, `stash_lane_compacted_required_dedicated_double_chests` | No |
@@ -457,8 +698,11 @@ connected PostgreSQL database.
 | `host.docker.internal` does not resolve | Add `host.docker.internal:host-gateway` to the Prometheus container or use the host's private Docker gateway address. |
 | Container name does not resolve | Put Prometheus and the bot on the same Docker network and use a stable service name or network alias. |
 | Grafana cannot reach Prometheus | Use the Prometheus service name rather than localhost when they are separate containers. |
+| Stash Manager cannot reach PostgreSQL | Test the JDBC host from the bot's network. Host processes normally use `127.0.0.1`; containers on the Compose network use `postgres`. |
+| PostgreSQL says no schema was selected | Create the schema first, grant it to the Stash Manager user, and check the `currentSchema` spelling in the JDBC URL. |
 | Dashboard shows only one bot | Remove hard-coded `job` filters and query with `service="stashmanager"` plus the `bot` variable. |
 | Two bots overwrite each other in charts | Give every Prometheus target a unique `bot` label. |
+| Two bots see the same stash records | Stop them and assign a different PostgreSQL schema to each bot. Prometheus labels do not isolate database rows. |
 | Item totals are missing | Connect PostgreSQL. Operational, scan, organizer, and lane metrics still work without aggregate database statistics. |
 | Lane panels are empty or blocked | Run a fresh stash scan and inspect `stash_lane_capacity_status` plus `stash_shulkers_unclassified`. |
 | New metrics do not appear | Update Stash Manager, restart the bot, and wait for the next Prometheus scrape. |
@@ -466,10 +710,12 @@ connected PostgreSQL database.
 ## Security and sharing
 
 - Keep bot API ports behind a firewall, private Docker network, private LAN, or VPN.
+- Keep PostgreSQL on loopback or a private network. Never publish port `5432` to the internet.
 - Do not add a public reverse-proxy route for the Stash Manager API.
 - Use a strong key and rotate it if it appears in logs, screenshots, tickets, chat, or Git history.
 - Avoid publishing Prometheus unless it has its own authentication and access controls.
 - Share dashboards using bot labels and totals rather than coordinates or container records.
+- Give Grafana a read-only PostgreSQL login instead of the bot's write-capable login.
 
 The metrics endpoint does not export Minecraft coordinates. Other authenticated Stash Manager API
 endpoints do return container and region positions, which is why the whole API must remain private.

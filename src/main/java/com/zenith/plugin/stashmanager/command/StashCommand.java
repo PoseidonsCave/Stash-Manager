@@ -38,6 +38,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
@@ -1152,7 +1153,9 @@ public class StashCommand extends Command {
                     boolean canStageShortage = !report.canOrganize()
                             && report.canOrganizeWithImportStaging(importStagingAvailable);
                     String friendlyStatus = switch (report.status()) {
-                        case READY -> "Good to go";
+                        case READY -> report.canOrganizeWithImportStaging(importStagingAvailable)
+                                ? "Good to go"
+                                : "Register an import chest for mixed boxes";
                         case INSUFFICIENT_LANES -> canStageShortage
                                 ? "Can reconcile into import staging"
                                 : "You need a few more lanes";
@@ -1358,8 +1361,7 @@ public class StashCommand extends Command {
                 .then(literal("stop")
                     .executes(c -> {
                         var organizer = module.getOrganizer();
-                        if (organizer != null && organizer.isActive()) {
-                            organizer.stop();
+                        if (organizer != null && module.stopOrganizer()) {
                             c.getSource().getEmbed()
                                 .title("Organizer Stopped")
                                 .addField("Completed", String.valueOf(organizer.getCompletedTasks()), true)
@@ -1374,6 +1376,48 @@ public class StashCommand extends Command {
                         return OK;
                     })
                 )
+                .then(literal("resume")
+                    .executes(c -> {
+                        var organizer = module.getOrganizer();
+                        var embed = c.getSource().getEmbed().title("Organizer Resume");
+                        if (organizer == null || !organizer.hasDurableCheckpoint()) {
+                            embed.description("There is no restart checkpoint waiting to resume.")
+                                .primaryColor();
+                        } else if (module.requestOrganizerCheckpointResume()) {
+                            embed.description("Resume is armed. The organizer will continue after the normal cooldown and quiet checks.")
+                                .addField("Progress",
+                                    organizer.getCompletedTasks() + "/" + organizer.getTotalTasks(), true)
+                                .successColor();
+                        } else if (organizer.getDurableResumeBlocker() != null) {
+                            embed.description("The checkpoint is safe, but it cannot resume yet: "
+                                    + organizer.getDurableResumeBlocker() + ".")
+                                .errorColor();
+                        } else {
+                            embed.description("The checkpoint could not be armed for resume: "
+                                    + Objects.toString(organizer.getDurableRecoveryError(), "unknown checkpoint problem") + ".")
+                                .errorColor();
+                        }
+                        return OK;
+                    })
+                )
+                .then(literal("discard")
+                    .then(literal("confirm")
+                        .executes(c -> {
+                            var organizer = module.getOrganizer();
+                            var embed = c.getSource().getEmbed().title("Organizer Checkpoint");
+                            if (organizer == null || !organizer.hasDurableCheckpoint()) {
+                                embed.description("There is no saved organizer checkpoint to discard.")
+                                    .primaryColor();
+                            } else if (module.discardOrganizerCheckpoint()) {
+                                embed.description("The saved plan and queue were discarded. No game items were moved.")
+                                    .successColor();
+                            } else {
+                                embed.description("The checkpoint could not be discarded while the organizer is running.")
+                                    .errorColor();
+                            }
+                            return OK;
+                        }))
+                )
                 .then(literal("status")
                     .executes(c -> {
                         var organizer = module.getOrganizer();
@@ -1386,6 +1430,17 @@ public class StashCommand extends Command {
                         } else {
                             embed.addField("State", organizer.getState().name(), true);
                             embed.addField("Detail", organizer.getStatus(), false);
+                            embed.addField("Restart Safe",
+                                organizer.hasDurableCheckpoint() ? "Yes" : "No", true);
+                            if (organizer.isDurableRecoveryLoaded()) {
+                                String blocker = organizer.getDurableResumeBlocker();
+                                embed.addField("Restart Recovery",
+                                    blocker == null ? "Waiting for cooldown" : "Waiting: " + blocker,
+                                    false);
+                            } else if (organizer.getDurableRecoveryError() != null) {
+                                embed.addField("Checkpoint Problem",
+                                    organizer.getDurableRecoveryError(), false);
+                            }
                             embed.addField("Task Handoffs",
                                 String.valueOf(module.getOrganizerPreemptionCount()), true);
                             if (organizer.isYielded()) {

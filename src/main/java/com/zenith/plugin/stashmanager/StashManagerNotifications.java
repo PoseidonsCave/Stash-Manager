@@ -92,6 +92,23 @@ public final class StashManagerNotifications {
         DISCORD.sendEmbedMessage(embed);
     }
 
+    public void sendOrganizerFailed(int completedTasks, int totalTasks, @Nullable String reason,
+                                    boolean checkpointPreserved, boolean cargoPreserved) {
+        var embed = Embed.builder()
+            .title("Stash Organizer Needs Attention")
+            .description(checkpointPreserved
+                ? "The organizer stopped safely and kept its restart checkpoint. Fix the reported problem, then use `/stash organize resume`."
+                : "The organizer stopped before finishing. Check the bot and run a fresh scan before starting another organization job.")
+            .addField("Progress", completedTasks + "/" + totalTasks, true)
+            .addField("Restart Checkpoint", checkpointPreserved ? "Saved" : "Unavailable", true)
+            .addField("Cargo", cargoPreserved ? "Preserved in inventory" : "Check manually", true)
+            .errorColor();
+        if (reason != null && !reason.isBlank()) {
+            embed.addField("Reason", reason, false);
+        }
+        DISCORD.sendEmbedMessage(embed);
+    }
+
     public void sendProxyControlWarning(@Nullable String playerName, String job,
                                         int graceSeconds, int cooldownSeconds,
                                         boolean temporaryShulkerOutstanding) {

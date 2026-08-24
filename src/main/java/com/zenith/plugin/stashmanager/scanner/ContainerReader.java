@@ -70,6 +70,7 @@ public class ContainerReader {
         String hopperFacing = location.hopperFacing() != null ? location.hopperFacing().name() : null;
         var inventoryIdentity = DoubleChestIdentity.resolve(
                 location.x(), location.y(), location.z(), actualDouble);
+        String doubleChestAxis = doubleChestAxis(inventoryIdentity);
 
         ContainerEntry containerEntry = new ContainerEntry(
             location.x(), location.y(), location.z(),
@@ -84,12 +85,22 @@ public class ContainerReader {
             inventoryIdentity.inventoryX(),
             inventoryIdentity.inventoryY(),
             inventoryIdentity.inventoryZ(),
-            inventoryIdentity.identityKnown()
+            inventoryIdentity.identityKnown(),
+            doubleChestAxis
         );
 
         index.put(containerEntry);
 
         return true;
+    }
+
+    private String doubleChestAxis(DoubleChestIdentity.Resolution identity) {
+        if (!identity.identityKnown() || identity.blocks().size() != 2) return null;
+        int[] first = identity.blocks().get(0);
+        int[] second = identity.blocks().get(1);
+        if (first[0] != second[0]) return "X";
+        if (first[2] != second[2]) return "Z";
+        return null;
     }
 
     private String getItemId(ItemStack stack) {

@@ -112,6 +112,9 @@ public record LaneCapacityReport(
 
     /** Lane shortages may reconcile into explicit import staging; stale scan states never may. */
     public boolean canOrganizeWithImportStaging(boolean importStagingAvailable) {
+        // Mixed boxes are decomposed in bounded batches through an explicitly owned import
+        // chest even when every permanent lane already fits.
+        if (mixedShulkers > 0 && !importStagingAvailable) return false;
         if (canOrganize()) return true;
         if (!importStagingAvailable) return false;
         return status == Status.INSUFFICIENT_LANES

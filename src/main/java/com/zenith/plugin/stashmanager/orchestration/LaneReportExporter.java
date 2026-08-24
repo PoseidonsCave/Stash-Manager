@@ -102,7 +102,7 @@ public final class LaneReportExporter {
                 report.laneStorage().unassignedRequiredShulkerSlots());
         sheet.metric(28, "Ready-to-sort shulkers", report.bulkShulkers());
         sheet.metric(29, "Empty shulkers", report.emptyShulkers());
-        sheet.metric(30, "Mixed shulkers we're leaving alone", report.mixedShulkers());
+        sheet.metric(30, "Mixed shulkers to separate", report.mixedShulkers());
         sheet.metric(31, "Shulkers we still need to identify", report.unclassifiedShulkers());
         sheet.metric(32, "Items using safe non-stackable fallback",
                 report.laneStorage().unresolvedStackSizeClasses().size(),

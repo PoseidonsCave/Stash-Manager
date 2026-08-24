@@ -9,7 +9,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 
-/** Chooses temporary import storage for reconciled bulk shulkers. */
+/** Chooses temporary import storage for reconciliation cargo and completed bulk shulkers. */
 public final class ImportStagingPolicy {
     private ImportStagingPolicy() {}
 

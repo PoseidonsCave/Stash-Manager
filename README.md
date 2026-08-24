@@ -151,6 +151,8 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 |---------|-------------|
 | `stash organize` | Start sorting items across containers by type |
 | `stash organize stop` | Stop the organizer during a run |
+| `stash organize resume` | Arm a saved restart checkpoint for its normal cooldown and resume checks |
+| `stash organize discard confirm` | Permanently discard a saved plan and queue without moving game items |
 | `stash organize status` | Show organizer state and progress |
 | `stash lanes` | Show lane count, per item lane sizes, and required double chest construction |
 | `stash lanes export` | Download the styled, coordinate free lane planning workbook as XLSX |
@@ -165,19 +167,26 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | Step | What happens |
 |:---:|--------------|
 | 1 | The scan identifies empty, bulk, mixed, and unknown shulkers. |
-| 2 | Mixed shulkers and premade kits are left alone. The bot never guesses what they should become. |
-| 3 | Every exact bulk item type gets its own lane. Fortune and Silk Touch tools remain separate. |
+| 2 | Every exact item gets its own storage class. Blocks, stairs, slabs, trapdoors, armor, tools, and weapons are never folded together. Fortune and Silk Touch tools remain separate. |
+| 3 | Mixed shulkers and returned kits are opened one at a time, staged through registered import chests, and split back into exact-item bulk boxes. The bot never guesses from a majority item. |
 | 4 | Existing lanes are reused when they are large enough. The bot reports the permanent lane gaps when they are not. |
 | 5 | Loose items with lanes are packed into permanent storage. Items without suitable lanes are packed into bulk shulkers and staged in registered import chests. |
-| 6 | Partial matching shulkers are filled before empty ones are used. Mixed boxes and kits remain untouched. |
+| 6 | Partial matching shulkers are filled before empty ones are used. Each mixed box is fully cleared and its empty box is reused before the next mixed box starts. |
 
 The capacity check uses each item's real stack size and the free room inside matching shulkers.
 `stash lanes` turns that into plain lane and double chest counts. `stash lanes export` gives you a
 styled workbook with a summary, a build list, and the full lane breakdown.
 
+Supported regions may mix hopper-fed staircase lanes with direct-access chest banks. Hopper lanes
+are followed through the inventories they actually feed, so narrow and wide stair steps remain
+separate from neighboring chains. In a stacked bank, each contiguous vertical stack is one lane.
+Unstructured standalone chests are still left alone unless they are explicitly registered as
+imports.
+
 > [!CAUTION]
-> After upgrading from an older version that grouped shulkers by color, run a fresh `stash scan`
-> before organizing. Old records stay unclassified so a kit is never mistaken for bulk storage.
+> After upgrading from an older version, run a fresh `stash scan` before organizing. Current scans
+> record both physical shulker instances and the X/Z footprint of every double chest. Older rows
+> stay blocked instead of guessing in dense storage banks.
 
 #### Import chests
 
@@ -186,6 +195,11 @@ organizer to drain it into the storage lanes. When permanent lane space is short
 may also hold newly reconciled bulk shulkers as temporary staging. It never becomes a permanent
 lane, and a later scan and organize run can move those boxes once suitable lanes exist. Facing
 either half of a double chest assigns or removes the whole chest.
+
+Mixed-shulker reconciliation also needs at least one registered import chest. It uses imports as a
+small, reusable transfer buffer: unload one mixed box, repack those exact items, then continue.
+The organizer moves those stacks into known-empty inventory slots, so matching keep-list gear is
+not accidentally swept into the returned kit.
 
 The completion message calls out how many boxes and item types are waiting in imports. If every
 registered import is full or unreachable, the organizer stops with the packed box still safely in
@@ -197,14 +211,34 @@ Scans and organizer runs yield when another Zenith automation request needs Bari
 inventory manager. The job keeps a checkpoint, waits through the configured five minute cooldown,
 then rebuilds its live container or reconciliation state before continuing.
 
+Running `stash stop` during that cooldown cancels the scan checkpoint immediately. It does not wait
+for the old gate or start a delayed return trip, so a stopped scan no longer remains `YIELDED`.
+
+Organizer plans are also journaled to disk. A proxy restart or plugin redeploy reloads the saved
+queue, waits through the same cooldown and quiet checks, verifies the dimension, then reconstructs
+the live inventory or shulker step. `stash organize status` shows whether restart recovery is
+waiting. Use `stash organize discard confirm` only when you intentionally want to abandon that
+saved job.
+
+An upstream disconnect now pauses scans and organizer runs too. Auto reconnect and a later manual
+reconnect use the same checkpoint: the job stays frozen through failed login attempts, waits until
+Zenith reports the bot fully online, then finishes the cooldown and quiet checks before resuming.
+Scanner checkpoints survive reconnects in the same proxy process; organizer checkpoints also
+survive a full proxy restart.
+
+Routine organizer alerts are limited to the 25%, 50%, and 75% milestones, followed by the normal
+completion message. Errors and recovery problems are still reported immediately.
+
 When someone connects as the controlling proxy client, the active job pauses immediately and sends
 a warning in game and on Discord. Use `/swap` to move into spectator mode within ten minutes. If
-control is still active when that grace period ends, the in-memory job checkpoint is discarded;
+control is still active when that grace period ends, the saved job checkpoint is discarded;
 container moves already completed in the world are not rolled back.
 
 `stash debug recent` records successful job starts and progress as well as failures. Handoffs add
 `organize_preempted`, `organize_resumed`, `proxy_control_grace_started`,
-`proxy_control_released`, or `proxy_control_grace_expired`, including the saved state and task
+`proxy_control_released`, or `proxy_control_grace_expired`. Connection recovery adds
+`connection_outage_started`, `connection_attempt_started`, `connection_login_failed`,
+`connection_recovery_armed`, and the normal job resume event, including the saved state and task
 counts needed to trace a resume.
 
 #### Keeping lane assignments stable
@@ -465,11 +499,10 @@ curl -H "Authorization: Bearer mykey" http://localhost:8585/api/v1/stats
 The `/api/v1/metrics` endpoint returns metrics in Prometheus exposition format:
 
 ```
-stashmanager_containers_total 1234
-stashmanager_items_total 56789
-stashmanager_scan_state 0
-stashmanager_database_connected 1
-stashmanager_api_uptime_seconds 3600
+stash_containers_total 1234
+stash_items_total 56789
+stash_scanner_state 0
+stash_database_connected 1
 stash_organizer_active 0
 stash_organizer_tasks_completed 0
 stash_organizer_tasks_total 0
@@ -487,10 +520,14 @@ stash_lanes_shortfall 0
 stash_shulkers_mixed 3
 stash_shulkers_unclassified 0
 stash_proxy_control_active 0
+stash_connection_recovery_pending 0
+stash_connection_outages_total 0
+stash_connection_recoveries_total 0
 stash_proxy_control_grace_remaining_seconds 0
 ```
 
-Add this as a Prometheus scrape target and build Grafana dashboards from the `stashmanager_*` metrics.
+Follow the [local Grafana setup guide](grafana-setup.md) to start PostgreSQL, Prometheus, and Grafana,
+then connect either one bot or a fleet without mixing their database records.
 
 ### 🔔 n8n and webhook integration
 

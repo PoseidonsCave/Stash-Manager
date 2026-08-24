@@ -63,6 +63,13 @@ public class ApiHandler {
         body.put("proxy_control_grace_remaining_seconds",
             module.getProxyControlGraceRemainingSeconds());
         body.put("proxy_control_job", module.getControlledJob().name());
+        body.put("connection_recovery_pending", module.isConnectionRecoveryPending());
+        body.put("connection_recovery_phase", module.getConnectionRecoveryPhase().name());
+        body.put("connection_outages", module.getConnectionOutageCount());
+        body.put("connection_recoveries", module.getConnectionRecoveryCount());
+        body.put("connection_outage_elapsed_seconds",
+            module.getConnectionOutageElapsedSeconds());
+        body.put("last_connection_outage_reason", module.getLastConnectionOutageReason());
         body.put("last_scan", index.timeSinceLastScan());
         body.put("database_connected", database != null && database.isInitialized());
         body.put("database_write_healthy", index.isDatabaseWriteHealthy());
@@ -264,6 +271,26 @@ public class ApiHandler {
         sb.append("stash_proxy_control_grace_remaining_seconds ")
             .append(module.getProxyControlGraceRemainingSeconds()).append('\n');
 
+        sb.append("# HELP stash_connection_recovery_pending Whether a stash job is waiting for the bot to reconnect\n");
+        sb.append("# TYPE stash_connection_recovery_pending gauge\n");
+        sb.append("stash_connection_recovery_pending ")
+            .append(module.isConnectionRecoveryPending() ? 1 : 0).append('\n');
+
+        sb.append("# HELP stash_connection_outages_total Upstream outages observed during resumable stash jobs\n");
+        sb.append("# TYPE stash_connection_outages_total counter\n");
+        sb.append("stash_connection_outages_total ")
+            .append(module.getConnectionOutageCount()).append('\n');
+
+        sb.append("# HELP stash_connection_recoveries_total Upstream outages recovered during resumable stash jobs\n");
+        sb.append("# TYPE stash_connection_recoveries_total counter\n");
+        sb.append("stash_connection_recoveries_total ")
+            .append(module.getConnectionRecoveryCount()).append('\n');
+
+        sb.append("# HELP stash_connection_outage_elapsed_seconds Current resumable-job outage duration\n");
+        sb.append("# TYPE stash_connection_outage_elapsed_seconds gauge\n");
+        sb.append("stash_connection_outage_elapsed_seconds ")
+            .append(module.getConnectionOutageElapsedSeconds()).append('\n');
+
         sb.append("# HELP stash_scan_containers_pending Containers pending in current scan\n");
         sb.append("# TYPE stash_scan_containers_pending gauge\n");
         sb.append("stash_scan_containers_pending ").append(module.getPendingCount()).append('\n');
@@ -338,6 +365,13 @@ public class ApiHandler {
             sb.append("# TYPE stash_organizer_tasks_total gauge\n");
             sb.append("stash_organizer_tasks_total ").append(organizer.getTotalTasks()).append('\n');
 
+            appendGauge(sb, "stash_organizer_durable_checkpoint",
+                    "Whether a restart-safe organizer checkpoint exists (1=yes, 0=no)",
+                    organizer.hasDurableCheckpoint() ? 1 : 0);
+            appendGauge(sb, "stash_organizer_restart_recovery_loaded",
+                    "Whether an organizer restart checkpoint is loaded and waiting to resume",
+                    organizer.isDurableRecoveryLoaded() ? 1 : 0);
+
             appendGauge(sb, "stash_organizer_staged_shulkers",
                     "Reconciled bulk shulkers stored temporarily in imports during the current run",
                     organizer.getStagedShulkers());
@@ -350,9 +384,13 @@ public class ApiHandler {
         }
 
         LaneCapacityReport capacity = module.getLaneCapacityReport();
+        boolean importStagingAvailable = config.pos1 != null && config.pos2 != null
+                && index.getInRegion(config.pos1, config.pos2).stream().anyMatch(index::isImportChest);
         sb.append("# HELP stash_lane_capacity_ready Whether the latest scan is trusted and has enough dedicated lanes\n");
         sb.append("# TYPE stash_lane_capacity_ready gauge\n");
-        sb.append("stash_lane_capacity_ready ").append(capacity.canOrganize() ? 1 : 0).append('\n');
+        sb.append("stash_lane_capacity_ready ")
+                .append(capacity.canOrganizeWithImportStaging(importStagingAvailable) ? 1 : 0)
+                .append('\n');
 
         sb.append("# HELP stash_lane_capacity_status Current lane audit status as a labeled one-hot gauge\n");
         sb.append("# TYPE stash_lane_capacity_status gauge\n");
@@ -400,7 +438,7 @@ public class ApiHandler {
                 capacity.bulkShulkers());
         appendGauge(sb, "stash_shulkers_empty", "Physical empty shulkers in the latest index",
                 capacity.emptyShulkers());
-        appendGauge(sb, "stash_shulkers_mixed", "Physical mixed-content shulkers preserved from bulk organization",
+        appendGauge(sb, "stash_shulkers_mixed", "Physical mixed-content shulkers awaiting exact-item decomposition",
                 capacity.mixedShulkers());
         appendGauge(sb, "stash_shulkers_unclassified", "Legacy or incomplete shulkers requiring a fresh scan",
                 capacity.unclassifiedShulkers());
@@ -444,8 +482,14 @@ public class ApiHandler {
             body.put("active", organizer.isActive());
             body.put("completed_tasks", organizer.getCompletedTasks());
             body.put("total_tasks", organizer.getTotalTasks());
+            body.put("durable_checkpoint", organizer.hasDurableCheckpoint());
+            body.put("restart_recovery_loaded", organizer.isDurableRecoveryLoaded());
+            body.put("checkpoint_updated_at", organizer.getDurableCheckpointUpdatedAtEpochMilli());
+            body.put("checkpoint_error", organizer.getDurableRecoveryError());
+            body.put("checkpoint_resume_blocker", organizer.getDurableResumeBlocker());
             body.put("using_import_staging", organizer.isUsingImportStaging());
             body.put("staged_shulkers", organizer.getStagedShulkers());
+            body.put("decomposed_mixed_shulkers", organizer.getDecomposedMixedShulkers());
             body.put("staging_storage_classes", organizer.getStagingStorageClassCount());
             body.put("permanent_lane_gaps", organizer.getPermanentLaneGaps());
             body.put("yielded", organizer.isYielded());
