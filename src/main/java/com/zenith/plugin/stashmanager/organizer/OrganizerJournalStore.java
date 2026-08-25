@@ -91,7 +91,9 @@ final class OrganizerJournalStore {
             int mixedPendingCargoSlot,
             List<Integer> mixedCargoSlots,
             List<int[]> mixedStagingUsedDestinations,
-            List<Integer> protectedInventorySlots) {}
+            List<Integer> protectedInventorySlots,
+            boolean stopAfterShulkerRecovery,
+            String shulkerRecoveryTrigger) {}
 
     record Loaded(Plan plan, Checkpoint checkpoint) {}
 

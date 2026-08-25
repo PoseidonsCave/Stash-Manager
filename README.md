@@ -527,7 +527,8 @@ stash_proxy_control_grace_remaining_seconds 0
 ```
 
 Follow the [local Grafana setup guide](grafana-setup.md) to start PostgreSQL, Prometheus, and Grafana,
-then connect either one bot or a fleet without mixing their database records.
+then import the included [coordinate-free dashboard](grafana/dashboards/stash-manager-overview.json)
+for either one bot or a fleet without mixing their database records.
 
 ### 🔔 n8n and webhook integration
 

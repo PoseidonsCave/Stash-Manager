@@ -513,24 +513,60 @@ SELECT 'bot-three' AS bot, COUNT(*) AS indexed_containers FROM bot_three.contain
 
 These examples intentionally return totals rather than Minecraft coordinates.
 
-## 5. Add a bot selector
+## 5. Import the included dashboard
 
-For a single bot this is optional. For multiple bots, create a dashboard variable named `bot`:
+The repository includes a ready-to-use, coordinate-free dashboard at
+[`grafana/dashboards/stash-manager-overview.json`](grafana/dashboards/stash-manager-overview.json).
+It works for one bot or a fleet and does not contain server addresses, bot names, container names,
+datasource IDs, API keys, or coordinates.
+
+In Grafana:
+
+1. Open **Dashboards → New → Import**.
+2. Upload `stash-manager-overview.json` or paste its contents.
+3. Select your Prometheus datasource if Grafana asks for one.
+4. Select **Import**.
+5. Use the **Prometheus** and **Bot** menus at the top of the dashboard.
+
+The bot menu is filled from this query:
 
 ```promql
 label_values(stash_containers_total{service="stashmanager"}, bot)
 ```
 
-Enable **Multi-value** and **Include All** if you want fleet views. Panels can then use:
+It already supports multiple selections and **All**. A one-bot setup simply shows one choice. The
+panels use queries like:
 
 ```promql
 stash_containers_total{service="stashmanager",bot=~"$bot"}
 ```
 
 Use `service="stashmanager"` instead of filtering on a specific job name. This keeps dashboards
-working when each bot has its own scrape job or API key.
+working when each bot has its own scrape job or API key. You do not need to edit the JSON when a
+bot is added; give the new Prometheus target a unique `bot` label and it appears automatically.
 
-## 6. Build a useful starter dashboard
+### Check the connection from end to end
+
+Before troubleshooting panels, verify each link separately:
+
+1. Open Prometheus at `http://localhost:9090/targets`. Every Stash Manager target should be `UP`.
+2. In Prometheus, run `count(up{service="stashmanager"})`. It should match the number of configured
+   bot targets.
+3. Run `count(stash_database_connected{service="stashmanager"} == 1)`. It should match the number
+   of bots using PostgreSQL.
+4. In Grafana **Explore**, select the Prometheus datasource and run
+   `stash_containers_total{service="stashmanager"}`.
+5. Open **Stash Manager Operations** and confirm the expected bot names appear in the **Bot** menu.
+
+If step 2 works but step 4 does not, Grafana is pointed at the wrong Prometheus service. If step 4
+works but the bot menu is empty, the Prometheus targets are missing their `bot` or
+`service="stashmanager"` labels.
+
+## 6. Read or customize the dashboard
+
+The included dashboard groups the panels below into fleet health, scanning, organization and
+recovery, permanent storage planning, and shulker staging. The tables are also a reference for
+people who want to build a smaller dashboard or add their own panels.
 
 ### Basic health
 
