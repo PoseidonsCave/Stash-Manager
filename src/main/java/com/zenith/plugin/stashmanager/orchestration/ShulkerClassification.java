@@ -24,8 +24,9 @@ public record ShulkerClassification(
         Map<String, Integer> contents = new TreeMap<>();
         if (rawContents != null) {
             rawContents.forEach((itemId, quantity) -> {
-                if (itemId != null && quantity != null && quantity > 0) {
-                    contents.merge(itemId, quantity, Integer::sum);
+                String storageClass = StorageClassPolicy.exact(itemId);
+                if (storageClass != null && quantity != null && quantity > 0) {
+                    contents.merge(storageClass, quantity, Integer::sum);
                 }
             });
         }

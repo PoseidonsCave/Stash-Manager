@@ -4,6 +4,15 @@ import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
 import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
+import com.zenith.event.client.ClientConnectEvent;
+import com.zenith.event.client.ClientDisconnectEvent;
+import com.zenith.event.client.ClientLoginFailedEvent;
+import com.zenith.event.client.ClientOnlineEvent;
+import com.zenith.event.client.ClientStartConnectEvent;
+import com.zenith.event.client.ClientTickEvent;
+import com.zenith.event.module.AutoReconnectEvent;
+import com.zenith.event.module.HealthAutoDisconnectEvent;
+import com.zenith.event.player.PlayerLoginEvent;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
@@ -18,6 +27,8 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.debug.DebugRecorder;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.orchestration.CooperativePreemptionGate;
+import com.zenith.plugin.stashmanager.orchestration.ConnectionRecoveryTracker;
+import com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
 import com.zenith.plugin.stashmanager.orchestration.OpenRetryCadence;
@@ -99,13 +110,20 @@ public class StashManagerModule extends Module {
     // Cooperative ownership of Zenith's global Baritone and InventoryManager. Futures let us
     // distinguish scanner work from a request submitted by PearlPlus or another plugin.
     private CooperativePreemptionGate scannerPreemptionGate;
+    private CooperativePreemptionGate organizerPreemptionGate;
+    private final JobContinuanceManager jobContinuanceManager = new JobContinuanceManager();
+    private final ConnectionRecoveryTracker connectionRecoveryTracker =
+            new ConnectionRecoveryTracker();
     private @Nullable PathingRequestFuture ownedBaritoneRequest;
     private OwnedBaritoneProcess ownedBaritoneProcess = OwnedBaritoneProcess.NONE;
     private @Nullable RequestFuture ownedInventoryRequest;
     private ScanResumeMode scanResumeMode = ScanResumeMode.RETRY_CURRENT;
-    private boolean resumeAbortedReturn = false;
     private int lateOpenQuarantineTicks = 0;
     private int scanPreemptionCount = 0;
+    private int organizerPreemptionCount = 0;
+    private boolean organizerPickupRecoveryDeferred = false;
+    private String lastOrganizerRecoveryBlocker;
+    private volatile @Nullable String controllingPlayerName;
     private static final int SCAN_PREEMPTION_QUIET_TICKS = 40;
     private static final int LATE_OPEN_QUARANTINE_TICKS = 100;
 
@@ -152,6 +170,7 @@ public class StashManagerModule extends Module {
         this.config = config;
         this.index = index;
         this.scannerPreemptionGate = newScannerPreemptionGate();
+        this.organizerPreemptionGate = newOrganizerPreemptionGate();
         this.regionScanner = new RegionScanner();
         this.containerReader = new ContainerReader(index);
         this.retriever = new StashRetriever();
@@ -197,9 +216,18 @@ public class StashManagerModule extends Module {
     @Override
     public List<EventConsumer<?>> registerEvents() {
         return List.of(
+            of(ClientTickEvent.class, this::onClientTick),
             of(ClientBotTick.class, this::onTick),
             of(ClientBotTick.Starting.class, this::onTickStarting),
-            of(ClientBotTick.Stopped.class, this::onTickStopped)
+            of(ClientBotTick.Stopped.class, this::onTickStopped),
+            of(PlayerLoginEvent.Post.class, this::onControllingPlayerLogin),
+            of(HealthAutoDisconnectEvent.class, this::onHealthAutoDisconnect),
+            of(ClientDisconnectEvent.class, this::onClientDisconnect),
+            of(AutoReconnectEvent.class, this::onAutoReconnectScheduled),
+            of(ClientStartConnectEvent.class, this::onClientStartConnect),
+            of(ClientConnectEvent.class, this::onClientConnect),
+            of(ClientLoginFailedEvent.class, this::onClientLoginFailed),
+            of(ClientOnlineEvent.class, this::onClientOnline)
         );
     }
 
@@ -245,11 +273,36 @@ public class StashManagerModule extends Module {
                 info("Loaded {} containers from database", loaded);
             }
         }
+        if (organizer != null) {
+            StashOrganizer.DurableRestoreResult restored = organizer.restoreDurableCheckpoint();
+            if (restored == StashOrganizer.DurableRestoreResult.RESTORED) {
+                organizerPreemptionGate = newOrganizerPreemptionGate();
+                organizerPreemptionGate.yield();
+                organizerPreemptionCount = 1;
+                organizerPickupRecoveryDeferred = false;
+                lastOrganizerRecoveryBlocker = null;
+                info("Organizer restart checkpoint armed; resume will wait for the configured cooldown and a quiet automation window");
+            } else if (restored == StashOrganizer.DurableRestoreResult.INVALID) {
+                warn("Organizer restart checkpoint needs attention: {}",
+                        organizer.getDurableRecoveryError());
+            }
+        }
+        if (activeResumableJob() != JobContinuanceManager.Job.NONE
+                && !Proxy.getInstance().isConnected()) {
+            beginConnectionOutage("module_enabled_while_disconnected", false, "module_enable");
+        }
         info("StashManager module enabled");
     }
 
     @Override
     public void onDisable() {
+        jobContinuanceManager.clear();
+        connectionRecoveryTracker.reset();
+        controllingPlayerName = null;
+        if (organizer != null && organizer.isActive()) {
+            organizer.prepareForProcessShutdown("module_disabled");
+            organizerPreemptionGate.reset();
+        }
         if (retriever.isActive()) {
             retriever.stop();
         }
@@ -284,6 +337,46 @@ public class StashManagerModule extends Module {
 
     public int getScanPreemptionCooldownRemainingSeconds() {
         return (scannerPreemptionGate.remainingHoldTicks() + 19) / 20;
+    }
+
+    public int getOrganizerPreemptionCount() {
+        return organizerPreemptionCount;
+    }
+
+    public int getOrganizerPreemptionCooldownRemainingSeconds() {
+        return (organizerPreemptionGate.remainingHoldTicks() + 19) / 20;
+    }
+
+    public int getProxyControlGraceRemainingSeconds() {
+        return jobContinuanceManager.remainingSeconds(System.nanoTime());
+    }
+
+    public JobContinuanceManager.Job getControlledJob() {
+        return jobContinuanceManager.job();
+    }
+
+    public boolean isConnectionRecoveryPending() {
+        return connectionRecoveryTracker.isPending();
+    }
+
+    public ConnectionRecoveryTracker.Phase getConnectionRecoveryPhase() {
+        return connectionRecoveryTracker.phase();
+    }
+
+    public int getConnectionOutageCount() {
+        return connectionRecoveryTracker.outageCount();
+    }
+
+    public int getConnectionRecoveryCount() {
+        return connectionRecoveryTracker.recoveryCount();
+    }
+
+    public long getConnectionOutageElapsedSeconds() {
+        return connectionRecoveryTracker.elapsedSeconds(System.nanoTime());
+    }
+
+    public String getLastConnectionOutageReason() {
+        return connectionRecoveryTracker.reason();
     }
 
     public int getPendingCount() {
@@ -335,6 +428,12 @@ public class StashManagerModule extends Module {
         if (organizer.isActive()) {
             return "organizer is already active";
         }
+        if (organizer.hasDurableCheckpoint()) {
+            return organizer.getDurableRecoveryError() == null
+                    ? "a saved organizer checkpoint exists; use /stash organize resume or /stash organize discard confirm"
+                    : "a saved organizer checkpoint is invalid; use /stash organize discard confirm ("
+                            + organizer.getDurableRecoveryError() + ")";
+        }
         if (retriever.isActive()) {
             return "retriever is active";
         }
@@ -342,19 +441,35 @@ public class StashManagerModule extends Module {
         if (automationBlocker != null) return automationBlocker;
 
         LaneCapacityReport capacity = organizer.calculateLaneCapacity();
+        boolean importStagingAvailable = hasImportStagingInventory();
+        boolean shortageCanStage = capacity.canOrganizeWithImportStaging(importStagingAvailable);
         return switch (capacity.status()) {
-            case READY -> null;
-            case INSUFFICIENT_LANES -> "lane capacity is short by " + capacity.laneShortfall()
-                    + " dedicated lane(s); run /stash lanes for details";
-            case INSUFFICIENT_LANE_STORAGE -> capacity.laneStorage().unassigned().size()
-                    + " bulk class(es) do not fit any assignable lane; run /stash lanes for details";
+            case READY -> capacity.mixedShulkers() > 0 && !importStagingAvailable
+                    ? capacity.mixedShulkers()
+                            + " mixed shulker(s) require a registered import chest for safe decomposition staging"
+                    : null;
+            case INSUFFICIENT_LANES -> shortageCanStage
+                    ? null
+                    : "lane capacity is short by " + capacity.laneShortfall()
+                            + " dedicated lane(s); register an import chest for temporary staging or run /stash lanes for details";
+            case INSUFFICIENT_LANE_STORAGE -> shortageCanStage
+                    ? null
+                    : capacity.laneStorage().unassigned().size()
+                            + " bulk class(es) do not fit any assignable lane; register an import chest for temporary staging or run /stash lanes for details";
             case NEEDS_FRESH_SCAN -> "lane capacity data contains "
                     + capacity.unclassifiedShulkers() + " unclassified shulker(s); run a fresh /stash scan";
-            case NEEDS_FRESH_CONTAINER_SCAN -> "double-chest inventory identities require a fresh /stash scan";
+            case NEEDS_FRESH_CONTAINER_SCAN -> "double-chest physical footprints require a fresh /stash scan";
             case REGION_NOT_DEFINED -> "region not defined (set pos1 and pos2 first)";
             case NO_SCANNED_CONTAINERS -> "no scanned containers in the configured region";
-            case NO_LANES_DETECTED -> "no storage lanes detected in the configured region";
+            case NO_LANES_DETECTED -> shortageCanStage
+                    ? null
+                    : "no storage lanes detected in the configured region; register an import chest for temporary staging";
         };
+    }
+
+    private boolean hasImportStagingInventory() {
+        if (config.pos1 == null || config.pos2 == null) return false;
+        return index.getInRegion(config.pos1, config.pos2).stream().anyMatch(index::isImportChest);
     }
 
     public boolean startOrganizer() {
@@ -364,7 +479,59 @@ public class StashManagerModule extends Module {
             fireWebhookEvent("organize_start_blocked", Map.of("reason", blocker));
             return false;
         }
+        organizerPreemptionGate = newOrganizerPreemptionGate();
+        organizerPreemptionCount = 0;
+        organizerPickupRecoveryDeferred = false;
+        lastOrganizerRecoveryBlocker = null;
         return organizer.start();
+    }
+
+    /** Cancel organizer work and retire any cooldown gate owned by that job. */
+    public boolean stopOrganizer() {
+        if (organizer == null || !organizer.isActive()) return false;
+        organizer.stop();
+        if (!organizer.isYielded()) {
+            organizerPreemptionGate.reset();
+            organizerPickupRecoveryDeferred = false;
+            lastOrganizerRecoveryBlocker = null;
+        }
+        if (!organizer.isActive()) {
+            clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE, "manual_stop");
+            connectionRecoveryTracker.reset();
+        }
+        return true;
+    }
+
+    /** Arm (or leave armed) a restored organizer checkpoint for normal gated resume. */
+    public boolean requestOrganizerCheckpointResume() {
+        if (organizer == null) return false;
+        if (!organizer.isDurableRecoveryLoaded()) {
+            StashOrganizer.DurableRestoreResult restored = organizer.restoreDurableCheckpoint();
+            if (restored != StashOrganizer.DurableRestoreResult.RESTORED) return false;
+            organizerPreemptionGate = newOrganizerPreemptionGate();
+            organizerPreemptionGate.yield();
+            lastOrganizerRecoveryBlocker = null;
+        }
+        if (!organizer.isYielded()) return false;
+        if (organizer.getDurableResumeBlocker() != null) return false;
+        if (!organizerPreemptionGate.isYielded()) {
+            organizerPreemptionGate = newOrganizerPreemptionGate();
+            organizerPreemptionGate.yield();
+        }
+        return true;
+    }
+
+    public boolean discardOrganizerCheckpoint() {
+        if (organizer == null || (organizer.isActive() && !organizer.isYielded())) return false;
+        boolean discarded = organizer.discardDurableCheckpoint("manual_discard");
+        if (discarded) {
+            organizerPreemptionGate.reset();
+            organizerPickupRecoveryDeferred = false;
+            lastOrganizerRecoveryBlocker = null;
+            clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE,
+                    "organize_checkpoint_discarded");
+        }
+        return discarded;
     }
 
     public boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems) {
@@ -524,28 +691,39 @@ public class StashManagerModule extends Module {
             "found", containersFound,
             "indexed", containersIndexed,
             "failed", containersFailed));
+        clearProxyControlCheckpoint(JobContinuanceManager.Job.SCAN, reason);
 
-        if (returnAfterAbort && config.returnToStart && hasStartPosition) {
+        if (shouldReturnToStartAfterAbort(
+                returnAfterAbort, config.returnToStart, hasStartPosition, wasYielded)) {
             info("Returning to starting position after scan abort: {}, {}, {}",
                 String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
-            if (wasYielded) {
-                // Do not steal shared control back from the task that interrupted us. The
-                // manual stop's return trip starts after the existing hold/quiet gate.
-                scanResumeMode = ScanResumeMode.RETURN_TO_START;
-                resumeAbortedReturn = true;
-                state = ScanState.YIELDED;
-            } else {
-                ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
-                state = ScanState.RETURNING;
-            }
+            ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
+            state = ScanState.RETURNING;
             fireWebhookEvent("return_to_start_started", Map.of(
                 "reason", "scan_aborted",
                 "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
         } else {
+            if (wasYielded && returnAfterAbort && config.returnToStart && hasStartPosition) {
+                // A manual stop cancels the checkpoint. Starting a delayed return inside the
+                // old yield gate makes the stopped scan continue to look active and can later
+                // steal shared automation back from the task which interrupted it.
+                debugRecorder.record("scan_return_skipped",
+                        "reason=manual_stop_during_yield, disposition=checkpoint_cancelled");
+            }
             state = ScanState.IDLE;
             scannerPreemptionGate.reset();
             clearOwnedAutomation();
+            lateOpenQuarantineTicks = 0;
+            connectionRecoveryTracker.reset();
         }
+    }
+
+    static boolean shouldReturnToStartAfterAbort(
+            boolean returnAfterAbort,
+            boolean returnToStartConfigured,
+            boolean hasStartPosition,
+            boolean wasYielded) {
+        return returnAfterAbort && returnToStartConfigured && hasStartPosition && !wasYielded;
     }
 
     // Return to recorded start position. Returns true if nav started.
@@ -621,28 +799,332 @@ public class StashManagerModule extends Module {
     }
 
     // Tick Handlers
+    private void onControllingPlayerLogin(PlayerLoginEvent.Post event) {
+        if (!event.session().isActivePlayer()) return;
+
+        JobContinuanceManager.Job job = activeResumableJob();
+        if (job == JobContinuanceManager.Job.NONE) {
+            if (organizer != null && !organizer.isActive() && organizer.hasDurableCheckpoint()) {
+                event.session().sendAsyncAlert(
+                        "<red>The previous stash organization stopped before finishing.</red> "
+                                + "<gray>Its checkpoint is saved. Check <white>/stash organize status</white>, "
+                                + "then use <white>/stash organize resume</white> after fixing the destination.</gray>");
+            }
+            return;
+        }
+
+        long now = System.nanoTime();
+        var update = jobContinuanceManager.beginControl(
+                job, now, Math.max(1, config.proxyControlGraceSeconds));
+        if (update.transition() != JobContinuanceManager.Transition.CONTROL_STARTED) return;
+
+        controllingPlayerName = event.session().getName();
+
+        int graceSeconds = Math.max(1, config.proxyControlGraceSeconds);
+        int cooldownSeconds = Math.max(1, config.scanPreemptionCooldownSeconds);
+        boolean temporaryShulkerOutstanding = job == JobContinuanceManager.Job.ORGANIZE
+                && organizer != null && organizer.hasTemporaryShulkerOutstanding();
+        String detail = "job=" + job.name().toLowerCase()
+                + ", controller=" + controllingPlayerName
+                + ", grace_seconds=" + graceSeconds
+                + ", cooldown_seconds=" + cooldownSeconds
+                + (job == JobContinuanceManager.Job.ORGANIZE
+                        ? ", " + organizerCheckpointDetail()
+                        : ", scan_state=" + state + ", resume_mode=" + scanResumeMode
+                            + ", completed=" + getProcessedCount() + ", total=" + containersFound);
+        debugRecorder.record("proxy_control_grace_started", detail);
+        notifications.sendProxyControlWarning(
+                controllingPlayerName, job.name().toLowerCase(), graceSeconds, cooldownSeconds,
+                temporaryShulkerOutstanding);
+        event.session().sendAsyncAlert(
+                "<yellow>Stash " + job.name().toLowerCase()
+                        + " paused.</yellow> <gray>Run <white>/swap</white> within "
+                        + graceSeconds
+                        + " seconds or the job checkpoint will be aborted.</gray>"
+                        + (temporaryShulkerOutstanding
+                                ? " <red>A temporary shulker is mid-recovery; switch now.</red>"
+                                : ""));
+    }
+
+    private void onClientTick(ClientTickEvent event) {
+        if (!jobContinuanceManager.isActive()) return;
+
+        long now = System.nanoTime();
+        var update = jobContinuanceManager.tick(Proxy.getInstance().hasActivePlayer(), now);
+        if (update.transition() == JobContinuanceManager.Transition.CONTROL_RELEASED) {
+            debugRecorder.record("proxy_control_released",
+                    "job=" + update.job().name().toLowerCase()
+                            + ", controller=" + controllingPlayerName
+                            + ", resume_cooldown_seconds="
+                            + Math.max(getScanPreemptionCooldownRemainingSeconds(),
+                                    getOrganizerPreemptionCooldownRemainingSeconds()));
+            notifications.sendProxyControlReleased(
+                    controllingPlayerName, update.job().name().toLowerCase());
+            controllingPlayerName = null;
+            return;
+        }
+        if (update.transition() != JobContinuanceManager.Transition.ABORT_REQUIRED) return;
+
+        JobContinuanceManager.Job expiredJob = update.job();
+        String controller = controllingPlayerName;
+        int elapsedSeconds = jobContinuanceManager.elapsedSeconds(now);
+        // Clear first so the job's abort callback cannot report this expected expiry as a
+        // separate manual checkpoint cancellation.
+        jobContinuanceManager.clear();
+        if (expiredJob == JobContinuanceManager.Job.ORGANIZE
+                && organizer != null && organizer.isActive()) {
+            if (!organizer.isYielded()) organizer.yieldToAutomation("proxy_control_grace_expired");
+            organizer.abortYielded("proxy_control_grace_expired");
+            organizerPreemptionGate.reset();
+        } else if (expiredJob == JobContinuanceManager.Job.SCAN
+                && state != ScanState.IDLE && state != ScanState.DONE) {
+            abortScan("proxy_control_grace_expired");
+        }
+
+        debugRecorder.record("proxy_control_grace_expired",
+                "job=" + expiredJob.name().toLowerCase()
+                        + ", controller=" + controller
+                        + ", elapsed_seconds=" + elapsedSeconds
+                        + ", lost_progress=true");
+        notifications.sendProxyControlAbort(
+                controller, expiredJob.name().toLowerCase(), config.proxyControlGraceSeconds);
+        var activePlayer = Proxy.getInstance().getActivePlayer();
+        if (activePlayer != null) {
+            activePlayer.sendAsyncAlert("<red>Stash " + expiredJob.name().toLowerCase()
+                    + " aborted.</red> <gray>The proxy-control grace period expired.</gray>");
+        }
+        controllingPlayerName = null;
+    }
+
     private void onTickStarting(ClientBotTick.Starting event) {
-        // Re-init on reconnect
-        if (state != ScanState.IDLE && state != ScanState.DONE) {
-            warn("Bot reconnected during scan — resetting state");
-            abortScan("bot_reconnected");
+        // ClientBotTick.Starting may be posted from inside ClientOnlineEvent before every
+        // subscriber has observed that the login completed. The explicit online handler owns
+        // connection recovery so no job can resume against a half-initialized session.
+        if (connectionRecoveryTracker.isPending()) return;
+
+        long now = System.nanoTime();
+        if (state == ScanState.YIELDED && scannerPreemptionGate.isClockSuspended()) {
+            int suspendedTicks = scannerPreemptionGate.resumeClock(now);
+            info("Bot control returned after {} seconds; scan checkpoint remains gated until cooldown and quiet checks pass",
+                suspendedTicks / 20);
+            debugRecorder.record("scan_bot_control_returned",
+                "suspended_seconds=" + suspendedTicks / 20
+                    + ", cooldown_remaining_seconds=" + getScanPreemptionCooldownRemainingSeconds()
+                    + ", resume_mode=" + scanResumeMode
+                    + ", target=" + currentContainerPos());
+        }
+        if (organizer != null && organizer.isYielded()
+                && organizerPreemptionGate.isClockSuspended()) {
+            int suspendedTicks = organizerPreemptionGate.resumeClock(now);
+            info("Bot control returned after {} seconds; organizer checkpoint remains gated until cooldown and quiet checks pass",
+                    suspendedTicks / 20);
+            debugRecorder.record("organize_bot_control_returned",
+                    organizerCheckpointDetail()
+                            + ", suspended_seconds=" + suspendedTicks / 20
+                            + ", cooldown_remaining_seconds="
+                            + getOrganizerPreemptionCooldownRemainingSeconds());
         }
     }
 
     private void onTickStopped(ClientBotTick.Stopped event) {
-        // Bot ticks stop whenever a player takes control, which also pauses Baritone.
+        // Upstream disconnects stop bot ticks too. They are not proxy-control handoffs and must
+        // remain recoverable until an explicit ClientOnlineEvent confirms a usable game session.
+        if (!Proxy.getInstance().isConnected() || connectionRecoveryTracker.isPending()) {
+            beginConnectionOutage(
+                    "bot_ticks_stopped_while_disconnected", false, "bot_tick_stopped");
+            return;
+        }
+
+        // Direct player control stops bot ticks and cancels Baritone. Preserve either long job
+        // at a reconstructable checkpoint; wall time still counts toward the resume hold.
         if (organizer != null && organizer.isActive()) {
-            warn("Bot ticks stopped while organizer was active — stopping organizer");
-            organizer.stop();
+            if (!organizer.isYielded()) {
+                beginOrganizerYield("proxy_control");
+            }
+            organizerPreemptionGate.suspendClock(System.nanoTime());
+            info("Bot control taken; organizer checkpoint suspended");
+            debugRecorder.record("organize_bot_control_suspended",
+                    organizerCheckpointDetail()
+                            + ", cooldown_seconds="
+                            + Math.max(1, config.scanPreemptionCooldownSeconds));
         }
         if (retriever.isActive()) {
             warn("Bot ticks stopped while retriever was active — stopping retriever");
             retriever.stop();
         }
         if (state != ScanState.IDLE && state != ScanState.DONE) {
-            warn("Bot ticks stopped while scan was active — aborting scan");
-            abortScan("bot_ticks_stopped");
+            if (state != ScanState.YIELDED) {
+                beginScannerYield();
+            }
+            scannerPreemptionGate.suspendClock(System.nanoTime());
+            info("Bot control taken; scan checkpoint suspended (resume={})", scanResumeMode);
+            debugRecorder.record("scan_bot_control_suspended",
+                "resume_mode=" + scanResumeMode
+                    + ", target=" + currentContainerPos()
+                    + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
         }
+    }
+
+    private void onClientDisconnect(ClientDisconnectEvent event) {
+        // Login failures can post a delayed synthetic disconnect. Ignore it if another manual
+        // attempt has already established a live replacement session.
+        if (Proxy.getInstance().isConnected()) {
+            debugRecorder.record("connection_disconnect_event_ignored",
+                    "reason=replacement_session_connected, manual_disconnect="
+                            + event.manualDisconnect());
+            return;
+        }
+        beginConnectionOutage(event.reason(), event.manualDisconnect(), "client_disconnect");
+        if (retriever.isActive()) {
+            warn("Connection ended while retriever was active — stopping retrieval safely");
+            retriever.stop();
+        }
+    }
+
+    private void onHealthAutoDisconnect(HealthAutoDisconnectEvent event) {
+        // This event is asynchronous and can arrive after the definitive disconnect callback.
+        // Keep it as useful provenance; ClientDisconnectEvent owns the atomic checkpoint.
+        if (activeResumableJob() != JobContinuanceManager.Job.NONE) {
+            debugRecorder.record("health_autodisconnect_requested",
+                    "job=" + activeResumableJob().name().toLowerCase());
+        }
+    }
+
+    private void onAutoReconnectScheduled(AutoReconnectEvent event) {
+        long now = System.nanoTime();
+        var update = connectionRecoveryTracker.autoReconnectScheduled(event.delaySeconds(), now);
+        if (update.transition()
+                != ConnectionRecoveryTracker.Transition.AUTO_RECONNECT_SCHEDULED) return;
+
+        debugRecorder.record("connection_auto_reconnect_scheduled",
+                connectionRecoveryDetail(update)
+                        + ", delay_seconds=" + event.delaySeconds());
+    }
+
+    private void onClientStartConnect(ClientStartConnectEvent event) {
+        ensureConnectionOutageForActiveCheckpoint("manual_or_automatic_connect_started");
+        long now = System.nanoTime();
+        var update = connectionRecoveryTracker.connectStarted(now);
+        if (update.transition() != ConnectionRecoveryTracker.Transition.CONNECT_STARTED) return;
+
+        debugRecorder.record("connection_attempt_started", connectionRecoveryDetail(update));
+    }
+
+    private void onClientConnect(ClientConnectEvent event) {
+        long now = System.nanoTime();
+        var update = connectionRecoveryTracker.transportConnected(now);
+        if (update.transition()
+                != ConnectionRecoveryTracker.Transition.TRANSPORT_CONNECTED) return;
+
+        debugRecorder.record("connection_transport_connected",
+                connectionRecoveryDetail(update)
+                        + ", disposition=wait_for_client_online");
+    }
+
+    private void onClientLoginFailed(ClientLoginFailedEvent event) {
+        ensureConnectionOutageForActiveCheckpoint("login_failed");
+        long now = System.nanoTime();
+        var update = connectionRecoveryTracker.loginFailed(now);
+        if (update.transition() != ConnectionRecoveryTracker.Transition.LOGIN_FAILED) return;
+
+        String exceptionType = event.exception() == null
+                ? "unknown"
+                : event.exception().getClass().getSimpleName();
+        debugRecorder.record("connection_login_failed",
+                connectionRecoveryDetail(update)
+                        + ", exception_type=" + exceptionType
+                        + ", disposition=checkpoint_preserved");
+    }
+
+    private void onClientOnline(ClientOnlineEvent event) {
+        var client = Proxy.getInstance().getClient();
+        if (client == null || !client.isConnected() || !client.isOnline()) {
+            debugRecorder.record("connection_online_event_ignored",
+                    "reason=session_no_longer_online, disposition=checkpoint_preserved");
+            return;
+        }
+
+        long now = System.nanoTime();
+        var update = connectionRecoveryTracker.online(now);
+        if (update.transition()
+                != ConnectionRecoveryTracker.Transition.ONLINE_RECOVERED) return;
+
+        int scanSuspendedTicks = scannerPreemptionGate.resumeClock(now);
+        int organizerSuspendedTicks = organizerPreemptionGate.resumeClock(now);
+        int cooldownRemaining = Math.max(
+                getScanPreemptionCooldownRemainingSeconds(),
+                getOrganizerPreemptionCooldownRemainingSeconds());
+        String detail = connectionRecoveryDetail(update)
+                + ", scan_suspended_seconds=" + scanSuspendedTicks / 20
+                + ", organizer_suspended_seconds=" + organizerSuspendedTicks / 20
+                + ", cooldown_remaining_seconds=" + cooldownRemaining
+                + ", disposition=wait_for_cooldown_and_quiet_window";
+        info("Connection restored; stash checkpoint will resume after cooldown and quiet checks");
+        debugRecorder.record("connection_recovery_armed", detail);
+        fireWebhookEvent("connection_recovery_armed", Map.of(
+                "job", activeResumableJob().name().toLowerCase(),
+                "outage_seconds", update.elapsedSeconds(),
+                "cooldown_remaining_seconds", cooldownRemaining,
+                "manual_disconnect", connectionRecoveryTracker.manualDisconnect()
+        ));
+    }
+
+    private void ensureConnectionOutageForActiveCheckpoint(String reason) {
+        if (connectionRecoveryTracker.isPending()) return;
+        // Start/connect events are asynchronous in Zenith and can be delivered after the
+        // synchronous online event. Never let a late lifecycle callback pause a healthy job.
+        if (Proxy.getInstance().isConnected()) return;
+        if (activeResumableJob() == JobContinuanceManager.Job.NONE) return;
+        beginConnectionOutage(reason, false, "connection_lifecycle");
+    }
+
+    private void beginConnectionOutage(
+            String reason, boolean manualDisconnect, String source) {
+        JobContinuanceManager.Job job = activeResumableJob();
+        if (job == JobContinuanceManager.Job.NONE
+                && !connectionRecoveryTracker.isPending()) return;
+
+        long now = System.nanoTime();
+        var update = connectionRecoveryTracker.beginOutage(reason, manualDisconnect, now);
+        if (update.transition() != ConnectionRecoveryTracker.Transition.OUTAGE_STARTED) {
+            debugRecorder.record("connection_disconnect_observed",
+                    connectionRecoveryDetail(update)
+                            + ", source=" + source
+                            + ", manual_disconnect=" + manualDisconnect);
+            return;
+        }
+
+        jobContinuanceManager.clear();
+        controllingPlayerName = null;
+        if (organizer != null && organizer.isActive()) {
+            warn("Connection ended while organizer was active — preserving its restart checkpoint");
+            if (!organizer.isYielded()) beginOrganizerYield("connection_lost");
+            organizerPreemptionGate.suspendClock(now);
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            warn("Connection ended while scan was active — preserving its in-memory checkpoint");
+            if (state != ScanState.YIELDED) beginScannerYield();
+            scannerPreemptionGate.suspendClock(now);
+        }
+
+        String detail = connectionRecoveryDetail(update)
+                + ", source=" + source
+                + ", job=" + job.name().toLowerCase()
+                + ", manual_disconnect=" + manualDisconnect
+                + ", disposition=checkpoint_preserved";
+        debugRecorder.record("connection_outage_started", detail);
+        fireWebhookEvent("connection_outage_started", Map.of(
+                "job", job.name().toLowerCase(),
+                "manual_disconnect", manualDisconnect,
+                "checkpoint_preserved", true
+        ));
+    }
+
+    private String connectionRecoveryDetail(ConnectionRecoveryTracker.Update update) {
+        return "phase=" + update.phase().name().toLowerCase()
+                + ", outage_number=" + update.outageNumber()
+                + ", elapsed_seconds=" + update.elapsedSeconds()
+                + ", reason=" + connectionRecoveryTracker.reason();
     }
 
     private void onTick(ClientBotTick event) {
@@ -652,6 +1134,30 @@ public class StashManagerModule extends Module {
 
         // Delegate tick to organizer when active
         if (organizer != null && organizer.isActive()) {
+            if (organizer.isYielded()) {
+                tickOrganizerYielded();
+                return;
+            }
+            if (organizer.wasAutomationPreempted()) {
+                if (!beginOrganizerYield("shared_automation")) {
+                    if (!organizerPickupRecoveryDeferred) {
+                        organizerPickupRecoveryDeferred = true;
+                        organizerPreemptionCount++;
+                        debugRecorder.record("organize_preemption_deferred",
+                                organizerCheckpointDetail()
+                                        + ", reason=temporary_shulker_drop_exposed"
+                                        + ", disposition=wait_for_foreign_task_then_recover"
+                                        + ", preemption_count=" + organizerPreemptionCount);
+                    }
+                }
+                return;
+            }
+            if (organizerPickupRecoveryDeferred) {
+                organizerPickupRecoveryDeferred = false;
+                debugRecorder.record("organize_preemption_recovery_started",
+                        organizerCheckpointDetail()
+                                + ", reason=foreign_task_released");
+            }
             organizer.tick();
             return;
         }
@@ -951,6 +1457,111 @@ public class StashManagerModule extends Module {
         return foreignBaritone || foreignInventory;
     }
 
+    private JobContinuanceManager.Job activeResumableJob() {
+        if (organizer != null && organizer.isActive()) {
+            return JobContinuanceManager.Job.ORGANIZE;
+        }
+        if (state != ScanState.IDLE && state != ScanState.DONE) {
+            return JobContinuanceManager.Job.SCAN;
+        }
+        return JobContinuanceManager.Job.NONE;
+    }
+
+    private boolean beginOrganizerYield(String reason) {
+        if (organizer == null || !organizer.yieldToAutomation(reason)) return false;
+
+        organizerPreemptionGate.yield();
+        organizerPreemptionCount++;
+        String detail = organizerCheckpointDetail()
+                + ", reason=" + reason
+                + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds)
+                + ", preemption_count=" + organizerPreemptionCount;
+        info("Organizer yielded to {} for at least {} seconds (checkpoint={})",
+                reason, Math.max(1, config.scanPreemptionCooldownSeconds),
+                organizer.getYieldedFromState());
+        debugRecorder.record("organize_preempted", detail);
+        if (!"connection_lost".equals(reason)) {
+            fireWebhookEvent("organize_preempted", Map.ofEntries(
+                    Map.entry("reason", reason),
+                    Map.entry("interrupted_state", String.valueOf(organizer.getYieldedFromState())),
+                    Map.entry("completed_tasks", organizer.getCompletedTasks()),
+                    Map.entry("total_tasks", organizer.getTotalTasks()),
+                    Map.entry("temporary_shulker_outstanding", organizer.hasTemporaryShulkerOutstanding()),
+                    Map.entry("cooldown_seconds", Math.max(1, config.scanPreemptionCooldownSeconds))
+            ));
+        }
+        return true;
+    }
+
+    private void tickOrganizerYielded() {
+        organizer.tickYieldMaintenance();
+        if (connectionRecoveryTracker.isPending()) return;
+
+        String recoveryBlocker = organizer.getDurableResumeBlocker();
+        if (recoveryBlocker != null) {
+            if (!recoveryBlocker.equals(lastOrganizerRecoveryBlocker)) {
+                lastOrganizerRecoveryBlocker = recoveryBlocker;
+                warn("Organizer restart checkpoint is waiting: {}", recoveryBlocker);
+                debugRecorder.record("organize_checkpoint_waiting",
+                        organizerCheckpointDetail() + ", reason=" + recoveryBlocker);
+            }
+            return;
+        }
+        if (lastOrganizerRecoveryBlocker != null) {
+            debugRecorder.record("organize_checkpoint_ready",
+                    organizerCheckpointDetail() + ", previous_reason="
+                            + lastOrganizerRecoveryBlocker);
+            lastOrganizerRecoveryBlocker = null;
+        }
+        var transition = organizerPreemptionGate.tick(isSharedAutomationBusy());
+        if (transition != CooperativePreemptionGate.Transition.RESUMED) return;
+
+        int pausedTicks = organizerPreemptionGate.elapsedTicks();
+        String interruptedState = String.valueOf(organizer.getYieldedFromState());
+        if (!organizer.resumeFromYield()) {
+            debugRecorder.record("organize_resume_failed",
+                    "interrupted_state=" + interruptedState
+                            + ", paused_seconds=" + pausedTicks / 20);
+            return;
+        }
+
+        info("Shared automation is quiet; resuming organizer checkpoint {} after {} seconds",
+                interruptedState, pausedTicks / 20);
+        String detail = organizerCheckpointDetail()
+                + ", interrupted_state=" + interruptedState
+                + ", paused_seconds=" + pausedTicks / 20
+                + ", preemption_count=" + organizerPreemptionCount;
+        debugRecorder.record("organize_resumed", detail);
+        fireWebhookEvent("organize_resumed", Map.of(
+                "interrupted_state", interruptedState,
+                "resume_state", organizer.getState().name(),
+                "paused_seconds", pausedTicks / 20,
+                "preemption_count", organizerPreemptionCount
+        ));
+    }
+
+    private String organizerCheckpointDetail() {
+        if (organizer == null) return "organizer=unavailable";
+        return "organizer_state=" + organizer.getState()
+                + ", interrupted_state=" + organizer.getYieldedFromState()
+                + ", completed_tasks=" + organizer.getCompletedTasks()
+                + ", total_tasks=" + organizer.getTotalTasks()
+                + ", temporary_shulker_outstanding="
+                + organizer.hasTemporaryShulkerOutstanding();
+    }
+
+    private void clearProxyControlCheckpoint(JobContinuanceManager.Job job, String reason) {
+        if (jobContinuanceManager.job() != job) return;
+
+        debugRecorder.record("proxy_control_checkpoint_cleared",
+                "job=" + job.name().toLowerCase()
+                        + ", controller=" + controllingPlayerName
+                        + ", reason=" + reason
+                        + ", lost_progress=false");
+        jobContinuanceManager.clear();
+        controllingPlayerName = null;
+    }
+
     private void beginScannerYield() {
         ScanState interruptedState = state;
         scanResumeMode = switch (interruptedState) {
@@ -995,14 +1606,13 @@ public class StashManagerModule extends Module {
 
     private void tickScannerYielded() {
         if (lateOpenQuarantineTicks > 0) lateOpenQuarantineTicks--;
+        if (connectionRecoveryTracker.isPending()) return;
 
         var transition = scannerPreemptionGate.tick(isSharedAutomationBusy());
         if (transition != CooperativePreemptionGate.Transition.RESUMED) return;
 
         int pausedTicks = scannerPreemptionGate.elapsedTicks();
         ScanResumeMode resumeMode = scanResumeMode;
-        boolean abortedReturn = resumeAbortedReturn;
-        resumeAbortedReturn = false;
         lateOpenQuarantineTicks = 0;
         clearOwnedAutomation();
 
@@ -1012,10 +1622,9 @@ public class StashManagerModule extends Module {
             "resume_mode=" + resumeMode
                 + ", paused_seconds=" + pausedTicks / 20
                 + ", target=" + currentContainerPos()
-                + ", preemption_count=" + scanPreemptionCount
-                + ", aborted_return=" + abortedReturn);
+                + ", preemption_count=" + scanPreemptionCount);
 
-        if (!abortedReturn) reacquireBaritoneBreakingAfterYield();
+        reacquireBaritoneBreakingAfterYield();
 
         switch (resumeMode) {
             case RETRY_CURRENT -> resumeCurrentContainer();
@@ -1410,6 +2019,7 @@ public class StashManagerModule extends Module {
             "found=" + containersFound
                 + ", indexed=" + containersIndexed
                 + ", failed=" + containersFailed);
+        clearProxyControlCheckpoint(JobContinuanceManager.Job.SCAN, "scan_completed");
         inGameAlert("<green>Scan complete.</green> <gray>Found=" + containersFound
             + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed + "</gray>");
     }
@@ -1487,7 +2097,6 @@ public class StashManagerModule extends Module {
         scannerPreemptionGate = newScannerPreemptionGate();
         clearOwnedAutomation();
         scanResumeMode = ScanResumeMode.RETRY_CURRENT;
-        resumeAbortedReturn = false;
         lateOpenQuarantineTicks = 0;
         scanPreemptionCount = 0;
     }
@@ -1496,6 +2105,12 @@ public class StashManagerModule extends Module {
         return new CooperativePreemptionGate(
             Math.max(1, config.scanPreemptionCooldownSeconds) * 20,
             SCAN_PREEMPTION_QUIET_TICKS);
+    }
+
+    private CooperativePreemptionGate newOrganizerPreemptionGate() {
+        return new CooperativePreemptionGate(
+                Math.max(1, config.scanPreemptionCooldownSeconds) * 20,
+                SCAN_PREEMPTION_QUIET_TICKS);
     }
 
     // Reasons that are expected/benign noise in a hopper-fed or actively-changing stash (the
@@ -1508,14 +2123,14 @@ public class StashManagerModule extends Module {
     private void handleAutomationEvent(String event, Map<String, Object> payload) {
         boolean suppressWebhook = payload != null
             && WEBHOOK_SUPPRESSED_REASONS.contains(String.valueOf(payload.get("reason")));
-        if (!suppressWebhook) {
+        boolean terminalOrganizerFailure = "organize_failed".equals(event)
+                && booleanValue(payload, "terminal");
+        if (!suppressWebhook && !terminalOrganizerFailure) {
             fireWebhookEvent(event, payload);
         }
-        // Organizer/retriever failures (pathfinding, shulker open/close/break, etc.) only ever
-        // reached Discord via fireWebhookEvent above — the debug recorder never saw them.
-        if (isFailureEvent(event)) {
-            debugRecorder.record(event, formatPayloadDetail(payload));
-        }
+        // Keep successful transitions too. Long headless jobs need a usable baseline even when
+        // nothing has failed yet, especially before a pause/resume handoff.
+        debugRecorder.record(event, formatPayloadDetail(payload));
         switch (event) {
             case "retrieve_completed" -> notifications.sendRetrievalFinished(
                 stringValue(payload, "request_name"),
@@ -1533,11 +2148,38 @@ public class StashManagerModule extends Module {
                 intValue(payload, "remaining_total"),
                 stringValue(payload, "reason")
             );
-            case "organize_completed" -> notifications.sendOrganizerFinished(
-                intValue(payload, "completed_tasks"),
-                intValue(payload, "total_tasks"),
-                intValue(payload, "overflow_types")
-            );
+            case "organize_completed" -> {
+                organizerPreemptionGate.reset();
+                organizerPickupRecoveryDeferred = false;
+                clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE,
+                        "organize_completed");
+                notifications.sendOrganizerFinished(
+                    intValue(payload, "completed_tasks"),
+                    intValue(payload, "total_tasks"),
+                    intValue(payload, "overflow_types"),
+                    intValue(payload, "staged_shulkers"),
+                    intValue(payload, "staged_storage_classes"),
+                    intValue(payload, "permanent_lane_gaps")
+                );
+            }
+            case "organize_failed" -> {
+                if (!booleanValue(payload, "terminal")) break;
+                organizerPreemptionGate.reset();
+                organizerPickupRecoveryDeferred = false;
+                clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE,
+                        "organize_failed");
+                notifications.sendOrganizerFailed(
+                        intValue(payload, "completed_tasks"),
+                        intValue(payload, "total_tasks"),
+                        stringValue(payload, "reason"),
+                        booleanValue(payload, "checkpoint_preserved"),
+                        booleanValue(payload, "cargo_preserved"));
+            }
+            case "organize_aborted", "organize_stopped" -> {
+                organizerPreemptionGate.reset();
+                organizerPickupRecoveryDeferred = false;
+                clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE, event);
+            }
             default -> {
             }
         }
@@ -1561,6 +2203,14 @@ public class StashManagerModule extends Module {
     private @Nullable String stringValue(Map<String, Object> payload, String key) {
         Object value = payload.get(key);
         return value == null ? null : String.valueOf(value);
+    }
+
+    private boolean booleanValue(Map<String, Object> payload, String key) {
+        if (payload == null) return false;
+        Object value = payload.get(key);
+        return value instanceof Boolean bool
+                ? bool
+                : Boolean.parseBoolean(String.valueOf(value));
     }
 
     private @Nullable String getAutomationUnavailableReason() {

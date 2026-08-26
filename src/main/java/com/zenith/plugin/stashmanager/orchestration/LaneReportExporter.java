@@ -82,31 +82,41 @@ public final class LaneReportExporter {
                 construction.existingLanesToExpand() > 0 ? STYLE_WARNING : STYLE_SUCCESS);
         sheet.metric(18, "Double chests to place", construction.doubleChestsToAdd(),
                 construction.doubleChestsToAdd() > 0 ? STYLE_WARNING : STYLE_SUCCESS);
-        sheet.metric(19, "Double chests needed altogether",
+        sheet.metric(19, "Double chests needed right now",
                 construction.requiredDedicatedDoubleChests());
-        sheet.decimalMetric(20, "Double-chest space you already have",
+        sheet.metric(20, "Double chests after full compaction",
+                construction.compactedRequiredDedicatedDoubleChests());
+        sheet.decimalMetric(21, "Double-chest space you already have",
                 construction.existingAssignableDoubleChestEquivalent());
 
         sheet.section(22, "What's in the stash", 4);
         sheet.metric(23, "Shulker spots available",
                 report.laneStorage().totalAssignableShulkerSlots());
-        sheet.metric(24, "Shulker spots needed",
+        sheet.metric(24, "Shulker spots needed right now",
                 report.laneStorage().totalRequiredShulkerSlots());
-        sheet.metric(25, "Needed spots with nowhere to go",
+        sheet.metric(25, "Shulker spots after full compaction",
+                report.laneStorage().totalCompactedShulkerSlots());
+        sheet.metric(26, "Shulker spots compaction can free",
+                report.laneStorage().totalReclaimableShulkerSlots());
+        sheet.metric(27, "Needed spots with nowhere to go",
                 report.laneStorage().unassignedRequiredShulkerSlots());
-        sheet.metric(26, "Ready-to-sort shulkers", report.bulkShulkers());
-        sheet.metric(27, "Empty shulkers", report.emptyShulkers());
-        sheet.metric(28, "Mixed shulkers we're leaving alone", report.mixedShulkers());
-        sheet.metric(29, "Shulkers we still need to identify", report.unclassifiedShulkers());
+        sheet.metric(28, "Ready-to-sort shulkers", report.bulkShulkers());
+        sheet.metric(29, "Empty shulkers", report.emptyShulkers());
+        sheet.metric(30, "Mixed shulkers to separate", report.mixedShulkers());
+        sheet.metric(31, "Shulkers we still need to identify", report.unclassifiedShulkers());
+        sheet.metric(32, "Items using safe non-stackable fallback",
+                report.laneStorage().unresolvedStackSizeClasses().size(),
+                report.laneStorage().unresolvedStackSizeClasses().isEmpty()
+                        ? STYLE_SUCCESS : STYLE_WARNING);
 
-        sheet.section(31, "What to do next", 4);
+        sheet.section(34, "What to do next", 4);
         String nextStep = construction.requirements().isEmpty()
                 ? "You don't need to build anything. Check All Lanes, and if the status above says you're good to go, you can start organizing."
                 : "Head over to What to Build and work through that list. When you're done, scan the stash again before you organize.";
-        sheet.mergedText(32, 1, 4, nextStep,
+        sheet.mergedText(35, 1, 4, nextStep,
                 construction.requirements().isEmpty() ? STYLE_SUCCESS : STYLE_WARNING, 38);
-        sheet.mergedText(34, 1, 4,
-                "Quick rule: one double chest holds 54 shulker boxes, and every exact item type gets a lane of its own.",
+        sheet.mergedText(37, 1, 4,
+                "Quick rule: a shulker has 27 slots. A double chest holds 54 shulkers. Stack size changes how many items fit inside each shulker.",
                 STYLE_NOTE, 34);
         return sheet.finish(null, null, null);
     }
@@ -114,11 +124,14 @@ public final class LaneReportExporter {
     private static String actionPlanSheet(LaneConstructionPlan construction) {
         String[] headers = {
                 "Order", "What to do", "Item", "Exact item ID", "Lane",
-                "Spots right now", "Spots needed", "Lane size (double chests)",
-                "Double chests to add", "Spots after the work", "Extra spots",
+                "Loose items", "Items already boxed", "Max per stack", "Items per shulker",
+                "Spots needed now", "Spots after compaction", "Spots compaction can free",
+                "Spots in lane now", "Lane size (double chests)", "Double chests to add",
+                "Spots after the work", "Extra spots",
                 "What this means"
         };
-        SheetBuilder sheet = new SheetBuilder(new double[]{10, 22, 25, 31, 12, 20, 21, 21, 20, 18, 21, 62});
+        SheetBuilder sheet = new SheetBuilder(new double[]{10, 22, 25, 31, 12, 17, 20, 15, 20,
+                19, 22, 24, 19, 22, 20, 18, 18, 62});
         sheet.mergedText(1, 1, headers.length, "What to Build", STYLE_TITLE, 28);
         sheet.mergedText(2, 1, headers.length,
                 "Start at the top and work your way down. Run another scan when you're finished.",
@@ -146,8 +159,15 @@ public final class LaneReportExporter {
                     Cell.text(item, bodyStyle),
                     Cell.text(requirement.demand().storageClass(), bodyStyle),
                     Cell.text(build ? "NEW" : String.valueOf(requirement.lane().id()), bodyStyle),
-                    Cell.number(requirement.currentShulkerSlots(), bodyStyle),
+                    Cell.number(requirement.demand().looseItems(), bodyStyle),
+                    Cell.number(requirement.demand().itemsInExistingShulkers(), bodyStyle),
+                    Cell.number(requirement.demand().maxStackSize(),
+                            requirement.demand().stackSizeResolved() ? bodyStyle : STYLE_WARNING),
+                    Cell.number(requirement.demand().itemsPerShulker(), bodyStyle),
                     Cell.number(requirement.targetShulkerSlots(), bodyStyle),
+                    Cell.number(requirement.demand().compactedShulkerSlots(), bodyStyle),
+                    Cell.number(requirement.demand().reclaimableShulkerSlots(), bodyStyle),
+                    Cell.number(requirement.currentShulkerSlots(), bodyStyle),
                     Cell.number(requirement.requiredDoubleChests(), bodyStyle),
                     Cell.number(requirement.doubleChestsToAdd(), STYLE_WARNING),
                     Cell.number(plannedCapacity, bodyStyle),
@@ -167,11 +187,14 @@ public final class LaneReportExporter {
             LaneConstructionPlan construction) {
         String[] headers = {
                 "How it's being used", "Lane", "Item", "Exact item ID",
+                "Max per stack", "Items per shulker",
                 "Shulker spots now", "Double-chest space now",
-                "Shulker spots needed", "Smallest lane that'll work", "Chests to add",
+                "Shulker spots needed now", "Spots after compaction", "Spots compaction can free",
+                "Smallest lane that'll work", "Chests to add",
                 "Extra spots afterward", "What this means"
         };
-        SheetBuilder sheet = new SheetBuilder(new double[]{19, 12, 25, 31, 21, 27, 21, 21, 20, 22, 58});
+        SheetBuilder sheet = new SheetBuilder(new double[]{19, 12, 25, 31, 15, 20, 21, 27,
+                24, 22, 24, 21, 20, 22, 58});
         sheet.mergedText(1, 1, headers.length, "Every Lane at a Glance", STYLE_TITLE, 28);
         sheet.mergedText(2, 1, headers.length,
                 "This is every lane we found, plus any new ones you need. Lane numbers don't reveal stash coordinates.",
@@ -457,6 +480,7 @@ public final class LaneReportExporter {
                 String notes,
                 int bodyStyle) {
             int requiredSlots = demand == null ? 0 : demand.requiredShulkerSlots();
+            int compactedSlots = demand == null ? 0 : demand.compactedShulkerSlots();
             int requiredChests = demand == null ? 0
                     : LaneConstructionPlan.doubleChestsForSlots(requiredSlots);
             row(row, new Cell[]{
@@ -464,10 +488,15 @@ public final class LaneReportExporter {
                     Cell.text(laneId, bodyStyle),
                     Cell.text(demand == null ? "" : IndexExporter.toReadableName(demand.storageClass()), bodyStyle),
                     Cell.text(demand == null ? "" : demand.storageClass(), bodyStyle),
+                    Cell.number(demand == null ? 0 : demand.maxStackSize(),
+                            demand != null && !demand.stackSizeResolved() ? STYLE_WARNING : bodyStyle),
+                    Cell.number(demand == null ? 0 : demand.itemsPerShulker(), bodyStyle),
                     Cell.number(currentSlots, bodyStyle),
                     Cell.number(currentSlots / (double) LaneConstructionPlan.SHULKER_SLOTS_PER_DOUBLE_CHEST,
                             bodyStyle == STYLE_STRIPE ? STYLE_DECIMAL_STRIPE : STYLE_DECIMAL),
                     Cell.number(requiredSlots, bodyStyle),
+                    Cell.number(compactedSlots, bodyStyle),
+                    Cell.number(demand == null ? 0 : demand.reclaimableShulkerSlots(), bodyStyle),
                     Cell.number(requiredChests, bodyStyle),
                     Cell.number(chestsToAdd, chestsToAdd > 0 ? STYLE_WARNING : bodyStyle),
                     Cell.number(Math.max(0, spareSlots), bodyStyle),

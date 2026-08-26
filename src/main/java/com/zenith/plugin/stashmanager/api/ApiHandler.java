@@ -57,6 +57,19 @@ public class ApiHandler {
         body.put("scan_preemptions", module.getScanPreemptionCount());
         body.put("scan_preemption_cooldown_remaining_seconds",
             module.getScanPreemptionCooldownRemainingSeconds());
+        body.put("organizer_preemptions", module.getOrganizerPreemptionCount());
+        body.put("organizer_preemption_cooldown_remaining_seconds",
+            module.getOrganizerPreemptionCooldownRemainingSeconds());
+        body.put("proxy_control_grace_remaining_seconds",
+            module.getProxyControlGraceRemainingSeconds());
+        body.put("proxy_control_job", module.getControlledJob().name());
+        body.put("connection_recovery_pending", module.isConnectionRecoveryPending());
+        body.put("connection_recovery_phase", module.getConnectionRecoveryPhase().name());
+        body.put("connection_outages", module.getConnectionOutageCount());
+        body.put("connection_recoveries", module.getConnectionRecoveryCount());
+        body.put("connection_outage_elapsed_seconds",
+            module.getConnectionOutageElapsedSeconds());
+        body.put("last_connection_outage_reason", module.getLastConnectionOutageReason());
         body.put("last_scan", index.timeSinceLastScan());
         body.put("database_connected", database != null && database.isInitialized());
         body.put("database_write_healthy", index.isDatabaseWriteHealthy());
@@ -236,6 +249,48 @@ public class ApiHandler {
         sb.append("stash_scan_preemption_cooldown_remaining_seconds ")
             .append(module.getScanPreemptionCooldownRemainingSeconds()).append('\n');
 
+        sb.append("# HELP stash_organizer_preemptions_total Cooperative organizer handoffs in the current or last run\n");
+        sb.append("# TYPE stash_organizer_preemptions_total gauge\n");
+        sb.append("stash_organizer_preemptions_total ")
+            .append(module.getOrganizerPreemptionCount()).append('\n');
+
+        sb.append("# HELP stash_organizer_preemption_cooldown_remaining_seconds Minimum organizer yield hold remaining\n");
+        sb.append("# TYPE stash_organizer_preemption_cooldown_remaining_seconds gauge\n");
+        sb.append("stash_organizer_preemption_cooldown_remaining_seconds ")
+            .append(module.getOrganizerPreemptionCooldownRemainingSeconds()).append('\n');
+
+        sb.append("# HELP stash_proxy_control_active Whether proxy control is holding a resumable stash job\n");
+        sb.append("# TYPE stash_proxy_control_active gauge\n");
+        sb.append("stash_proxy_control_active ")
+            .append(module.getControlledJob()
+                    == com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager.Job.NONE ? 0 : 1)
+            .append('\n');
+
+        sb.append("# HELP stash_proxy_control_grace_remaining_seconds Time before proxy control discards the active checkpoint\n");
+        sb.append("# TYPE stash_proxy_control_grace_remaining_seconds gauge\n");
+        sb.append("stash_proxy_control_grace_remaining_seconds ")
+            .append(module.getProxyControlGraceRemainingSeconds()).append('\n');
+
+        sb.append("# HELP stash_connection_recovery_pending Whether a stash job is waiting for the bot to reconnect\n");
+        sb.append("# TYPE stash_connection_recovery_pending gauge\n");
+        sb.append("stash_connection_recovery_pending ")
+            .append(module.isConnectionRecoveryPending() ? 1 : 0).append('\n');
+
+        sb.append("# HELP stash_connection_outages_total Upstream outages observed during resumable stash jobs\n");
+        sb.append("# TYPE stash_connection_outages_total counter\n");
+        sb.append("stash_connection_outages_total ")
+            .append(module.getConnectionOutageCount()).append('\n');
+
+        sb.append("# HELP stash_connection_recoveries_total Upstream outages recovered during resumable stash jobs\n");
+        sb.append("# TYPE stash_connection_recoveries_total counter\n");
+        sb.append("stash_connection_recoveries_total ")
+            .append(module.getConnectionRecoveryCount()).append('\n');
+
+        sb.append("# HELP stash_connection_outage_elapsed_seconds Current resumable-job outage duration\n");
+        sb.append("# TYPE stash_connection_outage_elapsed_seconds gauge\n");
+        sb.append("stash_connection_outage_elapsed_seconds ")
+            .append(module.getConnectionOutageElapsedSeconds()).append('\n');
+
         sb.append("# HELP stash_scan_containers_pending Containers pending in current scan\n");
         sb.append("# TYPE stash_scan_containers_pending gauge\n");
         sb.append("stash_scan_containers_pending ").append(module.getPendingCount()).append('\n');
@@ -309,12 +364,33 @@ public class ApiHandler {
             sb.append("# HELP stash_organizer_tasks_total Organizer tasks planned in current run\n");
             sb.append("# TYPE stash_organizer_tasks_total gauge\n");
             sb.append("stash_organizer_tasks_total ").append(organizer.getTotalTasks()).append('\n');
+
+            appendGauge(sb, "stash_organizer_durable_checkpoint",
+                    "Whether a restart-safe organizer checkpoint exists (1=yes, 0=no)",
+                    organizer.hasDurableCheckpoint() ? 1 : 0);
+            appendGauge(sb, "stash_organizer_restart_recovery_loaded",
+                    "Whether an organizer restart checkpoint is loaded and waiting to resume",
+                    organizer.isDurableRecoveryLoaded() ? 1 : 0);
+
+            appendGauge(sb, "stash_organizer_staged_shulkers",
+                    "Reconciled bulk shulkers stored temporarily in imports during the current run",
+                    organizer.getStagedShulkers());
+            appendGauge(sb, "stash_organizer_staging_storage_classes",
+                    "Item classes routed to temporary import staging during the current run",
+                    organizer.getStagingStorageClassCount());
+            appendGauge(sb, "stash_organizer_permanent_lane_gaps",
+                    "Item classes still lacking a suitable permanent lane",
+                    organizer.getPermanentLaneGaps());
         }
 
         LaneCapacityReport capacity = module.getLaneCapacityReport();
+        boolean importStagingAvailable = config.pos1 != null && config.pos2 != null
+                && index.getInRegion(config.pos1, config.pos2).stream().anyMatch(index::isImportChest);
         sb.append("# HELP stash_lane_capacity_ready Whether the latest scan is trusted and has enough dedicated lanes\n");
         sb.append("# TYPE stash_lane_capacity_ready gauge\n");
-        sb.append("stash_lane_capacity_ready ").append(capacity.canOrganize() ? 1 : 0).append('\n');
+        sb.append("stash_lane_capacity_ready ")
+                .append(capacity.canOrganizeWithImportStaging(importStagingAvailable) ? 1 : 0)
+                .append('\n');
 
         sb.append("# HELP stash_lane_capacity_status Current lane audit status as a labeled one-hot gauge\n");
         sb.append("# TYPE stash_lane_capacity_status gauge\n");
@@ -337,6 +413,12 @@ public class ApiHandler {
                 capacity.laneStorage().totalAssignableShulkerSlots());
         appendGauge(sb, "stash_lane_shulker_slots_required", "Shulker-box slots required by managed bulk classes",
                 capacity.laneStorage().totalRequiredShulkerSlots());
+        appendGauge(sb, "stash_lane_shulker_slots_compacted", "Shulker-box slots required after compatible partial boxes are consolidated",
+                capacity.laneStorage().totalCompactedShulkerSlots());
+        appendGauge(sb, "stash_lane_shulker_slots_reclaimable", "Existing shulker-box slots reclaimable through consolidation",
+                capacity.laneStorage().totalReclaimableShulkerSlots());
+        appendGauge(sb, "stash_lane_stack_sizes_unresolved", "Storage classes using conservative non-stackable capacity",
+                capacity.laneStorage().unresolvedStackSizeClasses().size());
         appendGauge(sb, "stash_lane_storage_classes_unassigned", "Bulk classes which cannot fit any assignable lane",
                 capacity.laneStorage().unassigned().size());
         appendGauge(sb, "stash_lane_shulker_slots_unassigned_required", "Required slots belonging to unassigned bulk classes",
@@ -350,11 +432,13 @@ public class ApiHandler {
                 construction.doubleChestsToAdd());
         appendGauge(sb, "stash_lane_required_dedicated_double_chests", "Minimum double chests required across all dedicated item lanes",
                 construction.requiredDedicatedDoubleChests());
+        appendGauge(sb, "stash_lane_compacted_required_dedicated_double_chests", "Minimum double chests required after compatible partial boxes are consolidated",
+                construction.compactedRequiredDedicatedDoubleChests());
         appendGauge(sb, "stash_shulkers_bulk", "Physical homogeneous bulk shulkers in the latest index",
                 capacity.bulkShulkers());
         appendGauge(sb, "stash_shulkers_empty", "Physical empty shulkers in the latest index",
                 capacity.emptyShulkers());
-        appendGauge(sb, "stash_shulkers_mixed", "Physical mixed-content shulkers preserved from bulk organization",
+        appendGauge(sb, "stash_shulkers_mixed", "Physical mixed-content shulkers awaiting exact-item decomposition",
                 capacity.mixedShulkers());
         appendGauge(sb, "stash_shulkers_unclassified", "Legacy or incomplete shulkers requiring a fresh scan",
                 capacity.unclassifiedShulkers());
@@ -398,6 +482,24 @@ public class ApiHandler {
             body.put("active", organizer.isActive());
             body.put("completed_tasks", organizer.getCompletedTasks());
             body.put("total_tasks", organizer.getTotalTasks());
+            body.put("durable_checkpoint", organizer.hasDurableCheckpoint());
+            body.put("restart_recovery_loaded", organizer.isDurableRecoveryLoaded());
+            body.put("checkpoint_updated_at", organizer.getDurableCheckpointUpdatedAtEpochMilli());
+            body.put("checkpoint_error", organizer.getDurableRecoveryError());
+            body.put("checkpoint_resume_blocker", organizer.getDurableResumeBlocker());
+            body.put("using_import_staging", organizer.isUsingImportStaging());
+            body.put("staged_shulkers", organizer.getStagedShulkers());
+            body.put("decomposed_mixed_shulkers", organizer.getDecomposedMixedShulkers());
+            body.put("staging_storage_classes", organizer.getStagingStorageClassCount());
+            body.put("permanent_lane_gaps", organizer.getPermanentLaneGaps());
+            body.put("yielded", organizer.isYielded());
+            body.put("yielded_from_state", organizer.getYieldedFromState() == null
+                    ? null : organizer.getYieldedFromState().name());
+            body.put("preemptions", module.getOrganizerPreemptionCount());
+            body.put("preemption_cooldown_remaining_seconds",
+                    module.getOrganizerPreemptionCooldownRemainingSeconds());
+            body.put("proxy_control_grace_remaining_seconds",
+                    module.getProxyControlGraceRemainingSeconds());
             body.put("status", organizer.getStatus());
         }
         LaneCapacityReport capacity = module.getLaneCapacityReport();
@@ -422,19 +524,35 @@ public class ApiHandler {
         body.put("lane_storage", Map.of(
                 "assignable_shulker_slots", capacity.laneStorage().totalAssignableShulkerSlots(),
                 "required_shulker_slots", capacity.laneStorage().totalRequiredShulkerSlots(),
+                "compacted_required_shulker_slots", capacity.laneStorage().totalCompactedShulkerSlots(),
+                "reclaimable_shulker_slots", capacity.laneStorage().totalReclaimableShulkerSlots(),
                 "unassigned_required_shulker_slots", capacity.laneStorage().unassignedRequiredShulkerSlots(),
+                "unresolved_stack_size_classes", capacity.laneStorage().unresolvedStackSizeClasses(),
                 "allocations", capacity.laneStorage().allocations().stream().map(allocation -> Map.ofEntries(
                         Map.entry("storage_class", allocation.demand().storageClass()),
                         Map.entry("lane_id", allocation.lane().id()),
+                        Map.entry("loose_items", allocation.demand().looseItems()),
+                        Map.entry("items_in_existing_shulkers", allocation.demand().itemsInExistingShulkers()),
+                        Map.entry("max_stack_size", allocation.demand().maxStackSize()),
+                        Map.entry("stack_size_resolved", allocation.demand().stackSizeResolved()),
+                        Map.entry("items_per_shulker", allocation.demand().itemsPerShulker()),
                         Map.entry("required_shulker_slots", allocation.demand().requiredShulkerSlots()),
+                        Map.entry("compacted_required_shulker_slots", allocation.demand().compactedShulkerSlots()),
+                        Map.entry("reclaimable_shulker_slots", allocation.demand().reclaimableShulkerSlots()),
                         Map.entry("lane_shulker_slots", allocation.lane().shulkerSlots()),
                         Map.entry("spare_shulker_slots", allocation.spareShulkerSlots())
                 )).toList(),
-                "unassigned", capacity.laneStorage().unassigned().stream().map(demand -> Map.of(
-                        "storage_class", demand.storageClass(),
-                        "required_shulker_slots", demand.requiredShulkerSlots(),
-                        "existing_bulk_shulkers", demand.existingBulkShulkers(),
-                        "loose_items", demand.looseItems()
+                "unassigned", capacity.laneStorage().unassigned().stream().map(demand -> Map.ofEntries(
+                        Map.entry("storage_class", demand.storageClass()),
+                        Map.entry("required_shulker_slots", demand.requiredShulkerSlots()),
+                        Map.entry("compacted_required_shulker_slots", demand.compactedShulkerSlots()),
+                        Map.entry("reclaimable_shulker_slots", demand.reclaimableShulkerSlots()),
+                        Map.entry("existing_bulk_shulkers", demand.existingBulkShulkers()),
+                        Map.entry("items_in_existing_shulkers", demand.itemsInExistingShulkers()),
+                        Map.entry("loose_items", demand.looseItems()),
+                        Map.entry("max_stack_size", demand.maxStackSize()),
+                        Map.entry("stack_size_resolved", demand.stackSizeResolved()),
+                        Map.entry("items_per_shulker", demand.itemsPerShulker())
                 )).toList()
         ));
         LaneConstructionPlan construction = LaneConstructionPlan.assess(capacity.laneStorage());
@@ -445,6 +563,8 @@ public class ApiHandler {
                 "existing_assignable_double_chest_equivalent",
                 construction.existingAssignableDoubleChestEquivalent(),
                 "required_dedicated_double_chests", construction.requiredDedicatedDoubleChests(),
+                "compacted_required_dedicated_double_chests",
+                construction.compactedRequiredDedicatedDoubleChests(),
                 "requirements", construction.requirements().stream().map(requirement -> {
                     Map<String, Object> row = new LinkedHashMap<>();
                     row.put("storage_class", requirement.demand().storageClass());

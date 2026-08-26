@@ -66,6 +66,7 @@ public class DatabaseManager implements AutoCloseable {
                     inventory_y INTEGER,
                     inventory_z INTEGER,
                     inventory_identity_known BOOLEAN NOT NULL DEFAULT FALSE,
+                    double_chest_axis VARCHAR(1),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(x, y, z)
@@ -229,6 +230,7 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_y INTEGER");
             stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_z INTEGER");
             stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS inventory_identity_known BOOLEAN NOT NULL DEFAULT FALSE");
+            stmt.execute("ALTER TABLE containers ADD COLUMN IF NOT EXISTS double_chest_axis VARCHAR(1)");
             // NULL means keep unlimited.
             stmt.execute("ALTER TABLE keep_items ADD COLUMN IF NOT EXISTS keep_quantity INTEGER");
             // Older rows remain NULL and are treated as legacy aggregate data until rescanned.
@@ -279,8 +281,8 @@ public class DatabaseManager implements AutoCloseable {
     private long upsertContainerRow(Connection conn, ContainerEntry entry) throws SQLException {
         String sql = """
             INSERT INTO containers (x, y, z, block_type, is_double, shulker_count, total_items, scan_timestamp, label, hopper_facing,
-                                    inventory_x, inventory_y, inventory_z, inventory_identity_known, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                                    inventory_x, inventory_y, inventory_z, inventory_identity_known, double_chest_axis, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT (x, y, z) DO UPDATE SET
                 block_type = EXCLUDED.block_type,
                 is_double = EXCLUDED.is_double,
@@ -293,6 +295,7 @@ public class DatabaseManager implements AutoCloseable {
                 inventory_y = EXCLUDED.inventory_y,
                 inventory_z = EXCLUDED.inventory_z,
                 inventory_identity_known = EXCLUDED.inventory_identity_known,
+                double_chest_axis = EXCLUDED.double_chest_axis,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
             """;
@@ -312,6 +315,7 @@ public class DatabaseManager implements AutoCloseable {
             ps.setInt(12, entry.inventoryY());
             ps.setInt(13, entry.inventoryZ());
             ps.setBoolean(14, entry.inventoryIdentityKnown());
+            ps.setString(15, entry.doubleChestAxis());
 
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
@@ -391,7 +395,7 @@ public class DatabaseManager implements AutoCloseable {
     public List<ContainerEntry> getAllContainers() throws SQLException {
         if (!initialized) return Collections.emptyList();
 
-        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known FROM containers ORDER BY scan_timestamp DESC";
+        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known, double_chest_axis FROM containers ORDER BY scan_timestamp DESC";
         List<ContainerEntry> results = new ArrayList<>();
 
         try (Connection conn = dataSource.getConnection();
@@ -409,7 +413,7 @@ public class DatabaseManager implements AutoCloseable {
     public List<ContainerEntry> getContainersPage(int page, int pageSize) throws SQLException {
         if (!initialized) return Collections.emptyList();
 
-        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
+        String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known, double_chest_axis FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
         List<ContainerEntry> results = new ArrayList<>();
 
         try (Connection conn = dataSource.getConnection();
@@ -432,7 +436,8 @@ public class DatabaseManager implements AutoCloseable {
 
         String sql = """
             SELECT DISTINCT c.id, c.x, c.y, c.z, c.block_type, c.is_double, c.shulker_count, c.scan_timestamp, c.label, c.hopper_facing,
-                            c.inventory_x, c.inventory_y, c.inventory_z, c.inventory_identity_known
+                            c.inventory_x, c.inventory_y, c.inventory_z, c.inventory_identity_known,
+                            c.double_chest_axis
             FROM containers c
             JOIN container_items ci ON c.id = ci.container_id
             WHERE LOWER(ci.item_id) LIKE ?
@@ -1167,6 +1172,7 @@ public class DatabaseManager implements AutoCloseable {
         int inventoryY = y;
         int inventoryZ = z;
         boolean inventoryIdentityKnown = !isDouble;
+        String doubleChestAxis = null;
         try {
             Object storedX = rs.getObject("inventory_x");
             Object storedY = rs.getObject("inventory_y");
@@ -1177,6 +1183,7 @@ public class DatabaseManager implements AutoCloseable {
                 inventoryZ = ((Number) storedZ).intValue();
             }
             inventoryIdentityKnown = rs.getBoolean("inventory_identity_known");
+            doubleChestAxis = rs.getString("double_chest_axis");
         } catch (SQLException ignored) {
             // Compatibility with a database that has not run the identity migration yet.
         }
@@ -1185,6 +1192,7 @@ public class DatabaseManager implements AutoCloseable {
             inventoryY = y;
             inventoryZ = z;
             inventoryIdentityKnown = true;
+            doubleChestAxis = null;
         }
 
         // Load items
@@ -1245,7 +1253,7 @@ public class DatabaseManager implements AutoCloseable {
 
         return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
                 shulkerDetails, scanTimestamp, label, hopperFacing,
-                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown);
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis);
     }
 
     @Override

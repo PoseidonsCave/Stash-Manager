@@ -38,6 +38,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
@@ -95,7 +96,7 @@ public class StashCommand extends Command {
                 "get <item_id> [count] / kit <name> / status / stop",
                 "lanes [export] / organize [stop|status]",
                 "db status / db clear",
-                "config <scanDelay|openTimeout|maxContainers|walkTimeout|preemptionCooldown> <value>",
+                "config <scanDelay|openTimeout|maxContainers|walkTimeout|preemptionCooldown|controlGrace> <value>",
                 "config returnToStart <on|off>",
                 "config db <enable|disable|connect>",
                 "config db <url|user|password|poolSize> <value>",
@@ -248,6 +249,11 @@ public class StashCommand extends Command {
                         if (module.getState() == StashManagerModule.ScanState.YIELDED) {
                             embed.addField("Minimum Resume Hold",
                                 module.getScanPreemptionCooldownRemainingSeconds() + "s", true);
+                        }
+                        if (module.getControlledJob()
+                                == com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager.Job.SCAN) {
+                            embed.addField("Proxy Control Grace",
+                                module.getProxyControlGraceRemainingSeconds() + "s", true);
                         }
                     }
 
@@ -1141,15 +1147,28 @@ public class StashCommand extends Command {
                     LaneCapacityReport report = module.getLaneCapacityReport();
                     LaneConstructionPlan construction = LaneConstructionPlan.assess(
                             report.laneStorage());
+                    boolean importStagingAvailable = config.pos1 != null && config.pos2 != null
+                            && index.getInRegion(config.pos1, config.pos2).stream()
+                                    .anyMatch(index::isImportChest);
+                    boolean canStageShortage = !report.canOrganize()
+                            && report.canOrganizeWithImportStaging(importStagingAvailable);
                     String friendlyStatus = switch (report.status()) {
-                        case READY -> "Good to go";
-                        case INSUFFICIENT_LANES -> "You need a few more lanes";
-                        case INSUFFICIENT_LANE_STORAGE -> "Some lanes are too small";
+                        case READY -> report.canOrganizeWithImportStaging(importStagingAvailable)
+                                ? "Good to go"
+                                : "Register an import chest for mixed boxes";
+                        case INSUFFICIENT_LANES -> canStageShortage
+                                ? "Can reconcile into import staging"
+                                : "You need a few more lanes";
+                        case INSUFFICIENT_LANE_STORAGE -> canStageShortage
+                                ? "Can reconcile into import staging"
+                                : "Some lanes are too small";
                         case NEEDS_FRESH_SCAN -> "Run a fresh scan first";
                         case NEEDS_FRESH_CONTAINER_SCAN -> "Scan the chests again first";
                         case REGION_NOT_DEFINED -> "Set the stash area first";
                         case NO_SCANNED_CONTAINERS -> "Scan the stash first";
-                        case NO_LANES_DETECTED -> "No lanes found yet";
+                        case NO_LANES_DETECTED -> canStageShortage
+                                ? "Can reconcile into import staging"
+                                : "No lanes found yet";
                     };
                     var embed = c.getSource().getEmbed()
                             .title("Your Stash Lane Plan")
@@ -1163,13 +1182,19 @@ public class StashCommand extends Command {
                             .addField("More Lanes Needed", String.valueOf(report.laneShortfall()), true)
                             .addField("Shulker Spots Available",
                                     String.valueOf(report.laneStorage().totalAssignableShulkerSlots()), true)
-                            .addField("Shulker Spots Needed",
+                            .addField("Shulker Spots Needed Now",
                                     String.valueOf(report.laneStorage().totalRequiredShulkerSlots()), true)
+                            .addField("Spots After Full Compaction",
+                                    String.valueOf(report.laneStorage().totalCompactedShulkerSlots()), true)
+                            .addField("Spots Compaction Can Free",
+                                    String.valueOf(report.laneStorage().totalReclaimableShulkerSlots()), true)
                             .addField("Double-Chest Space Now",
                                     String.format(Locale.ROOT, "%.2f",
                                             construction.existingAssignableDoubleChestEquivalent()), true)
-                            .addField("Double Chests Needed Altogether",
+                            .addField("Double Chests Needed Now",
                                     String.valueOf(construction.requiredDedicatedDoubleChests()), true)
+                            .addField("Double Chests After Compaction",
+                                    String.valueOf(construction.compactedRequiredDedicatedDoubleChests()), true)
                             .addField("New Lanes To Make",
                                     String.valueOf(construction.newLanesToBuild()), true)
                             .addField("Lanes To Make Bigger",
@@ -1181,21 +1206,52 @@ public class StashCommand extends Command {
                             .addField("Mixed / Unclassified",
                                     report.mixedShulkers() + " / " + report.unclassifiedShulkers(), true);
 
+                    if (!report.laneStorage().unresolvedStackSizeClasses().isEmpty()) {
+                        String unresolved = String.join(", ",
+                                report.laneStorage().unresolvedStackSizeClasses());
+                        if (unresolved.length() > 1000) unresolved = unresolved.substring(0, 997) + "...";
+                        embed.addField("Stack Sizes We Couldn't Verify",
+                                unresolved + "\nCounted as non-stackable so the plan stays safe.", false);
+                    }
+
                     switch (report.status()) {
                         case READY -> embed.description("Everything has a lane with enough room. You're good to start organizing.")
                                 .successColor();
-                        case INSUFFICIENT_LANES -> embed.description("You're short " + report.laneShortfall()
-                                        + " lane(s). Make those, then scan again before you organize.")
-                                .errorColor();
-                        case INSUFFICIENT_LANE_STORAGE -> embed.description("You have enough lanes, but some of them are too small. Check the build list below for exactly what to add.")
-                                .errorColor();
+                        case INSUFFICIENT_LANES -> {
+                            if (canStageShortage) {
+                                embed.description("You're short " + report.laneShortfall()
+                                                + " permanent lane(s), but organization can continue. New reconciled boxes will wait in your import chests.")
+                                        .inQueueColor();
+                            } else {
+                                embed.description("You're short " + report.laneShortfall()
+                                                + " lane(s). Make those, or register an import chest for temporary staging.")
+                                        .errorColor();
+                            }
+                        }
+                        case INSUFFICIENT_LANE_STORAGE -> {
+                            if (canStageShortage) {
+                                embed.description("Some lanes are too small, but organization can continue. New reconciled boxes without room will wait in your import chests.")
+                                        .inQueueColor();
+                            } else {
+                                embed.description("You have enough lanes, but some are too small. Check the build list or register an import chest for temporary staging.")
+                                        .errorColor();
+                            }
+                        }
                         case NEEDS_FRESH_SCAN -> embed.description("Some shulkers still aren't identified. Run a fresh stash scan before you organize.")
                                 .errorColor();
                         case NEEDS_FRESH_CONTAINER_SCAN -> embed.description("Some double chests came from an older scan. Scan the stash again so we can count them properly.")
                                 .errorColor();
                         case REGION_NOT_DEFINED -> embed.description("Set the stash corners with pos1 and pos2 first.").errorColor();
                         case NO_SCANNED_CONTAINERS -> embed.description("Scan the stash first so there's something to work from.").errorColor();
-                        case NO_LANES_DETECTED -> embed.description("The last scan didn't find any storage lanes.").errorColor();
+                        case NO_LANES_DETECTED -> {
+                            if (canStageShortage) {
+                                embed.description("No permanent lanes were found. Reconciliation can still pack loose items into your import chests for now.")
+                                        .inQueueColor();
+                            } else {
+                                embed.description("The last scan didn't find any storage lanes or registered import staging.")
+                                        .errorColor();
+                            }
+                        }
                     }
 
                     if (!report.storageClasses().isEmpty()) {
@@ -1211,8 +1267,12 @@ public class StashCommand extends Command {
                                         + " → Lane " + allocation.lane().id() + ": "
                                         + LaneConstructionPlan.doubleChestsForSlots(
                                             allocation.demand().requiredShulkerSlots())
-                                        + " double chest(s) minimum ("
+                                        + " double chest(s) now, "
+                                        + LaneConstructionPlan.doubleChestsForSlots(
+                                            allocation.demand().compactedShulkerSlots())
+                                        + " after compaction ("
                                         + allocation.demand().requiredShulkerSlots()
+                                        + "→" + allocation.demand().compactedShulkerSlots()
                                         + "/" + allocation.lane().shulkerSlots()
                                         + " shulker slots)")
                                 .collect(Collectors.joining("\n"));
@@ -1223,7 +1283,8 @@ public class StashCommand extends Command {
                         String oversized = report.laneStorage().unassigned().stream()
                                 .limit(20)
                                 .map(demand -> demand.storageClass() + " (needs "
-                                        + demand.requiredShulkerSlots() + " slots)")
+                                        + demand.requiredShulkerSlots() + " now, "
+                                        + demand.compactedShulkerSlots() + " compacted)")
                                 .collect(Collectors.joining(", "));
                         embed.addField("Items With Nowhere To Go Yet", oversized, false);
                     }
@@ -1300,8 +1361,7 @@ public class StashCommand extends Command {
                 .then(literal("stop")
                     .executes(c -> {
                         var organizer = module.getOrganizer();
-                        if (organizer != null && organizer.isActive()) {
-                            organizer.stop();
+                        if (organizer != null && module.stopOrganizer()) {
                             c.getSource().getEmbed()
                                 .title("Organizer Stopped")
                                 .addField("Completed", String.valueOf(organizer.getCompletedTasks()), true)
@@ -1316,6 +1376,48 @@ public class StashCommand extends Command {
                         return OK;
                     })
                 )
+                .then(literal("resume")
+                    .executes(c -> {
+                        var organizer = module.getOrganizer();
+                        var embed = c.getSource().getEmbed().title("Organizer Resume");
+                        if (organizer == null || !organizer.hasDurableCheckpoint()) {
+                            embed.description("There is no restart checkpoint waiting to resume.")
+                                .primaryColor();
+                        } else if (module.requestOrganizerCheckpointResume()) {
+                            embed.description("Resume is armed. The organizer will continue after the normal cooldown and quiet checks.")
+                                .addField("Progress",
+                                    organizer.getCompletedTasks() + "/" + organizer.getTotalTasks(), true)
+                                .successColor();
+                        } else if (organizer.getDurableResumeBlocker() != null) {
+                            embed.description("The checkpoint is safe, but it cannot resume yet: "
+                                    + organizer.getDurableResumeBlocker() + ".")
+                                .errorColor();
+                        } else {
+                            embed.description("The checkpoint could not be armed for resume: "
+                                    + Objects.toString(organizer.getDurableRecoveryError(), "unknown checkpoint problem") + ".")
+                                .errorColor();
+                        }
+                        return OK;
+                    })
+                )
+                .then(literal("discard")
+                    .then(literal("confirm")
+                        .executes(c -> {
+                            var organizer = module.getOrganizer();
+                            var embed = c.getSource().getEmbed().title("Organizer Checkpoint");
+                            if (organizer == null || !organizer.hasDurableCheckpoint()) {
+                                embed.description("There is no saved organizer checkpoint to discard.")
+                                    .primaryColor();
+                            } else if (module.discardOrganizerCheckpoint()) {
+                                embed.description("The saved plan and queue were discarded. No game items were moved.")
+                                    .successColor();
+                            } else {
+                                embed.description("The checkpoint could not be discarded while the organizer is running.")
+                                    .errorColor();
+                            }
+                            return OK;
+                        }))
+                )
                 .then(literal("status")
                     .executes(c -> {
                         var organizer = module.getOrganizer();
@@ -1328,9 +1430,41 @@ public class StashCommand extends Command {
                         } else {
                             embed.addField("State", organizer.getState().name(), true);
                             embed.addField("Detail", organizer.getStatus(), false);
+                            embed.addField("Restart Safe",
+                                organizer.hasDurableCheckpoint() ? "Yes" : "No", true);
+                            if (organizer.isDurableRecoveryLoaded()) {
+                                String blocker = organizer.getDurableResumeBlocker();
+                                embed.addField("Restart Recovery",
+                                    blocker == null ? "Waiting for cooldown" : "Waiting: " + blocker,
+                                    false);
+                            } else if (organizer.getDurableRecoveryError() != null) {
+                                embed.addField("Checkpoint Problem",
+                                    organizer.getDurableRecoveryError(), false);
+                            }
+                            embed.addField("Task Handoffs",
+                                String.valueOf(module.getOrganizerPreemptionCount()), true);
+                            if (organizer.isYielded()) {
+                                embed.addField("Paused From",
+                                    String.valueOf(organizer.getYieldedFromState()), true);
+                                embed.addField("Minimum Resume Hold",
+                                    module.getOrganizerPreemptionCooldownRemainingSeconds() + "s", true);
+                            }
+                            if (module.getControlledJob()
+                                    == com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager.Job.ORGANIZE) {
+                                embed.addField("Proxy Control Grace",
+                                    module.getProxyControlGraceRemainingSeconds() + "s", true);
+                            }
                             if (organizer.getTotalTasks() > 0) {
                                 embed.addField("Progress",
                                     organizer.getCompletedTasks() + "/" + organizer.getTotalTasks(), true);
+                            }
+                            if (organizer.isUsingImportStaging() || organizer.getPermanentLaneGaps() > 0) {
+                                embed.addField("Boxes Waiting in Imports",
+                                    String.valueOf(organizer.getStagedShulkers()), true);
+                                embed.addField("Staged Item Types",
+                                    String.valueOf(organizer.getStagingStorageClassCount()), true);
+                                embed.addField("Permanent Lane Gaps",
+                                    String.valueOf(organizer.getPermanentLaneGaps()), true);
                             }
                         }
                         return OK;
@@ -1524,7 +1658,8 @@ public class StashCommand extends Command {
                 embed.addField("Scan Delay", config.scanDelayTicks + " ticks", true);
                 embed.addField("Open Timeout", config.openTimeoutTicks + " ticks", true);
                 embed.addField("Max Containers", String.valueOf(config.maxContainers), true);
-                embed.addField("Preemption Cooldown", config.scanPreemptionCooldownSeconds + " seconds", true);
+                embed.addField("Task Resume Cooldown", config.scanPreemptionCooldownSeconds + " seconds", true);
+                embed.addField("Proxy Control Grace", config.proxyControlGraceSeconds + " seconds", true);
                 embed.addField("Organizer Walk Timeout", config.organizerWalkTimeoutTicks + " ticks ("
                     + (config.organizerWalkTimeoutTicks / 20) + "s)", true);
                 embed.addField("Waypoint Distance", String.valueOf(config.waypointDistance), true);
@@ -1608,7 +1743,21 @@ public class StashCommand extends Command {
                             .title("Config Updated")
                             .description("scanPreemptionCooldownSeconds = "
                                 + config.scanPreemptionCooldownSeconds
-                                + " (applies to the next scan)")
+                                + " (applies to the next scan or organize job)")
+                            .successColor();
+                        return OK;
+                    })
+                )
+            )
+            .then(literal("controlGrace")
+                .then(argument("seconds", integer(60, 3600))
+                    .executes(c -> {
+                        config.proxyControlGraceSeconds = IntegerArgumentType.getInteger(c, "seconds");
+                        c.getSource().getEmbed()
+                            .title("Config Updated")
+                            .description("proxyControlGraceSeconds = "
+                                + config.proxyControlGraceSeconds
+                                + " (applies to the next controlling client connection)")
                             .successColor();
                         return OK;
                     })
@@ -2010,7 +2159,7 @@ public class StashCommand extends Command {
         }
         if (add && positions.stream().anyMatch(this::isIndexedLanePosition)) {
             embed.title("Import Chest Conflict")
-                .description("The targeted chest belongs to a detected storage lane. Lane inventories cannot also be intake-only imports.")
+                .description("The targeted chest belongs to a detected storage lane. A permanent lane cannot also be registered as an import.")
                 .errorColor();
             return OK;
         }

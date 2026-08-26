@@ -17,6 +17,7 @@ import java.util.Map;
  */
 public final class IndexedStorageGeometry {
     private final Map<Long, ContainerEntry> exactByPosition = new HashMap<>();
+    private final Map<Long, ContainerEntry> knownFootprintByPosition = new HashMap<>();
     private final Map<Long, ContainerEntry> doubleByInventory = new HashMap<>();
 
     public IndexedStorageGeometry(Collection<ContainerEntry> containers) {
@@ -26,6 +27,16 @@ public final class IndexedStorageGeometry {
             exactByPosition.merge(entry.posKey(), entry, IndexedStorageGeometry::freshest);
             if (entry.isDouble() && entry.inventoryIdentityKnown()) {
                 doubleByInventory.merge(entry.inventoryKey(), entry, IndexedStorageGeometry::freshest);
+                if (entry.doubleChestAxis() != null) {
+                    knownFootprintByPosition.merge(
+                            posKey(entry.inventoryX(), entry.inventoryY(), entry.inventoryZ()),
+                            entry, IndexedStorageGeometry::freshest);
+                    int partnerX = entry.inventoryX() + ("X".equals(entry.doubleChestAxis()) ? 1 : 0);
+                    int partnerZ = entry.inventoryZ() + ("Z".equals(entry.doubleChestAxis()) ? 1 : 0);
+                    knownFootprintByPosition.merge(
+                            posKey(partnerX, entry.inventoryY(), partnerZ),
+                            entry, IndexedStorageGeometry::freshest);
+                }
             }
         }
     }
@@ -38,6 +49,12 @@ public final class IndexedStorageGeometry {
         ContainerEntry exact = exactByPosition.get(posKey(x, y, z));
         if (exact != null) return exact;
 
+        ContainerEntry knownFootprint = knownFootprintByPosition.get(posKey(x, y, z));
+        if (knownFootprint != null) return knownFootprint;
+
+        // Legacy rows predate persisted footprint axes. Keep their positive-half fallback
+        // available for read-only compatibility; organizer safety requires a fresh scan before
+        // those ambiguous rows can become movement destinations.
         ContainerEntry west = doubleByInventory.get(posKey(x - 1, y, z));
         ContainerEntry north = doubleByInventory.get(posKey(x, y, z - 1));
         if (preferredDx != 0) return west != null ? west : north;

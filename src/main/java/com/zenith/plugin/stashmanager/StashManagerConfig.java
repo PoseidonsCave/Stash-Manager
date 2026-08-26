@@ -14,9 +14,11 @@ public class StashManagerConfig {
     public int openTimeoutTicks = 400;
     public int maxContainers = 2048;
     public int waypointDistance = 48;
-    // A scan yields shared Baritone/inventory control to other plugins, then waits at least
-    // this long before resuming. This leaves enough time for distant pearl-stasis jobs.
+    // Long stash jobs yield shared automation, then wait this long before resuming.
     public int scanPreemptionCooldownSeconds = 300;
+    // A controlling proxy client must switch to spectator inside this window or the paused
+    // scan/organize checkpoint is discarded. Completed world changes are not rolled back.
+    public int proxyControlGraceSeconds = 600;
     public List<int[]> supplyChests = new ArrayList<>();
 
     // Return-to-start: pathfind the bot back to its initial position after scanning

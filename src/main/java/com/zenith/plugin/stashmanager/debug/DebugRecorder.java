@@ -18,6 +18,7 @@ import java.util.List;
 public final class DebugRecorder {
 
     private static final int MAX_EVENTS = 500;
+    private static final int MAX_DETAIL_LENGTH = 1000;
     private final Deque<DebugEvent> events = new ArrayDeque<>(MAX_EVENTS);
 
     public synchronized void record(String stage, String detail) {
@@ -79,7 +80,9 @@ public final class DebugRecorder {
     private static String compact(@Nullable String text) {
         if (text == null) return "";
         String singleLine = text.replaceAll("[\\r\\n]+", " ").strip();
-        return singleLine.length() <= 300 ? singleLine : singleLine.substring(0, 297) + "...";
+        return singleLine.length() <= MAX_DETAIL_LENGTH
+            ? singleLine
+            : singleLine.substring(0, MAX_DETAIL_LENGTH - 3) + "...";
     }
 
     public record DebugEvent(String timestamp, String stage, String detail, @Nullable String stackTrace) {
