@@ -131,6 +131,7 @@ public final class StashOrganizer {
         final int slot;
         final int itemId;
         final int amount;
+        final int taskCargoUnitsBefore;
         final RequestFuture request;
         int verificationTicks;
 
@@ -138,11 +139,13 @@ public final class StashOrganizer {
                 int containerId,
                 int slot,
                 ItemStack source,
+                int taskCargoUnitsBefore,
                 RequestFuture request) {
             this.containerId = containerId;
             this.slot = slot;
             this.itemId = source.getId();
             this.amount = source.getAmount();
+            this.taskCargoUnitsBefore = taskCargoUnitsBefore;
             this.request = request;
         }
     }
@@ -236,6 +239,10 @@ public final class StashOrganizer {
             return new MoveTask(source, newDestination, itemId, shulkerContentFilter,
                     alreadyInInventory, mixedDecomposition, mixedBatchConsolidation, mixedContents);
         }
+        MoveTask withShulkerFingerprint(String fingerprint) {
+            return new MoveTask(source, destination, itemId, fingerprint,
+                    alreadyInInventory, mixedDecomposition, mixedBatchConsolidation, mixedContents);
+        }
         static MoveTask mixedBatch(int[] source, int[] destination, String itemId) {
             return new MoveTask(source, destination, itemId, null,
                     false, false, true, Map.of());
@@ -317,8 +324,9 @@ public final class StashOrganizer {
     private final List<int[]> stagingImportDestinations = new ArrayList<>();
     private final Set<Long> packStoreTriedDestinations = new HashSet<>();
     private final Set<Long> emptyShulkerStagingTriedDestinations = new HashSet<>();
-    // Runtime capacity evidence is stronger than the pre-run scan. Once a live import window
-    // rejects cargo, do not make every later transaction walk back to it and rediscover that.
+    // A live success is useful cadence evidence only for the same cargo class. Rejections stay
+    // transaction-local because a chest that rejects an unstackable box may accept another
+    // item into a partial stack, and import contents can change during a multi-hour run.
     private final ImportDestinationTracker importDestinationTracker =
             new ImportDestinationTracker();
     private final Set<Long> overflowTriedDestinations = new HashSet<>();
@@ -334,6 +342,7 @@ public final class StashOrganizer {
 
     private int totalTasks;
     private int completedTasks;
+    private int generatedLooseTasks;
     private int nextProgressMilestone = ProgressMilestones.FIRST;
 
     // The plan is written only when tasks are added. Small checkpoints then refer to stable
@@ -375,6 +384,7 @@ public final class StashOrganizer {
     private int shulkerRecoveryBreakAttempts;
     private volatile boolean temporaryShulkerOutstanding;
     private volatile boolean temporaryShulkerPickupConfirmed;
+    private volatile String temporaryShulkerPickupFingerprint;
     private boolean stopAfterShulkerRecovery;
     private String shulkerRecoveryTrigger;
     private int shulkerPickupSweepAttempt;
@@ -386,6 +396,8 @@ public final class StashOrganizer {
     // mistaken for returned-kit cargo even when they share the same item id.
     private boolean mixedDecompositionMode;
     private boolean mixedBoxDrained;
+    private String mixedStagingCargoKey;
+    private String mixedStagingCargoItemId;
     private int decomposedMixedShulkers;
     private int mixedPendingSourceSlot = -1;
     private int mixedPendingCargoSlot = -1;
@@ -458,6 +470,7 @@ public final class StashOrganizer {
     public int getStagingStorageClassCount() { return stagingStorageClassesPlanned.size(); }
     public int getPermanentLaneGaps() { return permanentLaneGaps; }
     public int getDecomposedMixedShulkers() { return decomposedMixedShulkers; }
+    public int getGeneratedLooseTasks() { return generatedLooseTasks; }
     public boolean isUsingImportStaging() { return !stagingStorageClassesPlanned.isEmpty(); }
     public boolean isYielded() { return state == State.YIELDED; }
     public State getYieldedFromState() { return yieldedFromState; }
@@ -606,6 +619,7 @@ public final class StashOrganizer {
         mixedBatchConsolidationMode = checkpoint.mixedBatchConsolidationMode();
         mixedBoxDrained = checkpoint.mixedBoxDrained();
         decomposedMixedShulkers = checkpoint.decomposedMixedShulkers();
+        generatedLooseTasks = checkpoint.generatedLooseTasks();
         mixedPendingSourceSlot = checkpoint.mixedDecompositionMode()
                 ? checkpoint.mixedPendingSourceSlot()
                 : -1;
@@ -1094,6 +1108,7 @@ public final class StashOrganizer {
         stagedStorageClasses.clear();
         stagedShulkers = 0;
         decomposedMixedShulkers = 0;
+        generatedLooseTasks = 0;
         permanentLaneGaps = 0;
         packDestinationOpenFailures = 0;
         packStoreMatchingShulkersBefore = 0;
@@ -1181,6 +1196,7 @@ public final class StashOrganizer {
         stagedStorageClasses.clear();
         stagedShulkers = 0;
         decomposedMixedShulkers = 0;
+        generatedLooseTasks = 0;
         permanentLaneGaps = 0;
         packDestinationOpenFailures = 0;
         packStoreMatchingShulkersBefore = 0;
@@ -1265,11 +1281,20 @@ public final class StashOrganizer {
         double dz = entity.getZ() - (shulkerPlacePos[2] + 0.5);
         if (dx * dx + dy * dy + dz * dz > SHULKER_PICKUP_EVIDENCE_RADIUS_SQ) return;
 
+        String collectedItemId = itemIdFromStack(collected);
+        if (mixedDecompositionMode
+                && (currentTask == null || !currentTask.itemId().equals(collectedItemId))) {
+            return;
+        }
+        if (mixedDecompositionMode) {
+            temporaryShulkerPickupFingerprint = ShulkerClassification.classify(
+                    ItemIdentifier.readShulkerContents(collected)).fingerprint();
+        }
         if (!temporaryShulkerPickupConfirmed) {
             temporaryShulkerPickupConfirmed = true;
             emit("organize_shulker_pickup_confirmed", Map.of(
                     "evidence", "take_item_entity",
-                    "item_id", itemIdFromStack(collected),
+                    "item_id", collectedItemId,
                     "item_count", packet.getItemCount()
             ));
         }
@@ -2210,7 +2235,43 @@ public final class StashOrganizer {
             }
         }
 
-        return sortAndReindex(columns);
+        return deduplicateOverlappingColumns(columns, containers);
+    }
+
+    /** A physical inventory belongs to exactly one lane, even if two detectors claim it. */
+    static List<Column> deduplicateOverlappingColumns(
+            Collection<Column> rawColumns,
+            Collection<ContainerEntry> containers) {
+        if (rawColumns == null || rawColumns.isEmpty()) return List.of();
+        Map<Long, ContainerEntry> byPosition = new LinkedHashMap<>();
+        if (containers != null) {
+            for (ContainerEntry entry : containers) {
+                if (entry != null) {
+                    byPosition.merge(entry.posKey(), entry, StashOrganizer::freshest);
+                }
+            }
+        }
+
+        List<Column> ordered = sortAndReindex(new ArrayList<>(rawColumns));
+        Set<Long> claimedInventories = new HashSet<>();
+        List<Column> unique = new ArrayList<>();
+        for (Column column : ordered) {
+            Set<Long> laneInventories = new LinkedHashSet<>();
+            for (int[] position : column.chests()) {
+                long positionKey = posKey(position[0], position[1], position[2]);
+                ContainerEntry entry = byPosition.get(positionKey);
+                laneInventories.add(entry == null
+                        ? positionKey
+                        : storageIdentityKey(entry));
+            }
+            if (laneInventories.isEmpty()
+                    || laneInventories.stream().anyMatch(claimedInventories::contains)) {
+                continue;
+            }
+            claimedInventories.addAll(laneInventories);
+            unique.add(column);
+        }
+        return sortAndReindex(unique);
     }
 
     /** Detect hopper lanes and direct-access stacked banks within one mixed stash. */
@@ -2242,7 +2303,7 @@ public final class StashOrganizer {
             columns.addAll(detectColumns(positions));
         }
 
-        return sortAndReindex(columns);
+        return deduplicateOverlappingColumns(columns, containers);
     }
 
     private static List<Column> detectStackedColumns(
@@ -2765,7 +2826,8 @@ public final class StashOrganizer {
                 movedThisVisit++;
                 taskCargo.recordDeposited(transfer.movedAmount());
                 if (isImportStagingMoveTask(currentTask)) {
-                    recordWritableImportDestination(currentTask.destination());
+                    recordWritableImportDestination(
+                            currentTask.destination(), currentTaskCargoRoutingKey());
                 }
             }
             if (transfer.outcome() == QuickMoveOutcome.CONFIRMED_DRAINED) {
@@ -2812,7 +2874,9 @@ public final class StashOrganizer {
                     // Admission is cargo-specific. A container with no empty slots may still
                     // accept a partial stack, while an "empty" slot estimate from the scan may
                     // already be stale after earlier reconciliation transactions.
-                    if (!containerCanAccept(open, chestSlots, stack)) {
+                    ContainerAdmission admission = inspectContainerAdmission(
+                            open, chestSlots, stack);
+                    if (!admission.canAccept()) {
                         // Chest full — try cascading to next chest in column
                         closeCurrentContainer();
                         boolean importDestination = isImportStagingMoveTask(currentTask);
@@ -2824,12 +2888,13 @@ public final class StashOrganizer {
                                         isShulkerBoxItem(currentTask.itemId()));
                         switch (action) {
                             case TRY_ALTERNATE_IMPORT -> {
-                                if (switchImportStagingMoveDestination()) return;
+                                if (switchImportStagingMoveDestination(
+                                        admission, cargoRoutingKey(stack), itemIdFromStack(stack))) return;
                                 abortWithCargo(
                                         isEmptyShulkerStagingTask(currentTask)
                                                 ? "empty_shulker_staging_full_with_cargo"
                                                 : "import_staging_full_with_cargo",
-                                        "Every registered import chest rejected this cargo. It is preserved in inventory.");
+                                        "No registered import chest can accept this cargo. It is preserved in inventory.");
                             }
                             case STAGE_SHULKER_IN_IMPORT -> {
                                 if (rerouteCurrentCargoToImportStaging("shulker_lane_full")) return;
@@ -2897,10 +2962,15 @@ public final class StashOrganizer {
         int actualPercent = totalTasks <= 0 ? 0
                 : (int) Math.min(100L, ((long) completedTasks * 100L) / totalTasks);
         info("Progress: " + completedTasks + "/" + totalTasks
-                + " (" + crossing.milestonePercent() + "% milestone)");
+                + " (" + crossing.milestonePercent() + "% milestone; mixed boxes "
+                + decomposedMixedShulkers + "; generated loose tasks "
+                + generatedLooseTasks + ")");
         emit("organize_progress", Map.of(
                 "milestone_percent", crossing.milestonePercent(),
-                "progress_percent", actualPercent
+                "progress_percent", actualPercent,
+                "remaining_tasks", Math.max(0, totalTasks - completedTasks),
+                "decomposed_mixed_shulkers", decomposedMixedShulkers,
+                "generated_loose_tasks", generatedLooseTasks
         ));
     }
 
@@ -3080,7 +3150,8 @@ public final class StashOrganizer {
                 taskCargo.recordDeposited(taskCargo.remaining());
                 packStoreVerificationTicks = 0;
                 if (isImportStagingPack()) {
-                    recordWritableImportDestination(packDestination);
+                    recordWritableImportDestination(
+                            packDestination, packedCargoRoutingKey());
                 }
             }
             if (transfer.outcome() != QuickMoveOutcome.WAITING) {
@@ -3200,7 +3271,7 @@ public final class StashOrganizer {
         List<int[]> writableImports = orderedWritableImportDestinations();
         if (writableImports.isEmpty()) {
             abortWithCargo("mixed_staging_capacity_exhausted",
-                    "No registered import chest has remaining live capacity. The mixed box remains in its source or inventory.");
+                    "No registered import chest is available. The mixed box remains in its source or inventory.");
             return;
         }
         // Planning is a snapshot. Route each new transaction through the latest confirmed
@@ -3209,6 +3280,8 @@ public final class StashOrganizer {
         resetTemporaryShulkerState();
         mixedDecompositionMode = true;
         mixedBoxDrained = false;
+        mixedStagingCargoKey = null;
+        mixedStagingCargoItemId = null;
         mixedCargoSlots.clear();
         mixedStagingUsedDestinations.clear();
         mixedUnavailableStagingDestinations.clear();
@@ -3234,6 +3307,7 @@ public final class StashOrganizer {
                     ? 0 : countCompatibleBulkShulkersInInventory(packItemId);
             temporaryShulkerOutstanding = true;
             temporaryShulkerPickupConfirmed = false;
+            temporaryShulkerPickupFingerprint = null;
             stopAfterShulkerRecovery = false;
             beginTemporaryShulkerRecovery(ORPHANED_WORKSITE_RECOVERY);
             return;
@@ -3284,6 +3358,7 @@ public final class StashOrganizer {
                 ? 0
                 : countCompatibleBulkShulkersInInventory(packItemId);
         temporaryShulkerPickupConfirmed = false;
+        temporaryShulkerPickupFingerprint = null;
         if (!moveShulkerToHotbar(shulkerSlot)) {
             abortWithCargo("safe_hotbar_slot_unavailable",
                     "No unprotected hotbar slot is available for the reconciliation shulker.");
@@ -3542,8 +3617,17 @@ public final class StashOrganizer {
 
     private void beginMixedSourceClose(boolean drained) {
         mixedBoxDrained = drained;
+        // Each inventory load is a new staging transaction. A chest that rejected an
+        // earlier batch may have gained room after other cargo moved, and carrying those
+        // rejections into another batch of the same item eventually produces a false
+        // "all imports full" result.
+        resetRejectedImportsForNewBatch(mixedUnavailableStagingDestinations);
         state = State.MIXED_SOURCE_CLOSING;
         actionCooldown = 0;
+    }
+
+    static void resetRejectedImportsForNewBatch(Set<Long> rejectedImports) {
+        if (rejectedImports != null) rejectedImports.clear();
     }
 
     private void tickMixedSourceClosing() {
@@ -3583,8 +3667,7 @@ public final class StashOrganizer {
         if (containerDataReceived) {
             if (awaitLiveOpenContainer() == null) {
                 if (containerCacheReadyTimedOut()) {
-                    mixedUnavailableStagingDestinations.add(posKey(
-                            packDestination[0], packDestination[1], packDestination[2]));
+                    mixedUnavailableStagingDestinations.add(importInventoryKey(packDestination));
                     if (!switchMixedStagingDestination()) {
                         recoverMixedShulkerAndStop("mixed_staging_cache_sync_timeout",
                                 "No import chest produced a usable live window; recovering the mixed shulker before stopping.");
@@ -3601,8 +3684,7 @@ public final class StashOrganizer {
         openWaitTicks++;
         if (openWaitTicks > organizerOpenTimeoutTicks()) {
             BARITONE.stop();
-            mixedUnavailableStagingDestinations.add(posKey(
-                    packDestination[0], packDestination[1], packDestination[2]));
+            mixedUnavailableStagingDestinations.add(importInventoryKey(packDestination));
             if (!switchMixedStagingDestination()) {
                 recoverMixedShulkerAndStop("mixed_staging_open_timeout",
                         "No registered import chest could be opened; recovering the placed mixed shulker before stopping.");
@@ -3631,7 +3713,7 @@ public final class StashOrganizer {
             if (transfer.outcome() == QuickMoveOutcome.CONFIRMED_DRAINED) {
                 mixedCargoSlots.removeIf(rawSlot ->
                         rawPlayerSlotToWindowSlot(chestSlots, rawSlot) == transfer.slot());
-                recordWritableImportDestination(packDestination);
+                recordWritableImportDestination(packDestination, mixedStagingCargoKey);
                 persistDurableCheckpoint(State.MIXED_STAGE_DEPOSIT);
             }
             if (transfer.outcome() != QuickMoveOutcome.WAITING) {
@@ -3648,15 +3730,24 @@ public final class StashOrganizer {
                 cargo.remove();
                 continue;
             }
-            if (!containerCanAccept(open, chestSlots, stack)) {
+            String nextCargoKey = cargoRoutingKey(stack);
+            if (!Objects.equals(nextCargoKey, mixedStagingCargoKey)) {
+                // A rejection applies to this exact loose stack class only. The same import
+                // may still merge the next class even when it has no empty slots.
+                mixedUnavailableStagingDestinations.clear();
+            }
+            mixedStagingCargoKey = nextCargoKey;
+            mixedStagingCargoItemId = itemIdFromStack(stack);
+            ContainerAdmission admission = inspectContainerAdmission(open, chestSlots, stack);
+            if (!admission.canAccept()) {
                 closeCurrentContainer();
-                long fullKey = posKey(
-                        packDestination[0], packDestination[1], packDestination[2]);
+                long fullKey = importInventoryKey(packDestination);
                 mixedUnavailableStagingDestinations.add(fullKey);
-                importDestinationTracker.recordSaturated(fullKey);
-                if (!switchMixedStagingDestination()) {
+                importDestinationTracker.recordRejected(fullKey, mixedStagingCargoKey);
+                if (!switchMixedStagingDestination(admission)) {
                     recoverMixedShulkerAndStop("mixed_staging_full",
-                            "All registered import chests are full; recovering the placed mixed shulker before stopping.");
+                            "No registered import chest can accept the current mixed cargo; recovering the placed shulker before stopping."
+                                    + mixedStagingCapacitySummary());
                 }
                 return;
             }
@@ -3685,15 +3776,33 @@ public final class StashOrganizer {
     }
 
     private boolean switchMixedStagingDestination() {
+        return switchMixedStagingDestination(null);
+    }
+
+    private boolean switchMixedStagingDestination(ContainerAdmission rejectedAdmission) {
         closeCurrentContainer();
-        for (int[] candidate : orderedWritableImportDestinations()) {
-            long key = posKey(candidate[0], candidate[1], candidate[2]);
+        if (rejectedAdmission != null) {
+            emit("organize_mixed_staging_capacity_rejected", importCapacityDetails(
+                    rejectedAdmission,
+                    mixedUnavailableStagingDestinations.size(),
+                    mixedStagingCargoItemId));
+        }
+        for (int[] candidate : orderedWritableImportDestinations(
+                mixedStagingCargoKey, mixedStagingCargoItemId)) {
+            long key = importInventoryKey(candidate);
             if (!mixedUnavailableStagingDestinations.contains(key)) {
                 startMixedStageWalk(candidate);
                 return true;
             }
         }
         return false;
+    }
+
+    private String mixedStagingCapacitySummary() {
+        int available = orderedWritableImportDestinations(
+                mixedStagingCargoKey, mixedStagingCargoItemId).size();
+        return " Live checks tried " + mixedUnavailableStagingDestinations.size()
+                + " of " + available + " registered import inventories.";
     }
 
     private void recoverMixedShulkerAndStop(String reason, String message) {
@@ -3703,18 +3812,56 @@ public final class StashOrganizer {
         beginTemporaryShulkerRecovery(reason);
     }
 
-    private static boolean containerCanAccept(Container open, int chestSlots, ItemStack cargo) {
+    private record ContainerAdmission(
+            int containerSlots,
+            int emptySlots,
+            int matchingHeadroom,
+            int maxStackSize) {
+        boolean canAccept() {
+            return emptySlots > 0 || matchingHeadroom > 0;
+        }
+
+        long totalUnitHeadroom() {
+            return (long) emptySlots * maxStackSize + matchingHeadroom;
+        }
+    }
+
+    private static ContainerAdmission inspectContainerAdmission(
+            Container open,
+            int chestSlots,
+            ItemStack cargo) {
         ItemData cargoData = ItemRegistry.REGISTRY.get(cargo.getId());
         int maxStack = cargoData == null ? 1 : Math.max(1, cargoData.stackSize());
+        int emptySlots = 0;
+        int matchingHeadroom = 0;
         for (int slot = 0; slot < chestSlots; slot++) {
             ItemStack target = open.getItemStack(slot);
-            if (target == null || target.getAmount() <= 0) return true;
+            if (target == null || target.getAmount() <= 0) {
+                emptySlots++;
+                continue;
+            }
             if (target.getId() == cargo.getId() && target.getAmount() < maxStack
                     && Objects.equals(target.getDataComponents(), cargo.getDataComponents())) {
-                return true;
+                matchingHeadroom += maxStack - target.getAmount();
             }
         }
-        return false;
+        return new ContainerAdmission(chestSlots, emptySlots, matchingHeadroom, maxStack);
+    }
+
+    private static Map<String, Object> importCapacityDetails(
+            ContainerAdmission admission,
+            int destinationsTried,
+            String cargoItemId) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("reason", "import_destination_incompatible");
+        details.put("cargo_item", Objects.requireNonNullElse(cargoItemId, "unknown"));
+        details.put("container_slots", admission.containerSlots());
+        details.put("empty_slots", admission.emptySlots());
+        details.put("matching_headroom", admission.matchingHeadroom());
+        details.put("total_unit_headroom", admission.totalUnitHeadroom());
+        details.put("max_stack_size", admission.maxStackSize());
+        details.put("destinations_tried", destinationsTried);
+        return details;
     }
 
     private void rememberMixedStagingDestination(int[] destination) {
@@ -3922,6 +4069,7 @@ public final class StashOrganizer {
 
         completedTasks++;
         decomposedMixedShulkers++;
+        generatedLooseTasks += batch.size();
         // The empty shell is organizer-owned cargo. Stage it before touching any generated
         // loose-item task so each completed mixed box frees one real inventory slot.
         List<int[]> writableImports = orderedWritableImportDestinations();
@@ -4065,9 +4213,15 @@ public final class StashOrganizer {
                 return;
             }
             if (stopAfterShulkerRecovery) {
-                resetTemporaryShulkerState();
-                if ("manual_stop".equals(recoveredTrigger)) finishStop();
-                else finishStop(recoveredTrigger);
+                if ("manual_stop".equals(recoveredTrigger)) {
+                    resetTemporaryShulkerState();
+                    finishStop();
+                } else if (isResumableStagingCapacityFailure(recoveredTrigger)) {
+                    finishResumableStagingStop(recoveredTrigger);
+                } else {
+                    resetTemporaryShulkerState();
+                    finishStop(recoveredTrigger);
+                }
                 return;
             }
             if (mixedDecompositionMode) {
@@ -4138,6 +4292,102 @@ public final class StashOrganizer {
                         ? "resume_after_manual_recovery" : "manual_recovery_without_checkpoint")
         ));
         state = State.DONE;
+    }
+
+    static boolean isResumableStagingCapacityFailure(String reason) {
+        return "mixed_staging_full".equals(reason)
+                || "mixed_staging_destination_missing".equals(reason);
+    }
+
+    static State stagingCapacityResumeState(boolean cargoPending, boolean boxDrained) {
+        if (cargoPending) return State.MIXED_STAGE_WALK;
+        return boxDrained ? State.MIXED_RETURN_WALK : State.SHULKER_STATION_WALK;
+    }
+
+    /** Stop safely without discarding a multi-hour plan after import capacity is exhausted. */
+    private void finishResumableStagingStop(String reason) {
+        BARITONE.stop();
+        clearOwnedAutomation();
+        closeCurrentContainer();
+        restoreBaritoneBreaking();
+        restorePlaceBlockSneak();
+
+        temporaryShulkerOutstanding = false;
+        stopAfterShulkerRecovery = false;
+        shulkerRecoveryTrigger = null;
+        shulkerRecoveryBreakAttempts = 0;
+        shulkerPlaceFuture = null;
+        shulkerBreakFuture = null;
+        shulkerBreakAttemptGate.clear();
+        resetShulkerPickupSweep();
+        boolean recoveredBoxIdentified = refreshRecoveredMixedShulkerFingerprint();
+        temporaryShulkerPickupConfirmed = false;
+        temporaryShulkerPickupFingerprint = null;
+        shulkerPlacePos = reconciliationWorksite;
+
+        State resumeState = stagingCapacityResumeState(
+                !mixedCargoSlots.isEmpty(), mixedBoxDrained);
+        boolean checkpointPreserved = recoveredBoxIdentified
+                && persistDurableCheckpoint(resumeState);
+        if (!recoveredBoxIdentified) clearDurableJournal();
+        state = State.DONE;
+        emit("organize_failed", Map.of(
+                "reason", reason,
+                "terminal", true,
+                "cargo_preserved", true,
+                "cargo_state", "inventory",
+                "checkpoint_preserved", checkpointPreserved,
+                "temporary_shulker_recovered", true,
+                "recovered_shulker_identified", recoveredBoxIdentified,
+                "resume_state", resumeState.name(),
+                "recovery_disposition", checkpointPreserved
+                        ? "clear_or_add_import_storage_then_resume"
+                        : "fresh_scan_required"
+        ));
+        info(checkpointPreserved
+                ? "Organizer paused with cargo recovered. Clear or add import storage, then run /stash organize resume."
+                : "Organizer stopped after recovering the temporary shulker, but its checkpoint could not be saved.");
+    }
+
+    /** A partially drained box has a new fingerprint; persist it before a later resume. */
+    private boolean refreshRecoveredMixedShulkerFingerprint() {
+        if (!mixedDecompositionMode || currentTask == null) return false;
+        if (mixedBoxDrained) return true;
+        if (temporaryShulkerPickupFingerprint != null) {
+            currentTask = currentTask
+                    .withShulkerFingerprint(temporaryShulkerPickupFingerprint)
+                    .markAlreadyInInventory();
+            return true;
+        }
+        Container inventory = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (inventory == null) return false;
+
+        List<ShulkerClassification> candidates = new ArrayList<>();
+        for (int slot = 9; slot <= 44; slot++) {
+            if (isProtectedInventorySlot(slot)) continue;
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0
+                    || !currentTask.itemId().equals(itemIdFromStack(stack))) continue;
+            ShulkerClassification classification = ShulkerClassification.classify(
+                    ItemIdentifier.readShulkerContents(stack));
+            if (currentTask.shulkerContentFilter().equals(classification.fingerprint())) {
+                // Capacity recovery happens after at least one stack left the box. An
+                // unchanged fingerprint therefore belongs to a different, identical box.
+                continue;
+            }
+            candidates.add(classification);
+        }
+        if (candidates.size() == 1) {
+            currentTask = currentTask
+                    .withShulkerFingerprint(candidates.get(0).fingerprint())
+                    .markAlreadyInInventory();
+            return true;
+        }
+        emit("organize_target_failed", Map.of(
+                "reason", "recovered_mixed_shulker_identity_ambiguous",
+                "candidate_count", candidates.size()
+        ));
+        return false;
     }
 
     // CRAFTING SHULKER BOXES
@@ -4346,7 +4596,8 @@ public final class StashOrganizer {
             if (transfer.outcome() == QuickMoveOutcome.CONFIRMED_DRAINED
                     || transfer.outcome() == QuickMoveOutcome.CONFIRMED_PARTIAL) {
                 taskCargo.recordDeposited(transfer.movedAmount());
-                recordWritableImportDestination(overflowChestPos);
+                recordWritableImportDestination(
+                        overflowChestPos, currentTaskCargoRoutingKey());
             }
             if (transfer.outcome() == QuickMoveOutcome.CONFIRMED_DRAINED) {
                 actionSlotIndex++;
@@ -4368,10 +4619,13 @@ public final class StashOrganizer {
             int containerSlotIndex = rawPlayerSlotToWindowSlot(chestSlots, actionSlotIndex);
             ItemStack stack = open.getItemStack(containerSlotIndex);
             if (stack != null && stack.getAmount() > 0 && currentTaskOwnsStack(stack)) {
-                if (!containerCanAccept(open, chestSlots, stack)) {
-                    if (switchOverflowDestination()) return;
+                ContainerAdmission admission = inspectContainerAdmission(
+                        open, chestSlots, stack);
+                if (!admission.canAccept()) {
+                    if (switchOverflowDestination(
+                            admission, cargoRoutingKey(stack), itemIdFromStack(stack))) return;
                     abortWithCargo("overflow_full_with_cargo",
-                            "Every registered import chest rejected the current task cargo. It remains in inventory.");
+                            "No registered import chest can accept the current task cargo. It remains in inventory.");
                     return;
                 }
                 submitQuickMove(containerSlotIndex);
@@ -4390,15 +4644,20 @@ public final class StashOrganizer {
         advanceToNextTask();
     }
 
-    private boolean switchOverflowDestination() {
+    private boolean switchOverflowDestination(
+            ContainerAdmission rejectedAdmission,
+            String cargoKey,
+            String cargoItemId) {
         closeCurrentContainer();
         if (overflowChestPos != null) {
-            long key = posKey(overflowChestPos[0], overflowChestPos[1], overflowChestPos[2]);
+            long key = importInventoryKey(overflowChestPos);
             overflowTriedDestinations.add(key);
-            importDestinationTracker.recordSaturated(key);
+            importDestinationTracker.recordRejected(key, cargoKey);
         }
-        for (int[] candidate : orderedWritableImportDestinations()) {
-            long key = posKey(candidate[0], candidate[1], candidate[2]);
+        emit("organize_overflow_capacity_rejected", importCapacityDetails(
+                rejectedAdmission, overflowTriedDestinations.size(), cargoItemId));
+        for (int[] candidate : orderedWritableImportDestinations(cargoKey, cargoItemId)) {
+            long key = importInventoryKey(candidate);
             if (overflowTriedDestinations.contains(key)) continue;
             overflowChestPos = copyPos(candidate);
             walkTarget = copyPos(candidate);
@@ -4408,7 +4667,7 @@ public final class StashOrganizer {
             state = State.OVERFLOW_WALKING;
             persistDurableCheckpoint(state);
             emit("organize_overflow_destination_switched", Map.of(
-                    "reason", "import_destination_full",
+                    "reason", "import_destination_incompatible",
                     "destinations_tried", overflowTriedDestinations.size()
             ));
             return true;
@@ -4501,13 +4760,35 @@ public final class StashOrganizer {
             case CRAFT_MATERIAL_WALK, CRAFT_MATERIAL_OPEN, CRAFT_MATERIAL_TAKE,
                  CRAFT_WALKING, CRAFT_OPENING, CRAFT_PLACING, CRAFT_TAKING,
                  OVERFLOW_WALKING, OVERFLOW_OPENING, OVERFLOW_DEPOSITING ->
-                    startOverflowAfterShulkerCleanup();
+                    resumeOverflowCheckpoint();
             case SHULKER_RESUME_WALK, SHULKER_PLACING, SHULKER_WAIT_PLACE,
                  SHULKER_OPENING, SHULKER_FILLING, SHULKER_CLOSING,
                  SHULKER_BREAKING, SHULKER_PICKUP, SHULKER_RECOVERY_BREAKING,
                  SHULKER_RECOVERY_PICKUP -> resumeTemporaryShulkerCheckpoint();
             case IDLE, YIELDED, DONE -> state = State.DONE;
         }
+    }
+
+    private void resumeOverflowCheckpoint() {
+        int cargoUnitsPresent = countCurrentTaskCargoUnitsInInventory();
+        taskCargo.reset(cargoUnitsPresent);
+        if (CheckpointCargoRecovery.disposition(cargoUnitsPresent)
+                == CheckpointCargoRecovery.Disposition.RESUME_HANDOFF) {
+            startOverflowAfterShulkerCleanup();
+            return;
+        }
+
+        // Destination checkpoints are at-most-once. If their exact cargo is no longer aboard,
+        // do not revisit the source or manufacture an empty overflow transaction.
+        closeCurrentContainer();
+        movedThisVisit = 0;
+        destinationVisitFailed = false;
+        state = State.CLOSING_DEST;
+        emit("organize_recovery_completed", Map.of(
+                "reason", "restored_destination_cargo_absent",
+                "disposition", "complete_current_task"
+        ));
+        persistDurableCheckpoint(state);
     }
 
     private static boolean isTemporaryShulkerState(State state) {
@@ -4721,8 +5002,7 @@ public final class StashOrganizer {
             return classification.kind() == ShulkerClassification.Kind.EMPTY;
         }
         if (task.mixedDecomposition()) {
-            return classification.kind() == ShulkerClassification.Kind.MIXED
-                    && task.shulkerContentFilter().equals(classification.fingerprint());
+            return task.shulkerContentFilter().equals(classification.fingerprint());
         }
         return classification.kind() == ShulkerClassification.Kind.BULK
                 && ItemIdentifier.contentItemIdsMatch(
@@ -4742,15 +5022,21 @@ public final class StashOrganizer {
         return index.isImportChest(destination[0], destination[1], destination[2]);
     }
 
-    private boolean switchImportStagingMoveDestination() {
+    private boolean switchImportStagingMoveDestination(
+            ContainerAdmission rejectedAdmission,
+            String cargoKey,
+            String cargoItemId) {
         if (!isImportStagingMoveTask(currentTask)) return false;
         int[] currentDestination = currentTask.destination();
-        long currentKey = posKey(
-                currentDestination[0], currentDestination[1], currentDestination[2]);
+        long currentKey = importInventoryKey(currentDestination);
         emptyShulkerStagingTriedDestinations.add(currentKey);
-        importDestinationTracker.recordSaturated(currentKey);
-        for (int[] candidate : orderedWritableImportDestinations()) {
-            long key = posKey(candidate[0], candidate[1], candidate[2]);
+        importDestinationTracker.recordRejected(currentKey, cargoKey);
+        Map<String, Object> capacity = importCapacityDetails(
+                rejectedAdmission,
+                emptyShulkerStagingTriedDestinations.size(),
+                cargoItemId);
+        for (int[] candidate : orderedWritableImportDestinations(cargoKey, cargoItemId)) {
+            long key = importInventoryKey(candidate);
             if (emptyShulkerStagingTriedDestinations.contains(key)) continue;
             currentTask = currentTask.withDestination(copyPos(candidate));
             currentRole = TargetRole.DESTINATION;
@@ -4763,12 +5049,10 @@ public final class StashOrganizer {
             persistDurableCheckpoint(state);
             emit(isEmptyShulkerStagingTask(currentTask)
                             ? "organize_empty_shulker_staging_switched"
-                            : "organize_import_staging_switched", Map.of(
-                    "reason", "import_destination_full",
-                    "destinations_tried", emptyShulkerStagingTriedDestinations.size()
-            ));
+                            : "organize_import_staging_switched", capacity);
             return true;
         }
+        emit("organize_import_capacity_exhausted", capacity);
         return false;
     }
 
@@ -4797,22 +5081,92 @@ public final class StashOrganizer {
     }
 
     private List<int[]> orderedWritableImportDestinations() {
-        Map<Long, int[]> byKey = new LinkedHashMap<>();
+        return orderedWritableImportDestinations(
+                currentTaskCargoRoutingKey(),
+                currentTask == null ? null : currentTask.itemId());
+    }
+
+    private List<int[]> orderedWritableImportDestinations(
+            String cargoKey,
+            String cargoItemId) {
+        record RankedImport(long inventoryKey, int[] position, int matchingItems, int freeSlots) {}
+
+        refreshStagingImportDestinations();
+        Map<Long, RankedImport> unique = new LinkedHashMap<>();
         for (int[] candidate : stagingImportDestinations) {
-            long key = posKey(candidate[0], candidate[1], candidate[2]);
-            byKey.putIfAbsent(key, candidate);
+            ContainerEntry entry = index.get(candidate[0], candidate[1], candidate[2]);
+            long key = importInventoryKey(candidate);
+            int matchingItems = ImportStagingPolicy.looseItemCount(entry, cargoItemId);
+            int freeSlots = entry == null
+                    ? 0
+                    : ImportStagingPolicy.from(entry).estimatedFreeSlots();
+            RankedImport ranked = new RankedImport(
+                    key, copyPos(candidate), matchingItems, freeSlots);
+            unique.merge(key, ranked, (current, replacement) ->
+                    replacement.matchingItems() > current.matchingItems()
+                            || (replacement.matchingItems() == current.matchingItems()
+                                && replacement.freeSlots() > current.freeSlots())
+                            ? replacement
+                            : current);
         }
-        return importDestinationTracker.order(byKey.keySet()).stream()
+        List<RankedImport> ranked = unique.values().stream()
+                .sorted(Comparator
+                        .comparing((RankedImport candidate) -> candidate.matchingItems() > 0)
+                        .reversed()
+                        .thenComparing(Comparator.comparingInt(
+                                RankedImport::matchingItems).reversed())
+                        .thenComparing(Comparator.comparingInt(
+                                RankedImport::freeSlots).reversed())
+                        .thenComparingLong(RankedImport::inventoryKey))
+                .toList();
+        Map<Long, int[]> byKey = ranked.stream().collect(Collectors.toMap(
+                RankedImport::inventoryKey,
+                RankedImport::position,
+                (current, ignored) -> current,
+                LinkedHashMap::new));
+        return importDestinationTracker.order(byKey.keySet(), cargoKey).stream()
                 .map(byKey::get)
                 .map(StashOrganizer::copyPos)
                 .toList();
     }
 
-    private void recordWritableImportDestination(int[] destination) {
+    /** Long jobs and restored checkpoints can outlive import-chest registration changes. */
+    private void refreshStagingImportDestinations() {
+        if (config.pos1 == null || config.pos2 == null) return;
+        index.getInRegion(config.pos1, config.pos2).stream()
+                .filter(index::isImportChest)
+                .map(entry -> new int[]{entry.x(), entry.y(), entry.z()})
+                .forEach(this::rememberStagingImportDestination);
+    }
+
+    private void recordWritableImportDestination(int[] destination, String cargoKey) {
         if (destination == null || !index.isImportChest(
                 destination[0], destination[1], destination[2])) return;
-        long key = posKey(destination[0], destination[1], destination[2]);
-        importDestinationTracker.recordWritable(key);
+        importDestinationTracker.recordWritable(importInventoryKey(destination), cargoKey);
+    }
+
+    private long importInventoryKey(int[] destination) {
+        if (destination == null || destination.length < 3) return Long.MIN_VALUE;
+        ContainerEntry entry = index.get(destination[0], destination[1], destination[2]);
+        return entry != null && entry.isDouble() && entry.inventoryIdentityKnown()
+                ? entry.inventoryKey()
+                : posKey(destination[0], destination[1], destination[2]);
+    }
+
+    private String currentTaskCargoRoutingKey() {
+        if (currentTask == null) return "unknown";
+        return currentTask.itemId() + "\u0000"
+                + Objects.toString(currentTask.shulkerContentFilter(), "");
+    }
+
+    private String packedCargoRoutingKey() {
+        return "packed_shulker\u0000" + Objects.toString(packItemId, "unknown");
+    }
+
+    private static String cargoRoutingKey(ItemStack stack) {
+        if (stack == null) return "unknown";
+        return itemIdFromStack(stack) + "\u0000"
+                + Integer.toHexString(Objects.hashCode(stack.getDataComponents()));
     }
 
     // Navigation
@@ -4914,6 +5268,7 @@ public final class StashOrganizer {
         payload.put("overflow_types", overflowItems.size());
         payload.put("staged_shulkers", stagedShulkers);
         payload.put("decomposed_mixed_shulkers", decomposedMixedShulkers);
+        payload.put("generated_loose_tasks", generatedLooseTasks);
         payload.put("staged_storage_classes", stagedStorageClasses.size());
         payload.put("staging_storage_classes_planned", stagingStorageClassesPlanned.size());
         payload.put("permanent_lane_gaps", permanentLaneGaps);
@@ -5146,12 +5501,15 @@ public final class StashOrganizer {
         }
 
         if (staging) {
-            long failedKey = posKey(
-                    packDestination[0], packDestination[1], packDestination[2]);
+            long failedKey = importInventoryKey(packDestination);
             packStoreTriedDestinations.add(failedKey);
-            if (knownFull) importDestinationTracker.recordSaturated(failedKey);
-            for (int[] candidate : orderedWritableImportDestinations()) {
-                long key = posKey(candidate[0], candidate[1], candidate[2]);
+            if (knownFull) {
+                importDestinationTracker.recordRejected(
+                        failedKey, packedCargoRoutingKey());
+            }
+            for (int[] candidate : orderedWritableImportDestinations(
+                    packedCargoRoutingKey(), null)) {
+                long key = importInventoryKey(candidate);
                 if (packStoreTriedDestinations.contains(key)) continue;
                 packDestination = new int[]{candidate[0], candidate[1], candidate[2]};
                 packDestinationOpenFailures = 0;
@@ -5166,7 +5524,7 @@ public final class StashOrganizer {
                 return;
             }
             abortWithCargo("import_staging_full_with_cargo",
-                    "Every registered import chest is full or unreachable. The reconciled shulker is preserved in inventory; clear import space and organize again.");
+                    "No registered import chest can currently accept the reconciled shulker. It is preserved in inventory; free a slot or register another import, then resume.");
             return;
         }
 
@@ -5410,6 +5768,32 @@ public final class StashOrganizer {
                 && current.getAmount() < pendingQuickMove.amount;
         boolean completed = pendingQuickMove.request.isCompleted();
         boolean accepted = completed && pendingQuickMove.request.getNow();
+        int playerWindowCargo = state == State.TAKING
+                ? countCurrentTaskCargoUnitsInOpenPlayerSection(open)
+                : -1;
+        int observedMoved = InventoryTransferPolicy.observedTaskCargoDelta(
+                pendingQuickMove.taskCargoUnitsBefore,
+                playerWindowCargo,
+                pendingQuickMove.amount);
+        if (observedMoved > 0) {
+            int requested = pendingQuickMove.amount;
+            pendingQuickMove = null;
+            quickMoveFailureKey = null;
+            quickMoveFailureAttempts = 0;
+            emit("organize_transfer_confirmed", Map.of(
+                    "reason", "inventory_transfer_confirmed_from_player_window",
+                    "evidence", "exact_task_cargo_increased",
+                    "container_id", openContainerId,
+                    "slot", slot,
+                    "moved_amount", observedMoved
+            ));
+            return new QuickMovePoll(
+                    observedMoved >= requested
+                            ? QuickMoveOutcome.CONFIRMED_DRAINED
+                            : QuickMoveOutcome.CONFIRMED_PARTIAL,
+                    slot,
+                    observedMoved);
+        }
         InventoryTransferPolicy.Result result = InventoryTransferPolicy.assess(
                 true,
                 completed,
@@ -5464,13 +5848,17 @@ public final class StashOrganizer {
         if (source == null || source.getAmount() <= 0) return false;
 
         try {
+            int taskCargoUnitsBefore = state == State.TAKING
+                    ? countCurrentTaskCargoUnitsInOpenPlayerSection(open)
+                    : -1;
             var future = INVENTORY.submit(InventoryActionRequest.builder()
                     .owner(this)
                     .priority(6000)
                     .actions(new ShiftClick(openContainerId, slot, ShiftClickItemAction.LEFT_CLICK))
                     .build());
             ownInventory(future);
-            pendingQuickMove = new PendingQuickMove(openContainerId, slot, source, future);
+            pendingQuickMove = new PendingQuickMove(
+                    openContainerId, slot, source, taskCargoUnitsBefore, future);
             if (future.isCompleted() && !future.getNow()) {
                 recordQuickMoveFailure("inventory_transfer_rejected", pendingQuickMove);
                 pendingQuickMove = null;
@@ -5513,6 +5901,20 @@ public final class StashOrganizer {
 
     private void clearPendingQuickMove() {
         pendingQuickMove = null;
+    }
+
+    private int countCurrentTaskCargoUnitsInOpenPlayerSection(Container open) {
+        if (open == null || currentTask == null) return -1;
+        int containerSlots = getOpenContainerSlotCount(open);
+        int units = 0;
+        for (int rawSlot = 9; rawSlot <= 44; rawSlot++) {
+            if (isProtectedInventorySlot(rawSlot)) continue;
+            int windowSlot = rawPlayerSlotToWindowSlot(containerSlots, rawSlot);
+            if (windowSlot < 0 || windowSlot >= open.getSize()) continue;
+            ItemStack stack = open.getItemStack(windowSlot);
+            if (currentTaskOwnsStack(stack)) units += stack.getAmount();
+        }
+        return units;
     }
 
     // Inventory Helpers
@@ -5625,8 +6027,6 @@ public final class StashOrganizer {
                 .filter(index::isImportChest)
                 .map(ImportStagingPolicy::from)
                 .filter(candidate -> candidate.estimatedFreeSlots() > 0)
-                .filter(candidate -> !importDestinationTracker.isSaturated(
-                        posKey(candidate.x(), candidate.y(), candidate.z())))
                 .max(Comparator
                         .comparingInt(ImportStagingPolicy.Candidate::estimatedFreeSlots)
                         .thenComparingInt(ImportStagingPolicy.Candidate::x)
@@ -5756,6 +6156,7 @@ public final class StashOrganizer {
                 mixedBatchConsolidationMode,
                 mixedBoxDrained,
                 decomposedMixedShulkers,
+                generatedLooseTasks,
                 mixedPendingSourceSlot,
                 mixedPendingCargoSlot,
                 new ArrayList<>(mixedCargoSlots),
@@ -5938,6 +6339,10 @@ public final class StashOrganizer {
         };
         if (totalTasks > 0) {
             detail += " [" + completedTasks + "/" + totalTasks + "]";
+            if (decomposedMixedShulkers > 0 || generatedLooseTasks > 0) {
+                detail += " [mixed boxes " + decomposedMixedShulkers
+                        + "; loose tasks generated " + generatedLooseTasks + "]";
+            }
         }
         return detail;
     }
@@ -5946,6 +6351,7 @@ public final class StashOrganizer {
     private void resetTemporaryShulkerState() {
         temporaryShulkerOutstanding = false;
         temporaryShulkerPickupConfirmed = false;
+        temporaryShulkerPickupFingerprint = null;
         stopAfterShulkerRecovery = false;
         shulkerRecoveryTrigger = null;
         shulkerRecoveryBreakAttempts = 0;
@@ -5961,6 +6367,8 @@ public final class StashOrganizer {
     private void clearMixedDecompositionState() {
         mixedDecompositionMode = false;
         mixedBoxDrained = false;
+        mixedStagingCargoKey = null;
+        mixedStagingCargoItemId = null;
         mixedPendingSourceSlot = -1;
         mixedPendingCargoSlot = -1;
         mixedCargoSlots.clear();
@@ -6014,8 +6422,7 @@ public final class StashOrganizer {
                     || !currentTask.itemId().equals(itemIdFromStack(stack))) continue;
             ShulkerClassification classification = ShulkerClassification.classify(
                     ItemIdentifier.readShulkerContents(stack));
-            if (classification.kind() == ShulkerClassification.Kind.MIXED
-                    && currentTask.shulkerContentFilter().equals(classification.fingerprint())) {
+            if (matchesShulkerTaskFilter(currentTask, classification)) {
                 return slot;
             }
         }

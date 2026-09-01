@@ -87,6 +87,7 @@ final class OrganizerJournalStore {
             boolean mixedBatchConsolidationMode,
             boolean mixedBoxDrained,
             int decomposedMixedShulkers,
+            int generatedLooseTasks,
             int mixedPendingSourceSlot,
             int mixedPendingCargoSlot,
             List<Integer> mixedCargoSlots,

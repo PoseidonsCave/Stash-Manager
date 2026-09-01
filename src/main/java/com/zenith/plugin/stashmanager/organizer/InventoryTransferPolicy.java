@@ -29,4 +29,10 @@ final class InventoryTransferPolicy {
         if (!requestAccepted) return Result.RETRY;
         return Result.WAIT;
     }
+
+    /** Player-window growth is authoritative when the source half of the window is stale. */
+    static int observedTaskCargoDelta(int beforeUnits, int afterUnits, int requestedAmount) {
+        if (beforeUnits < 0 || afterUnits <= beforeUnits || requestedAmount <= 0) return 0;
+        return Math.min(requestedAmount, afterUnits - beforeUnits);
+    }
 }
