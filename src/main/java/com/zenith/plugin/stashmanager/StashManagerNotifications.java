@@ -93,7 +93,14 @@ public final class StashManagerNotifications {
     }
 
     public void sendOrganizerFailed(int completedTasks, int totalTasks, @Nullable String reason,
-                                    boolean checkpointPreserved, boolean cargoPreserved) {
+                                    boolean checkpointPreserved, boolean cargoPreserved,
+                                    @Nullable String cargoState) {
+        String cargo = switch (cargoState == null ? "" : cargoState) {
+            case "placed_block" -> "Preserved at reconciliation worksite";
+            case "inventory" -> "Recovered in inventory";
+            case "unverified_drop" -> "Unverified — check the reconciliation worksite";
+            default -> cargoPreserved ? "Preserved in inventory" : "Check manually";
+        };
         var embed = Embed.builder()
             .title("Stash Organizer Needs Attention")
             .description(checkpointPreserved
@@ -101,7 +108,7 @@ public final class StashManagerNotifications {
                 : "The organizer stopped before finishing. Check the bot and run a fresh scan before starting another organization job.")
             .addField("Progress", completedTasks + "/" + totalTasks, true)
             .addField("Restart Checkpoint", checkpointPreserved ? "Saved" : "Unavailable", true)
-            .addField("Cargo", cargoPreserved ? "Preserved in inventory" : "Check manually", true)
+            .addField("Cargo", cargo, true)
             .errorColor();
         if (reason != null && !reason.isBlank()) {
             embed.addField("Reason", reason, false);

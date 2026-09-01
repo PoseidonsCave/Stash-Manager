@@ -17,6 +17,7 @@ import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
+import com.zenith.feature.pathfinder.goals.GoalNear;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
 import com.zenith.mc.block.BlockPos;
@@ -32,6 +33,8 @@ import com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
 import com.zenith.plugin.stashmanager.orchestration.OpenRetryCadence;
+import com.zenith.plugin.stashmanager.orchestration.ScanCompletionPolicy;
+import com.zenith.plugin.stashmanager.orchestration.ScanNavigationPolicy;
 import com.zenith.plugin.stashmanager.orchestration.SneakReleaseGate;
 import com.zenith.plugin.stashmanager.orchestration.TailRetryTracker;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
@@ -44,6 +47,7 @@ import com.zenith.plugin.stashmanager.travel.tunnel.network.sync.SyncWorker;
 import com.zenith.util.RequestFuture;
 import org.geysermc.mcprotocollib.protocol.data.ProtocolState;
 import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.ClientboundTakeItemEntityPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClosePacket;
 import org.jspecify.annotations.Nullable;
@@ -104,6 +108,7 @@ public class StashManagerModule extends Module {
     private int tickCounter = 0;
     private int openTimeoutCounter = 0;
     private int openInteractionAttempts = 0;
+    private int lastOpenInteractionTick = -1;
     private boolean containerDataReceived = false;
     private final SneakReleaseGate containerOpenGate = new SneakReleaseGate();
 
@@ -131,6 +136,13 @@ public class StashManagerModule extends Module {
     private double startX, startY, startZ;
     private boolean hasStartPosition = false;
     private boolean finishScanAfterReturn = false;
+    private boolean resumeScanAfterReturn = false;
+    private ScanResumeMode returnResumeMode = ScanResumeMode.RETRY_CURRENT;
+    private @Nullable String abortScanAfterReturnReason;
+    private int returnPathAttempts = 0;
+    private static final double SCAN_HORIZONTAL_RECOVERY_MARGIN = 32.0;
+    private static final double SCAN_VERTICAL_RECOVERY_MARGIN = 6.0;
+    private static final int ZONE_WAYPOINT_RANGE_SQ = 16;
 
     // A scanner target owns no inventory cargo, so a transient failure can safely move the
     // untouched target to the tail. Counts stay tied to physical containers, not attempts.
@@ -140,6 +152,7 @@ public class StashManagerModule extends Module {
         new TailRetryTracker<>(MAX_CONTAINER_ATTEMPTS);
     private static final int MIN_CONTAINER_OPEN_TIMEOUT_TICKS = 400;
     private static final int CONTAINER_OPEN_RETRY_INTERVAL_TICKS = 20;
+    private static final int CONTAINER_INTERACTION_ATTEMPT_TIMEOUT_TICKS = 60;
 
     // Baritone config — saved/restored around scans
     private boolean savedAllowBreak = true;
@@ -159,6 +172,7 @@ public class StashManagerModule extends Module {
     // Database integration
     private DatabaseManager database;
     private long currentScanId = -1;
+    private boolean latestScanTrusted = false;
 
     // Tunnel network sync
     private final SyncWorker tunnelNetworkSyncWorker;
@@ -260,6 +274,15 @@ public class StashManagerModule extends Module {
                     }
                     return packet;
                 })
+                // Priority 1 runs before Zenith's priority-0 entity-cache handler removes the
+                // collected item. This gives the organizer definitive pickup evidence even if
+                // the following inventory-slot update is delayed or coalesced.
+                .inbound(ClientboundTakeItemEntityPacket.class, (packet, session) -> {
+                    if (organizer != null && organizer.isActive()) {
+                        organizer.onItemCollected(packet);
+                    }
+                    return packet;
+                })
                 .build())
             .build();
     }
@@ -273,6 +296,7 @@ public class StashManagerModule extends Module {
                 info("Loaded {} containers from database", loaded);
             }
         }
+        refreshLatestScanTrust();
         if (organizer != null) {
             StashOrganizer.DurableRestoreResult restored = organizer.restoreDurableCheckpoint();
             if (restored == StashOrganizer.DurableRestoreResult.RESTORED) {
@@ -437,8 +461,18 @@ public class StashManagerModule extends Module {
         if (retriever.isActive()) {
             return "retriever is active";
         }
+        if (database == null || !database.isInitialized()) {
+            return "database not connected";
+        }
+        refreshLatestScanTrust();
+        if (!latestScanTrusted) {
+            return "the latest scan is incomplete or unhealthy; run a fresh /stash scan before organizing";
+        }
         String automationBlocker = getAutomationUnavailableReason();
         if (automationBlocker != null) return automationBlocker;
+        if (isBotOutsideScanEnvelope()) {
+            return "bot is outside the configured stash area; return it near the scanned region before organizing";
+        }
 
         LaneCapacityReport capacity = organizer.calculateLaneCapacity();
         boolean importStagingAvailable = hasImportStagingInventory();
@@ -505,6 +539,8 @@ public class StashManagerModule extends Module {
     /** Arm (or leave armed) a restored organizer checkpoint for normal gated resume. */
     public boolean requestOrganizerCheckpointResume() {
         if (organizer == null) return false;
+        refreshLatestScanTrust();
+        if (getOrganizerCheckpointResumeBlocker() != null) return false;
         if (!organizer.isDurableRecoveryLoaded()) {
             StashOrganizer.DurableRestoreResult restored = organizer.restoreDurableCheckpoint();
             if (restored != StashOrganizer.DurableRestoreResult.RESTORED) return false;
@@ -513,12 +549,17 @@ public class StashManagerModule extends Module {
             lastOrganizerRecoveryBlocker = null;
         }
         if (!organizer.isYielded()) return false;
-        if (organizer.getDurableResumeBlocker() != null) return false;
+        if (getOrganizerCheckpointResumeBlocker() != null) return false;
         if (!organizerPreemptionGate.isYielded()) {
             organizerPreemptionGate = newOrganizerPreemptionGate();
             organizerPreemptionGate.yield();
         }
         return true;
+    }
+
+    public @Nullable String getOrganizerCheckpointResumeBlocker() {
+        if (!latestScanTrusted) return "latest_scan_incomplete_or_unhealthy";
+        return organizer == null ? "organizer_unavailable" : organizer.getDurableResumeBlocker();
     }
 
     public boolean discardOrganizerCheckpoint() {
@@ -614,6 +655,7 @@ public class StashManagerModule extends Module {
         }
 
         resetScanState();
+        latestScanTrusted = false;
 
         // Clear any existing Baritone state before starting
         BARITONE.stop();
@@ -671,13 +713,15 @@ public class StashManagerModule extends Module {
         // Restore Baritone config
         restoreBaritoneBreaking();
         finishScanAfterReturn = false;
+        resumeScanAfterReturn = false;
+        abortScanAfterReturnReason = null;
 
         // Close out the scan_history row with partial counts so it doesn't stay
         // stuck at completed_at=NULL forever (a rescan will still safely
         // overwrite any already-indexed containers via ON CONFLICT upsert).
         if (database != null && database.isInitialized() && currentScanId >= 0) {
             try {
-                database.recordScanComplete(currentScanId, containersFound, containersIndexed, containersFailed);
+                database.recordScanAborted(currentScanId, containersFound, containersIndexed, containersFailed);
             } catch (Exception e) {
                 warn("Failed to record scan abort in database: {}", e.getMessage());
                 debugRecorder.record("scan_abort_db_error", "Failed to record scan abort", e);
@@ -697,8 +741,7 @@ public class StashManagerModule extends Module {
                 returnAfterAbort, config.returnToStart, hasStartPosition, wasYielded)) {
             info("Returning to starting position after scan abort: {}, {}, {}",
                 String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
-            ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
-            state = ScanState.RETURNING;
+            beginReturnPath();
             fireWebhookEvent("return_to_start_started", Map.of(
                 "reason", "scan_aborted",
                 "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
@@ -736,9 +779,10 @@ public class StashManagerModule extends Module {
         }
         info("Returning to starting position: {}, {}, {}",
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
-        ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
-        state = ScanState.RETURNING;
+        beginReturnPath();
         finishScanAfterReturn = false;
+        resumeScanAfterReturn = false;
+        abortScanAfterReturnReason = null;
         fireWebhookEvent("return_to_start_started", Map.of("start_position",
             String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
         return true;
@@ -769,7 +813,11 @@ public class StashManagerModule extends Module {
         if (hasAnyBaritoneProcessActive() || BARITONE.isActive() || INVENTORY.hasActiveRequest()) {
             return "shared Baritone/inventory automation is active";
         }
-        return getAutomationUnavailableReason();
+        String automationBlocker = getAutomationUnavailableReason();
+        if (automationBlocker != null) return automationBlocker;
+        return isBotOutsideScanEnvelope()
+                ? "bot is outside the configured stash area; move it near the region before scanning"
+                : null;
     }
 
     public @Nullable String getReturnToStartBlocker() {
@@ -1196,6 +1244,9 @@ public class StashManagerModule extends Module {
 
     // State Implementations
     private void tickZoneScanning() {
+        if (beginScanPositionRecoveryIfNeeded(
+                ScanResumeMode.RESCAN_ZONE, "zone_scan_outside_region")) return;
+
         int remainingCapacity = Math.max(0, config.maxContainers - discoveredContainerKeys.size());
         List<ContainerLocation> found = remainingCapacity > 0
             ? regionScanner.scanRegion(
@@ -1236,11 +1287,9 @@ public class StashManagerModule extends Module {
         }
 
         if (pendingContainers.isEmpty()) {
-            restoreBaritoneBreaking();
-            state = ScanState.DONE;
             info("No containers found in region");
             fireWebhookEvent("scan_empty");
-            notifications.sendScanFinished(0, 0, 0);
+            finishScan();
             return;
         }
 
@@ -1248,6 +1297,9 @@ public class StashManagerModule extends Module {
     }
 
     private void tickWalking() {
+        if (beginScanPositionRecoveryIfNeeded(
+                ScanResumeMode.RETRY_CURRENT, "container_walk_outside_region")) return;
+
         walkingTickCount++;
 
         ContainerLocation target = currentContainer();
@@ -1267,6 +1319,7 @@ public class StashManagerModule extends Module {
             tickCounter = 0;
             openTimeoutCounter = 0;
             openInteractionAttempts = 0;
+            lastOpenInteractionTick = -1;
             containerDataReceived = false;
             return;
         }
@@ -1390,43 +1443,68 @@ public class StashManagerModule extends Module {
     }
 
     private void tickWalkingToZone() {
+        if (beginScanPositionRecoveryIfNeeded(
+                ScanResumeMode.RESCAN_ZONE, "zone_waypoint_outside_region")) return;
         if (!BARITONE.getCustomGoalProcess().isActive()) {
             state = ScanState.ZONE_SCANNING;
         }
     }
 
     private void tickReturning() {
-        if (!BARITONE.getCustomGoalProcess().isActive()) {
-            double dist = Math.sqrt(
-                Math.pow(CACHE.getPlayerCache().getX() - startX, 2)
-                + Math.pow(CACHE.getPlayerCache().getY() - startY, 2)
-                + Math.pow(CACHE.getPlayerCache().getZ() - startZ, 2)
-            );
-
-            if (dist <= 3.0) {
-                info("Returned to starting position: {}, {}, {}",
-                    String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
-                inGameAlert("<green>Returned to starting position.</green>");
-                fireWebhookEvent("returned_to_start", Map.of("start_position",
-                    String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
-                notifications.sendReturnToStartCompleted(startX, startY, startZ);
-            } else {
-                warn("Could not reach starting position (dist={}). Finishing scan.",
-                    String.format("%.1f", dist));
-                inGameAlert("<yellow>Could not reach starting position</yellow> <gray>(dist="
-                    + String.format("%.1f", dist) + "). Finishing scan.</gray>");
-                recordAndFireScanFailure("return_to_start_failed", Map.of(
-                    "distance", String.format("%.1f", dist),
-                    "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
-                notifications.sendReturnToStartFailed(startX, startY, startZ, dist);
+        double dist = distanceToStart();
+        if (dist <= 3.0) {
+            stopOwnedBaritoneProcess();
+            if (resumeScanAfterReturn) {
+                ScanResumeMode resumeMode = returnResumeMode;
+                resumeScanAfterReturn = false;
+                returnPathAttempts = 0;
+                info("Recovered scan position at the recorded start; resuming {}", resumeMode);
+                debugRecorder.record("scan_position_recovered",
+                        "resume_mode=" + resumeMode
+                                + ", start_position="
+                                + String.format("%.1f, %.1f, %.1f", startX, startY, startZ));
+                resumeScanCheckpoint(resumeMode);
+                return;
             }
 
-            if (finishScanAfterReturn) {
-                finishScan();
-            } else {
-                state = ScanState.DONE;
-            }
+            info("Returned to starting position: {}, {}, {}",
+                String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
+            inGameAlert("<green>Returned to starting position.</green>");
+            fireWebhookEvent("returned_to_start", Map.of("start_position",
+                String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+            notifications.sendReturnToStartCompleted(startX, startY, startZ);
+            finishOrAbortAfterReturn();
+            return;
         }
+
+        if (BARITONE.getCustomGoalProcess().isActive()) return;
+        if (returnPathAttempts < MAX_WALK_RETRIES) {
+            returnPathAttempts++;
+            info("Re-pathing to scan start (dist={}, attempt={}/{})",
+                    String.format("%.1f", dist), returnPathAttempts, MAX_WALK_RETRIES);
+            ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
+            return;
+        }
+
+        if (resumeScanAfterReturn) {
+            resumeScanAfterReturn = false;
+            recordAndFireScanFailure("scan_position_recovery_failed", Map.of(
+                    "distance", String.format("%.1f", dist),
+                    "attempts", returnPathAttempts,
+                    "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+            abortScan("position_recovery_failed", false);
+            return;
+        }
+
+        warn("Could not reach starting position (dist={}). Finishing scan.",
+            String.format("%.1f", dist));
+        inGameAlert("<yellow>Could not reach starting position</yellow> <gray>(dist="
+            + String.format("%.1f", dist) + "). Finishing scan.</gray>");
+        recordAndFireScanFailure("return_to_start_failed", Map.of(
+            "distance", String.format("%.1f", dist),
+            "start_position", String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
+        notifications.sendReturnToStartFailed(startX, startY, startZ, dist);
+        finishOrAbortAfterReturn();
     }
 
     private boolean scannerWasPreempted() {
@@ -1497,7 +1575,7 @@ public class StashManagerModule extends Module {
         organizer.tickYieldMaintenance();
         if (connectionRecoveryTracker.isPending()) return;
 
-        String recoveryBlocker = organizer.getDurableResumeBlocker();
+        String recoveryBlocker = getOrganizerCheckpointResumeBlocker();
         if (recoveryBlocker != null) {
             if (!recoveryBlocker.equals(lastOrganizerRecoveryBlocker)) {
                 lastOrganizerRecoveryBlocker = recoveryBlocker;
@@ -1625,19 +1703,24 @@ public class StashManagerModule extends Module {
                 + ", preemption_count=" + scanPreemptionCount);
 
         reacquireBaritoneBreakingAfterYield();
+        if (beginScanPositionRecoveryIfNeeded(
+                resumeMode, "resume_outside_region")) return;
+        resumeScanCheckpoint(resumeMode);
+    }
 
+    private void resumeScanCheckpoint(ScanResumeMode resumeMode) {
         switch (resumeMode) {
             case RETRY_CURRENT -> resumeCurrentContainer();
             case ADVANCE_CURRENT -> advanceToNextContainer();
             case RESCAN_ZONE -> state = ScanState.ZONE_SCANNING;
-            case RETURN_TO_START -> {
-                ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
-                state = ScanState.RETURNING;
-            }
+            case RETURN_TO_START -> beginReturnPath();
         }
     }
 
     private void resumeCurrentContainer() {
+        if (beginScanPositionRecoveryIfNeeded(
+                ScanResumeMode.RETRY_CURRENT, "retry_outside_region")) return;
+
         ContainerLocation target = currentContainer();
         if (target == null) {
             advanceToNextContainer();
@@ -1647,6 +1730,7 @@ public class StashManagerModule extends Module {
         tickCounter = 0;
         openTimeoutCounter = 0;
         openInteractionAttempts = 0;
+        lastOpenInteractionTick = -1;
         containerDataReceived = false;
         walkRetryCount = 0;
         walkingTickCount = 0;
@@ -1706,6 +1790,74 @@ public class StashManagerModule extends Module {
     }
 
     // Helpers
+    private boolean isBotOutsideScanEnvelope() {
+        var playerCache = CACHE.getPlayerCache();
+        return ScanNavigationPolicy.isOutsideRegionEnvelope(
+                playerCache.getX(), playerCache.getY(), playerCache.getZ(),
+                config.pos1, config.pos2,
+                SCAN_HORIZONTAL_RECOVERY_MARGIN,
+                SCAN_VERTICAL_RECOVERY_MARGIN);
+    }
+
+    private boolean beginScanPositionRecoveryIfNeeded(
+            ScanResumeMode resumeMode,
+            String reason) {
+        if (!hasStartPosition || !isBotOutsideScanEnvelope()) return false;
+
+        var playerCache = CACHE.getPlayerCache();
+        stopOwnedBaritoneProcess();
+        // RETURN_TO_START already carries its own completion/abort intent. Preserve it when
+        // an external task interrupts the return path; clearing these flags would turn an
+        // unhealthy scan into a false DONE state after recovery.
+        if (resumeMode != ScanResumeMode.RETURN_TO_START) {
+            finishScanAfterReturn = false;
+            resumeScanAfterReturn = true;
+            returnResumeMode = resumeMode;
+            abortScanAfterReturnReason = null;
+        }
+        info("Scan left the configured stash envelope; returning to its start before {}",
+                resumeMode);
+        String detail = "reason=" + reason
+                + ", resume_mode=" + resumeMode
+                + ", current_position=" + String.format("%.1f, %.1f, %.1f",
+                        playerCache.getX(), playerCache.getY(), playerCache.getZ())
+                + ", start_position=" + String.format("%.1f, %.1f, %.1f",
+                        startX, startY, startZ);
+        debugRecorder.record("scan_position_recovery_started", detail);
+        fireWebhookEvent("scan_position_recovery_started", Map.of(
+                "reason", reason,
+                "resume_mode", resumeMode,
+                "distance", String.format("%.1f", distanceToStart())
+        ));
+        beginReturnPath();
+        return true;
+    }
+
+    private void beginReturnPath() {
+        returnPathAttempts = 1;
+        ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
+        state = ScanState.RETURNING;
+    }
+
+    private double distanceToStart() {
+        return Math.sqrt(
+                Math.pow(CACHE.getPlayerCache().getX() - startX, 2)
+                        + Math.pow(CACHE.getPlayerCache().getY() - startY, 2)
+                        + Math.pow(CACHE.getPlayerCache().getZ() - startZ, 2));
+    }
+
+    private void finishOrAbortAfterReturn() {
+        if (abortScanAfterReturnReason != null) {
+            String reason = abortScanAfterReturnReason;
+            abortScanAfterReturnReason = null;
+            abortScan(reason, false);
+        } else if (finishScanAfterReturn) {
+            finishScan();
+        } else {
+            state = ScanState.DONE;
+        }
+    }
+
     private void advanceToNextContainer() {
         currentContainerIndex++;
 
@@ -1719,22 +1871,56 @@ public class StashManagerModule extends Module {
 
             info("All containers processed. Found={}, Indexed={}, Failed={}",
                 containersFound, containersIndexed, containersFailed);
+            int unresolved = ScanCompletionPolicy.unresolvedContainers(
+                    containersFound, containersIndexed, containersFailed);
+            if (unresolved > 0) {
+                containersFailed = (int) Math.min(
+                        Integer.MAX_VALUE,
+                        (long) containersFailed + unresolved);
+                debugRecorder.record("scan_unresolved_targets_counted",
+                        "unresolved=" + unresolved
+                                + ", disposition=counted_as_terminal_failures"
+                                + ", found=" + containersFound
+                                + ", indexed=" + containersIndexed
+                                + ", failed=" + containersFailed);
+            }
+            ScanCompletionPolicy.Assessment completion = ScanCompletionPolicy.assess(
+                    containersFound, containersIndexed, containersFailed);
+            boolean unhealthySnapshot = !completion.accepted();
+            if (unhealthySnapshot) {
+                abortScanAfterReturnReason = completion.rejectionReason();
+                debugRecorder.record("scan_completion_rejected",
+                        "reason=" + completion.rejectionReason()
+                                + ", found=" + containersFound
+                                + ", indexed=" + containersIndexed
+                                + ", failed=" + containersFailed
+                                + ", unresolved=" + completion.unresolved()
+                                + ", effective_failures=" + completion.effectiveFailures()
+                                + ", allowed_failures=" + completion.allowedFailures());
+            }
 
             // Return to start if enabled
             if (config.returnToStart && hasStartPosition) {
                 info("Returning to starting position: {}, {}, {}",
                     String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
-                inGameAlert("<aqua>Scan complete!</aqua> <gray>Found=" + containersFound
+                inGameAlert((unhealthySnapshot
+                        ? "<yellow>Scan needs recovery.</yellow> <gray>"
+                        : "<aqua>Scan complete!</aqua> <gray>")
+                    + "Found=" + containersFound
                     + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed
                     + ". Returning to start position...</gray>");
-                ownCustomGoal(BARITONE.pathTo((int) startX, (int) startY, (int) startZ));
-                state = ScanState.RETURNING;
-                finishScanAfterReturn = true;
+                finishScanAfterReturn = !unhealthySnapshot;
+                resumeScanAfterReturn = false;
+                beginReturnPath();
                 fireWebhookEvent("return_to_start_started", Map.of("start_position",
                     String.format("%.1f, %.1f, %.1f", startX, startY, startZ)));
                 return;
             }
 
+            if (unhealthySnapshot) {
+                abortScan(abortScanAfterReturnReason, false);
+                return;
+            }
             finishScan();
             return;
         }
@@ -1772,6 +1958,7 @@ public class StashManagerModule extends Module {
             tickCounter = 0;
             openTimeoutCounter = 0;
             openInteractionAttempts = 0;
+            lastOpenInteractionTick = -1;
             containerDataReceived = false;
         } else {
             state = ScanState.WALKING;
@@ -1799,8 +1986,18 @@ public class StashManagerModule extends Module {
             targetZ = (int) Math.round(playerZ + dz / distance * legLength);
         }
 
-        info("Walking toward unscanned chunk via waypoint at {}, {}", targetX, targetZ);
-        ownCustomGoal(BARITONE.pathTo(targetX, targetZ));
+        int targetY = ScanNavigationPolicy.waypointY(
+                startY,
+                CACHE.getPlayerCache().getY(),
+                config.pos1,
+                config.pos2);
+        info("Walking toward unscanned chunk via level-aware waypoint at {}, {}, {}",
+                targetX, targetY, targetZ);
+        debugRecorder.record("scan_zone_waypoint_started",
+                "waypoint=" + targetX + ", " + targetY + ", " + targetZ
+                        + ", range_sq=" + ZONE_WAYPOINT_RANGE_SQ);
+        ownCustomGoal(BARITONE.pathTo(
+                new GoalNear(targetX, targetY, targetZ, ZONE_WAYPOINT_RANGE_SQ)));
         state = ScanState.WALKING_TO_ZONE;
     }
 
@@ -1837,13 +2034,23 @@ public class StashManagerModule extends Module {
     }
 
     private void interactWithContainer(ContainerLocation loc) {
+        if (ownedBaritoneProcess == OwnedBaritoneProcess.INTERACTION
+                && ownedBaritoneRequest != null
+                && !ownedBaritoneRequest.isCompleted()) {
+            if (lastOpenInteractionTick < 0
+                    || openTimeoutCounter - lastOpenInteractionTick
+                    < CONTAINER_INTERACTION_ATTEMPT_TIMEOUT_TICKS) {
+                return;
+            }
+            stopOwnedBaritoneProcess();
+        }
         // Right-click the container block at exact coordinates
         openInteractionAttempts++;
+        lastOpenInteractionTick = openTimeoutCounter;
         ownInteraction(BARITONE.rightClickBlock(loc.x(), loc.y(), loc.z()));
     }
 
     private boolean prepareStandingContainerInteraction() {
-        stopOwnedBaritoneProcess();
         if (containerOpenGate.tick(BOT.isSneaking())) return true;
         INPUTS.submit(InputRequest.builder()
             .owner(this)
@@ -1965,6 +2172,7 @@ public class StashManagerModule extends Module {
                 debugRecorder.record("scan_complete_db_error", "Failed to record scan completion", e);
             }
         }
+        latestScanTrusted = true;
 
         // Fire webhook notification
         fireWebhookEvent("scan_complete");
@@ -2085,6 +2293,7 @@ public class StashManagerModule extends Module {
         tickCounter = 0;
         openTimeoutCounter = 0;
         openInteractionAttempts = 0;
+        lastOpenInteractionTick = -1;
         containerDataReceived = false;
         containersFound = 0;
         containersIndexed = 0;
@@ -2092,6 +2301,10 @@ public class StashManagerModule extends Module {
         currentScanId = -1;
         hasStartPosition = false;
         finishScanAfterReturn = false;
+        resumeScanAfterReturn = false;
+        returnResumeMode = ScanResumeMode.RETRY_CURRENT;
+        abortScanAfterReturnReason = null;
+        returnPathAttempts = 0;
         walkRetryCount = 0;
         walkingTickCount = 0;
         scannerPreemptionGate = newScannerPreemptionGate();
@@ -2099,6 +2312,28 @@ public class StashManagerModule extends Module {
         scanResumeMode = ScanResumeMode.RETRY_CURRENT;
         lateOpenQuarantineTicks = 0;
         scanPreemptionCount = 0;
+    }
+
+    private void refreshLatestScanTrust() {
+        latestScanTrusted = false;
+        if (database == null || !database.isInitialized()
+                || config.pos1 == null || config.pos2 == null) {
+            return;
+        }
+        try {
+            latestScanTrusted = database.getLatestScanSummary(config.pos1, config.pos2)
+                    .map(summary -> summary.completed()
+                            && !ScanCompletionPolicy.shouldAbort(
+                                    summary.found(), summary.indexed(), summary.failed()))
+                    .orElse(false);
+            if (!latestScanTrusted && index.size() > 0) {
+                debugRecorder.record("scan_snapshot_untrusted",
+                        "reason=latest_scan_incomplete_or_unhealthy, indexed_containers=" + index.size());
+            }
+        } catch (Exception e) {
+            warn("Failed to verify latest scan status: {}", e.getMessage());
+            debugRecorder.record("scan_trust_check_failed", "Failed to verify latest scan status", e);
+        }
     }
 
     private CooperativePreemptionGate newScannerPreemptionGate() {
@@ -2113,19 +2348,10 @@ public class StashManagerModule extends Module {
                 SCAN_PREEMPTION_QUIET_TICKS);
     }
 
-    // Reasons that are expected/benign noise in a hopper-fed or actively-changing stash (the
-    // planned target simply isn't there anymore by the time the bot looks) — still worth
-    // recording for /stash debug, but not worth a Discord ping every single occurrence.
-    private static final Set<String> WEBHOOK_SUPPRESSED_REASONS = Set.of(
-        "item_not_found_at_source", "nothing_to_deposit"
-    );
-
     private void handleAutomationEvent(String event, Map<String, Object> payload) {
-        boolean suppressWebhook = payload != null
-            && WEBHOOK_SUPPRESSED_REASONS.contains(String.valueOf(payload.get("reason")));
-        boolean terminalOrganizerFailure = "organize_failed".equals(event)
-                && booleanValue(payload, "terminal");
-        if (!suppressWebhook && !terminalOrganizerFailure) {
+        // Every transition remains in console/debug. Discord receives only job starts and
+        // actionable blockers here; completion/failure use the richer dedicated embeds below.
+        if (AutomationNotificationPolicy.sendGenericDiscord(event, payload)) {
             fireWebhookEvent(event, payload);
         }
         // Keep successful transitions too. Long headless jobs need a usable baseline even when
@@ -2173,7 +2399,8 @@ public class StashManagerModule extends Module {
                         intValue(payload, "total_tasks"),
                         stringValue(payload, "reason"),
                         booleanValue(payload, "checkpoint_preserved"),
-                        booleanValue(payload, "cargo_preserved"));
+                        booleanValue(payload, "cargo_preserved"),
+                        stringValue(payload, "cargo_state"));
             }
             case "organize_aborted", "organize_stopped" -> {
                 organizerPreemptionGate.reset();

@@ -107,6 +107,7 @@ public class DatabaseManager implements AutoCloseable {
                     containers_found INTEGER NOT NULL DEFAULT 0,
                     containers_indexed INTEGER NOT NULL DEFAULT 0,
                     containers_failed INTEGER NOT NULL DEFAULT 0,
+                    completion_status VARCHAR(16) NOT NULL DEFAULT 'complete',
                     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP
                 )
@@ -235,6 +236,26 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("ALTER TABLE keep_items ADD COLUMN IF NOT EXISTS keep_quantity INTEGER");
             // Older rows remain NULL and are treated as legacy aggregate data until rescanned.
             stmt.execute("ALTER TABLE container_items ADD COLUMN IF NOT EXISTS shulker_instance INTEGER");
+            // Existing completed rows remain trusted. New scans explicitly transition through
+            // running -> complete/aborted so partial snapshots survive restarts as unsafe.
+            stmt.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS completion_status VARCHAR(16) NOT NULL DEFAULT 'complete'");
+
+            // Old organizer runs only upserted current assignments, leaving retired item
+            // classes pointed at lanes that had since been reassigned. Keep the newest owner
+            // of each physical lane before enforcing the one-class-per-lane invariant.
+            stmt.execute("""
+                DELETE FROM column_assignments stale
+                USING column_assignments keeper
+                WHERE stale.col_x = keeper.col_x
+                  AND stale.col_y = keeper.col_y
+                  AND stale.col_z = keeper.col_z
+                  AND (stale.updated_at < keeper.updated_at
+                    OR (stale.updated_at = keeper.updated_at AND stale.item_id > keeper.item_id))
+                """);
+            stmt.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_column_assignments_lane
+                ON column_assignments(col_x, col_y, col_z)
+                """);
 
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS import_chests (
@@ -898,10 +919,19 @@ public class DatabaseManager implements AutoCloseable {
     // if it isn't, this silently no-ops and the organizer falls back to in-memory-only behavior
     // for that run (see README for how to configure persistent storage).
     public void saveColumnAssignments(Map<String, int[]> assignments) throws SQLException {
-        if (!initialized || assignments.isEmpty()) return;
+        if (!initialized) return;
 
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
+            // This table represents the latest complete plan, not an append-only history.
+            // Removing retired rows prevents old item classes from claiming reassigned lanes.
+            try (Statement clear = conn.createStatement()) {
+                clear.executeUpdate("DELETE FROM column_assignments");
+            }
+            if (assignments.isEmpty()) {
+                conn.commit();
+                return;
+            }
             try (PreparedStatement ps = conn.prepareStatement("""
                     INSERT INTO column_assignments (item_id, col_x, col_y, col_z, updated_at)
                     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -1116,8 +1146,12 @@ public class DatabaseManager implements AutoCloseable {
         if (!initialized) return -1;
 
         String sql = """
-            INSERT INTO scan_history (region_pos1_x, region_pos1_y, region_pos1_z, region_pos2_x, region_pos2_y, region_pos2_z)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO scan_history (
+                region_pos1_x, region_pos1_y, region_pos1_z,
+                region_pos2_x, region_pos2_y, region_pos2_z,
+                completion_status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'running')
             RETURNING id
             """;
 
@@ -1138,10 +1172,24 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     public void recordScanComplete(long scanId, int found, int indexed, int failed) throws SQLException {
+        recordScanFinished(scanId, found, indexed, failed, "complete");
+    }
+
+    public void recordScanAborted(long scanId, int found, int indexed, int failed) throws SQLException {
+        recordScanFinished(scanId, found, indexed, failed, "aborted");
+    }
+
+    private void recordScanFinished(
+            long scanId,
+            int found,
+            int indexed,
+            int failed,
+            String completionStatus) throws SQLException {
         if (!initialized || scanId < 0) return;
 
         String sql = """
-            UPDATE scan_history SET containers_found = ?, containers_indexed = ?, containers_failed = ?, completed_at = CURRENT_TIMESTAMP
+            UPDATE scan_history SET containers_found = ?, containers_indexed = ?, containers_failed = ?,
+                completion_status = ?, completed_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """;
 
@@ -1150,8 +1198,56 @@ public class DatabaseManager implements AutoCloseable {
             ps.setInt(1, found);
             ps.setInt(2, indexed);
             ps.setInt(3, failed);
-            ps.setLong(4, scanId);
+            ps.setString(4, completionStatus);
+            ps.setLong(5, scanId);
             ps.executeUpdate();
+        }
+    }
+
+    public Optional<ScanSummary> getLatestScanSummary(int[] pos1, int[] pos2) throws SQLException {
+        if (!initialized || pos1 == null || pos2 == null) return Optional.empty();
+
+        int minX = Math.min(pos1[0], pos2[0]);
+        int minY = Math.min(pos1[1], pos2[1]);
+        int minZ = Math.min(pos1[2], pos2[2]);
+        int maxX = Math.max(pos1[0], pos2[0]);
+        int maxY = Math.max(pos1[1], pos2[1]);
+        int maxZ = Math.max(pos1[2], pos2[2]);
+        String sql = """
+            SELECT containers_found, containers_indexed, containers_failed, completion_status
+            FROM scan_history
+            WHERE LEAST(region_pos1_x, region_pos2_x) = ?
+              AND LEAST(region_pos1_y, region_pos2_y) = ?
+              AND LEAST(region_pos1_z, region_pos2_z) = ?
+              AND GREATEST(region_pos1_x, region_pos2_x) = ?
+              AND GREATEST(region_pos1_y, region_pos2_y) = ?
+              AND GREATEST(region_pos1_z, region_pos2_z) = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """;
+
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, minX);
+            ps.setInt(2, minY);
+            ps.setInt(3, minZ);
+            ps.setInt(4, maxX);
+            ps.setInt(5, maxY);
+            ps.setInt(6, maxZ);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return Optional.empty();
+                return Optional.of(new ScanSummary(
+                        rs.getInt("containers_found"),
+                        rs.getInt("containers_indexed"),
+                        rs.getInt("containers_failed"),
+                        rs.getString("completion_status")));
+            }
+        }
+    }
+
+    public record ScanSummary(int found, int indexed, int failed, String completionStatus) {
+        public boolean completed() {
+            return "complete".equalsIgnoreCase(completionStatus);
         }
     }
 
