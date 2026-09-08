@@ -11,6 +11,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /** Calculates shulker capacity and lane assignments. */
 public final class LaneStorageCapacity {
@@ -172,14 +173,22 @@ public final class LaneStorageCapacity {
             Collection<Demand> rawDemands,
             Collection<Lane> rawLanes,
             Map<String, Integer> preferredLaneIds) {
-        List<Demand> demands = rawDemands == null ? new ArrayList<>() : new ArrayList<>(rawDemands);
-        demands.removeIf(demand -> demand == null || demand.storageClass() == null
-                || demand.requiredShulkerSlots() <= 0);
+        Map<String, Demand> uniqueDemands = new LinkedHashMap<>();
+        if (rawDemands != null) {
+            for (Demand demand : rawDemands) {
+                if (demand == null || demand.storageClass() == null
+                        || demand.requiredShulkerSlots() <= 0) continue;
+                // A class is one organization contract. Repeated scan evidence must not create
+                // another assignment for the same class; keep the conservative larger demand.
+                uniqueDemands.merge(demand.storageClass(), demand,
+                        LaneStorageCapacity::largerDemand);
+            }
+        }
+        List<Demand> demands = new ArrayList<>(uniqueDemands.values());
         demands.sort(Comparator.comparingInt(Demand::requiredShulkerSlots).reversed()
                 .thenComparing(Demand::storageClass));
 
-        List<Lane> lanes = rawLanes == null ? new ArrayList<>() : new ArrayList<>(rawLanes);
-        lanes.removeIf(lane -> lane == null || lane.shulkerSlots() <= 0);
+        List<Lane> lanes = deduplicateLanes(rawLanes);
         lanes.sort(Comparator.comparingInt(Lane::shulkerSlots).thenComparingInt(Lane::id));
 
         Map<Integer, Lane> availableById = new HashMap<>();
@@ -230,6 +239,32 @@ public final class LaneStorageCapacity {
 
     public static Report assess(Collection<Demand> demands, Collection<Lane> lanes) {
         return assess(demands, lanes, Map.of());
+    }
+
+    private static List<Lane> deduplicateLanes(Collection<Lane> rawLanes) {
+        if (rawLanes == null || rawLanes.isEmpty()) return new ArrayList<>();
+        List<Lane> candidates = rawLanes.stream()
+                .filter(lane -> lane != null && lane.shulkerSlots() > 0)
+                .sorted(Comparator.comparingInt(Lane::shulkerSlots)
+                        .thenComparingInt(Lane::id)
+                        .thenComparingInt(Lane::topX)
+                        .thenComparingInt(Lane::topY)
+                        .thenComparingInt(Lane::topZ))
+                .toList();
+        Set<Integer> ids = new java.util.HashSet<>();
+        List<Lane> unique = new ArrayList<>();
+        for (Lane lane : candidates) {
+            if (!ids.add(lane.id())) continue;
+            unique.add(lane);
+        }
+        return unique;
+    }
+
+    private static Demand largerDemand(Demand left, Demand right) {
+        int bySlots = Integer.compare(
+                left.requiredShulkerSlots(), right.requiredShulkerSlots());
+        if (bySlots != 0) return bySlots >= 0 ? left : right;
+        return left.totalItems() >= right.totalItems() ? left : right;
     }
 
     private static int saturatingSum(Collection<Integer> values) {

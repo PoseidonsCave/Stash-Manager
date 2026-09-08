@@ -1388,9 +1388,9 @@ public class StashCommand extends Command {
                                 .addField("Progress",
                                     organizer.getCompletedTasks() + "/" + organizer.getTotalTasks(), true)
                                 .successColor();
-                        } else if (organizer.getDurableResumeBlocker() != null) {
+                        } else if (module.getOrganizerCheckpointResumeBlocker() != null) {
                             embed.description("The checkpoint is safe, but it cannot resume yet: "
-                                    + organizer.getDurableResumeBlocker() + ".")
+                                    + module.getOrganizerCheckpointResumeBlocker() + ".")
                                 .errorColor();
                         } else {
                             embed.description("The checkpoint could not be armed for resume: "
@@ -1433,7 +1433,7 @@ public class StashCommand extends Command {
                             embed.addField("Restart Safe",
                                 organizer.hasDurableCheckpoint() ? "Yes" : "No", true);
                             if (organizer.isDurableRecoveryLoaded()) {
-                                String blocker = organizer.getDurableResumeBlocker();
+                                String blocker = module.getOrganizerCheckpointResumeBlocker();
                                 embed.addField("Restart Recovery",
                                     blocker == null ? "Waiting for cooldown" : "Waiting: " + blocker,
                                     false);

@@ -168,9 +168,9 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 |:---:|--------------|
 | 1 | The scan identifies empty, bulk, mixed, and unknown shulkers. |
 | 2 | Every exact item gets its own storage class. Blocks, stairs, slabs, trapdoors, armor, tools, and weapons are never folded together. Fortune and Silk Touch tools remain separate. |
-| 3 | Mixed shulkers and returned kits are opened one at a time, staged through registered import chests, and split back into exact-item bulk boxes. The bot never guesses from a majority item. |
-| 4 | Existing lanes are reused when they are large enough. The bot reports the permanent lane gaps when they are not. |
-| 5 | Loose items with lanes are packed into permanent storage. Items without suitable lanes are packed into bulk shulkers and staged in registered import chests. |
+| 3 | Mixed shulkers and returned kits are opened one at a time and their loose cargo is staged through registered import chests. The bot never guesses from a majority item. |
+| 4 | Staged cargo is packed into exact-item bulk shulkers, filling a matching partial box before using an empty one. |
+| 5 | Each completed bulk shulker goes to its assigned lane. When no suitable lane exists, it waits safely in an import chest instead. |
 | 6 | Partial matching shulkers are filled before empty ones are used. Each mixed box is fully cleared and its empty box is reused before the next mixed box starts. |
 
 The capacity check uses each item's real stack size and the free room inside matching shulkers.
@@ -180,6 +180,8 @@ styled workbook with a summary, a build list, and the full lane breakdown.
 Supported regions may mix hopper-fed staircase lanes with direct-access chest banks. Hopper lanes
 are followed through the inventories they actually feed, so narrow and wide stair steps remain
 separate from neighboring chains. In a stacked bank, each contiguous vertical stack is one lane.
+Physical inventories are claimed once, and duplicate scan evidence cannot create a second lane or
+assign the same storage class twice.
 Unstructured standalone chests are still left alone unless they are explicitly registered as
 imports.
 
@@ -200,10 +202,34 @@ Mixed-shulker reconciliation also needs at least one registered import chest. It
 small, reusable transfer buffer: unload one mixed box, repack those exact items, then continue.
 The organizer moves those stacks into known-empty inventory slots, so matching keep-list gear is
 not accidentally swept into the returned kit.
+Follow-up work remembers which item type went into which import chest, including partial deposits
+split across several chests. It no longer pairs every item type with every staging chest. If a
+connection drops during a deposit, only that attempted item/chest pair needs a cautious recheck.
+Older checkpoints remain usable; already queued work is retained, and an older mixed box in progress
+uses its conservative fallback until that box is finished.
 
-The completion message calls out how many boxes and item types are waiting in imports. If every
-registered import is full or unreachable, the organizer stops with the packed box still safely in
-the bot inventory.
+Import capacity is checked from the live container window for the exact cargo being moved. Recent
+checks help the bot go straight to a chest with usable space, including compatible partial stacks.
+Those observations expire after five minutes and refresh whenever the organizer visits that chest.
+Known full chests are checked last, and still get a live recheck before a capacity stop. Routine
+capacity misses are grouped into console/debug summaries.
+
+Packing searches try matching partial boxes first, then known empty boxes. Within each group,
+recent observations come first, followed by nearer chests. Both halves of a known double chest count
+as one visit. Recent failed searches are checked last for five minutes, unless the indexed box stock
+changes; uncertain and apparently full sources remain available as a final live fallback.
+
+Packing boxes are checked for actual stack space before pickup. A box that cannot accept the cargo
+is skipped so the bot can use another matching box or an empty one. Completed boxes go directly to
+their assigned lane, including a box that fills up while more loose cargo remains aboard. The bot
+tries other chests in that same lane if the intake is full, then uses imports if the entire lane is
+full. No extra lane or follow-up move task is created for a successful direct delivery.
+
+The completion message calls out how many boxes and item types are waiting in imports. If no import
+can accept the current cargo, the organizer recovers the active reconciliation shulker into the bot
+inventory and saves the remaining queue. Free compatible space if needed, then run
+`stash organize resume`; a fresh scan is not required while that checkpoint remains valid. An
+unreachable destination still stops safely and reports whether its checkpoint can be resumed.
 
 #### Pausing for other work
 
@@ -226,8 +252,10 @@ Zenith reports the bot fully online, then finishes the cooldown and quiet checks
 Scanner checkpoints survive reconnects in the same proxy process; organizer checkpoints also
 survive a full proxy restart.
 
-Routine organizer alerts are limited to the 25%, 50%, and 75% milestones, followed by the normal
-completion message. Errors and recovery problems are still reported immediately.
+Routine progress, item actions, retries, and recoveries stay in console and `stash debug`.
+Discord receives the job start, actionable blockers, and one completion or terminal failure message.
+Progress records include completed and remaining tasks, mixed boxes decomposed, and the loose-item
+tasks generated by reconciliation, so a growing queue does not hide what phase the organizer is in.
 
 When someone connects as the controlling proxy client, the active job pauses immediately and sends
 a warning in game and on Discord. Use `/swap` to move into spectator mode within ten minutes. If
@@ -488,6 +516,29 @@ When enabled, the API server exposes the following endpoints. All endpoints requ
 | `GET` | `/api/v1/regions` | Saved region list |
 | `POST` | `/api/v1/webhook/test` | Send a test webhook payload |
 
+An organizer that stops with a problem reports `state: "FAILED"` and `failed: true`,
+not `DONE`. The organizer response includes `last_failure_reason`, `last_failure_state`,
+and `last_failure_timestamp` (Unix milliseconds). Those details stay with a saved checkpoint;
+after resuming, they describe the previous failure, not the current job state.
+
+While organizing, the bot refreshes the contents of indexed storage containers it opens.
+Both indexed halves of a double chest stay in sync, and temporary packing shulkers are not
+added to the stash index. These are snapshots of visited containers, not a full rescan:
+hoppers can move items afterward. Run `stash scan` after organizing for a complete audit.
+
+For database health, check `database_last_write_attempt` and `database_last_write_success`
+in `/api/v1/status`, alongside `database_write_healthy`. A zero timestamp means no write
+has been attempted or completed since startup. `last_inventory_observation` records the
+latest organizer observation, even if its database write failed. These timestamps use Unix milliseconds.
+
+Transfer confirmations, lane handoffs, recoveries, and failures are also written to the
+console and log files. Failed transfers include the clicked slot, request acceptance, and
+exact-stack counts before and after the attempted move. Routine progress stays out of Discord.
+Taking items requires a matching inventory increase; depositing requires a matching decrease
+across the bot's inventory. A hopper draining the chest won't leave a phantom undelivered item.
+Transfer events include the requested amount, confirmed amount, and observed destination gain.
+Cargo-related aborts also include the acquired, deposited, and remaining task counts.
+
 ### Example request
 
 ```sh
@@ -504,6 +555,11 @@ stash_items_total 56789
 stash_scanner_state 0
 stash_database_connected 1
 stash_organizer_active 0
+stash_organizer_failed 0
+stash_organizer_last_failure_timestamp_seconds 0
+stash_database_last_write_attempt_timestamp_seconds 0
+stash_database_last_write_success_timestamp_seconds 0
+stash_inventory_last_observation_timestamp_seconds 0
 stash_organizer_tasks_completed 0
 stash_organizer_tasks_total 0
 stash_organizer_preemptions_total 0
@@ -526,7 +582,7 @@ stash_connection_recoveries_total 0
 stash_proxy_control_grace_remaining_seconds 0
 ```
 
-Follow the [local Grafana setup guide](grafana-setup.md) to start PostgreSQL, Prometheus, and Grafana,
+Follow the [local Grafana setup guide](tools/grafana-setup.md) to start PostgreSQL, Prometheus, and Grafana,
 then import the included [coordinate-free dashboard](grafana/dashboards/stash-manager-overview.json)
 for either one bot or a fleet without mixing their database records.
 

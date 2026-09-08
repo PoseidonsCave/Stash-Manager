@@ -66,6 +66,32 @@ public final class ItemIdentifier {
         return contents;
     }
 
+    // Physical stack count matters during mixed-box admission: 27 non-stackable tools need
+    // more unpack room than 27 blocks even though both aggregate to a quantity of 27.
+    public static int readShulkerOccupiedSlots(ItemStack shulkerStack) {
+        if (shulkerStack == null || shulkerStack.getAmount() <= 0) return 0;
+
+        try {
+            DataComponents components = shulkerStack.getDataComponents();
+            if (components == null) return 0;
+            Object containerValue = components.get(DataComponentTypes.CONTAINER);
+            if (!(containerValue instanceof List<?> containerItems)) return 0;
+
+            int occupied = 0;
+            for (Object entry : containerItems) {
+                Object value = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
+                if (value instanceof ItemStack innerStack
+                        && innerStack.getId() != 0
+                        && innerStack.getAmount() > 0) {
+                    occupied++;
+                }
+            }
+            return Math.min(27, occupied);
+        } catch (Exception ignored) {
+            return 0;
+        }
+    }
+
     // Strips the enchant suffix (e.g. "diamond_pickaxe[fortune]" -> "diamond_pickaxe") for
     // content-filter comparisons — grouping/matching by primary content only needs the base
     // item type, and a stale index entry captured before enchant suffixes existed would

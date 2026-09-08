@@ -64,6 +64,16 @@ public final class ImportStagingPolicy {
         return Math.max(0, containerSlots(entry) - (int) Math.min(Integer.MAX_VALUE, occupied));
     }
 
+    /** Exact loose quantity only; nested shulker contents do not help chest stack merging. */
+    public static int looseItemCount(ContainerEntry entry, String itemId) {
+        if (entry == null || itemId == null || itemId.isBlank()) return 0;
+        int loose = Math.max(0, entry.items().getOrDefault(itemId, 0));
+        for (ContainerEntry.ShulkerDetail detail : entry.shulkerDetails()) {
+            loose -= Math.max(0, detail.items().getOrDefault(itemId, 0));
+        }
+        return Math.max(0, loose);
+    }
+
     private static int containerSlots(ContainerEntry entry) {
         if (entry.isDouble()) return 54;
         return switch (entry.blockType()) {
