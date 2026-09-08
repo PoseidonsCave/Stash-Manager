@@ -14,7 +14,7 @@ import org.slf4j.LoggerFactory;
 
 // Thread-safe in-memory container inventory index with optional DB persistence.
 public class ContainerIndex {
-    private static final Logger LOGGER = LoggerFactory.getLogger("StashManager/ContainerIndex");
+    private static final Logger LOGGER = LoggerFactory.getLogger("Plugin.StashManager.ContainerIndex");
 
     private final ConcurrentHashMap<Long, ContainerEntry> entries = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, int[]> importChests = new ConcurrentHashMap<>();
@@ -22,6 +22,9 @@ public class ContainerIndex {
     private volatile long lastScanTimestamp = 0;
     private volatile boolean databaseWriteHealthy = true;
     private volatile boolean databaseWriteFailureLogged = false;
+    private volatile long databaseLastWriteAttempt = 0;
+    private volatile long databaseLastWriteSuccess = 0;
+    private volatile long lastInventoryObservation = 0;
     private DatabaseManager database;
 
     public void setDatabase(DatabaseManager database) {
@@ -29,6 +32,10 @@ public class ContainerIndex {
     }
 
     public void put(ContainerEntry entry) {
+        put(entry, true);
+    }
+
+    private void put(ContainerEntry entry, boolean scanned) {
         // Rescans never carry a label of their own — preserve whatever label
         // (manual or auto-assigned) was already set for this position.
         if (entry.label() == null) {
@@ -39,13 +46,15 @@ public class ContainerIndex {
         }
 
         entries.put(entry.posKey(), entry);
-        lastScanTimestamp = System.currentTimeMillis();
+        if (scanned) lastScanTimestamp = System.currentTimeMillis();
 
         // Preserve the in-memory scan even if persistence fails, but expose and log that
         // distinction so an apparently successful scan cannot silently leave PostgreSQL empty.
         if (database != null && database.isInitialized()) {
+            databaseLastWriteAttempt = System.currentTimeMillis();
             try {
                 database.upsertContainer(entry);
+                databaseLastWriteSuccess = System.currentTimeMillis();
                 databaseWriteHealthy = true;
                 databaseWriteFailureLogged = false;
             } catch (Exception e) {
@@ -66,6 +75,28 @@ public class ContainerIndex {
 
     public long getDatabaseWriteFailures() {
         return databaseWriteFailures.get();
+    }
+
+    public long getDatabaseLastWriteAttempt() { return databaseLastWriteAttempt; }
+    public long getDatabaseLastWriteSuccess() { return databaseLastWriteSuccess; }
+    public long getLastInventoryObservation() { return lastInventoryObservation; }
+
+    /** Update both indexed halves of a shared inventory without inventing new chest rows. */
+    public void recordInventoryObservation(ContainerEntry observation) {
+        ContainerEntry existing = entries.get(observation.posKey());
+        if (existing == null) return;
+        List<ContainerEntry> aliases = entries.values().stream()
+                .filter(entry -> entry.posKey() == existing.posKey()
+                        || (existing.isDouble() && existing.inventoryFootprintKnown()
+                            && entry.isDouble() && entry.inventoryFootprintKnown()
+                            && entry.blockType().equals(existing.blockType())
+                            && entry.inventoryKey() == existing.inventoryKey()))
+                .toList();
+        for (ContainerEntry alias : aliases) {
+            put(alias.withContents(observation.items(), observation.shulkerCount(),
+                    observation.shulkerDetails(), observation.timestamp()), false);
+        }
+        lastInventoryObservation = observation.timestamp();
     }
 
     public boolean isImportChest(int x, int y, int z) {

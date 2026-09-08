@@ -150,6 +150,13 @@ public record ContainerEntry(
                 | ((long) inventoryZ & 0x3FFFFFFL);
     }
 
+    public ContainerEntry withContents(Map<String, Integer> observedItems, int observedShulkers,
+                                       List<ShulkerDetail> observedDetails, long observedAt) {
+        return new ContainerEntry(x, y, z, blockType, isDouble, observedItems, observedShulkers,
+                observedDetails, observedAt, label, hopperFacing,
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis);
+    }
+
     public boolean inventoryFootprintKnown() {
         return !isDouble || (inventoryIdentityKnown && doubleChestAxis != null);
     }

@@ -93,7 +93,9 @@ public final class MixedShulkerPlaybook {
 
     /** Stages the current batch before the last safe inventory slot can be consumed. */
     public static boolean shouldStageBeforeNextTransfer(int freeSlots, int cargoSlots) {
-        return cargoSlots > 0 && freeSlots <= RESERVED_HEADROOM_SLOTS;
+        return cargoSlots > 0
+                && (cargoSlots >= MAX_TRANSFER_BATCH_SLOTS
+                    || freeSlots <= RESERVED_HEADROOM_SLOTS);
     }
 
     public static int reservedHeadroomSlots() {

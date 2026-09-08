@@ -40,6 +40,11 @@ final class OrganizerJournalStore {
 
     record ColumnSnapshot(int id, List<int[]> chests) {}
 
+    record PackingProgress(int movedUnits, int zeroFillCycles,
+                           boolean atMaximumCapacity, boolean laneExhausted) {}
+
+    record Failure(String reason, String state, long timestamp) {}
+
     record Plan(
             int schemaVersion,
             String jobId,
@@ -94,7 +99,10 @@ final class OrganizerJournalStore {
             List<int[]> mixedStagingUsedDestinations,
             List<Integer> protectedInventorySlots,
             boolean stopAfterShulkerRecovery,
-            String shulkerRecoveryTrigger) {}
+            String shulkerRecoveryTrigger,
+            PackingProgress packingProgress,
+            Failure lastFailure,
+            MixedStagingLedger.Snapshot mixedStagingLedger) {}
 
     record Loaded(Plan plan, Checkpoint checkpoint) {}
 

@@ -202,13 +202,28 @@ Mixed-shulker reconciliation also needs at least one registered import chest. It
 small, reusable transfer buffer: unload one mixed box, repack those exact items, then continue.
 The organizer moves those stacks into known-empty inventory slots, so matching keep-list gear is
 not accidentally swept into the returned kit.
+Follow-up work remembers which item type went into which import chest, including partial deposits
+split across several chests. It no longer pairs every item type with every staging chest. If a
+connection drops during a deposit, only that attempted item/chest pair needs a cautious recheck.
+Older checkpoints remain usable; already queued work is retained, and an older mixed box in progress
+uses its conservative fallback until that box is finished.
 
-Import capacity is checked from the live container window for the exact cargo being moved. The bot
-prefers an import already holding that item, then an empty import, then any import with enough empty
-or matching-stack space. A rejection applies only to that cargo transaction, so a chest that cannot
-hold an unstackable shulker is still considered later for an item it can merge. The organizer only
-reports an import-capacity stop after it has checked every registered physical import inventory for
-the current cargo.
+Import capacity is checked from the live container window for the exact cargo being moved. Recent
+checks help the bot go straight to a chest with usable space, including compatible partial stacks.
+Those observations expire after five minutes and refresh whenever the organizer visits that chest.
+Known full chests are checked last, and still get a live recheck before a capacity stop. Routine
+capacity misses are grouped into console/debug summaries.
+
+Packing searches try matching partial boxes first, then known empty boxes. Within each group,
+recent observations come first, followed by nearer chests. Both halves of a known double chest count
+as one visit. Recent failed searches are checked last for five minutes, unless the indexed box stock
+changes; uncertain and apparently full sources remain available as a final live fallback.
+
+Packing boxes are checked for actual stack space before pickup. A box that cannot accept the cargo
+is skipped so the bot can use another matching box or an empty one. Completed boxes go directly to
+their assigned lane, including a box that fills up while more loose cargo remains aboard. The bot
+tries other chests in that same lane if the intake is full, then uses imports if the entire lane is
+full. No extra lane or follow-up move task is created for a successful direct delivery.
 
 The completion message calls out how many boxes and item types are waiting in imports. If no import
 can accept the current cargo, the organizer recovers the active reconciliation shulker into the bot
@@ -501,6 +516,29 @@ When enabled, the API server exposes the following endpoints. All endpoints requ
 | `GET` | `/api/v1/regions` | Saved region list |
 | `POST` | `/api/v1/webhook/test` | Send a test webhook payload |
 
+An organizer that stops with a problem reports `state: "FAILED"` and `failed: true`,
+not `DONE`. The organizer response includes `last_failure_reason`, `last_failure_state`,
+and `last_failure_timestamp` (Unix milliseconds). Those details stay with a saved checkpoint;
+after resuming, they describe the previous failure, not the current job state.
+
+While organizing, the bot refreshes the contents of indexed storage containers it opens.
+Both indexed halves of a double chest stay in sync, and temporary packing shulkers are not
+added to the stash index. These are snapshots of visited containers, not a full rescan:
+hoppers can move items afterward. Run `stash scan` after organizing for a complete audit.
+
+For database health, check `database_last_write_attempt` and `database_last_write_success`
+in `/api/v1/status`, alongside `database_write_healthy`. A zero timestamp means no write
+has been attempted or completed since startup. `last_inventory_observation` records the
+latest organizer observation, even if its database write failed. These timestamps use Unix milliseconds.
+
+Transfer confirmations, lane handoffs, recoveries, and failures are also written to the
+console and log files. Failed transfers include the clicked slot, request acceptance, and
+exact-stack counts before and after the attempted move. Routine progress stays out of Discord.
+Taking items requires a matching inventory increase; depositing requires a matching decrease
+across the bot's inventory. A hopper draining the chest won't leave a phantom undelivered item.
+Transfer events include the requested amount, confirmed amount, and observed destination gain.
+Cargo-related aborts also include the acquired, deposited, and remaining task counts.
+
 ### Example request
 
 ```sh
@@ -517,6 +555,11 @@ stash_items_total 56789
 stash_scanner_state 0
 stash_database_connected 1
 stash_organizer_active 0
+stash_organizer_failed 0
+stash_organizer_last_failure_timestamp_seconds 0
+stash_database_last_write_attempt_timestamp_seconds 0
+stash_database_last_write_success_timestamp_seconds 0
+stash_inventory_last_observation_timestamp_seconds 0
 stash_organizer_tasks_completed 0
 stash_organizer_tasks_total 0
 stash_organizer_preemptions_total 0

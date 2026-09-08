@@ -17,11 +17,9 @@ import static com.zenith.Globals.CACHE;
 public class ContainerReader {
 
     private final ContainerIndex index;
-    private final ShulkerIntrospector shulkerIntrospector;
 
     public ContainerReader(ContainerIndex index) {
         this.index = index;
-        this.shulkerIntrospector = new ShulkerIntrospector();
     }
 
     // Read the currently open container and record its contents to the index.
@@ -37,31 +35,6 @@ public class ContainerReader {
         // after the container's own slots — exclude them or every scan attributes
         // whatever the bot happens to be carrying to every container it opens.
         int containerSlotCount = Math.max(0, size - 36);
-        Map<String, Integer> items = new LinkedHashMap<>();
-        int shulkerCount = 0;
-        var shulkerDetails = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
-
-        for (int slot = 0; slot < containerSlotCount; slot++) {
-            ItemStack stack = open.getItemStack(slot);
-            if (stack == null || stack.getId() == 0 || stack.getAmount() <= 0) continue;
-
-            String itemId = getItemId(stack);
-            items.merge(itemId, stack.getAmount(), Integer::sum);
-
-            // Check if this item is a shulker box
-            if (isShulkerBox(itemId)) {
-                shulkerCount++;
-                var shulkerDetail = shulkerIntrospector.introspect(stack);
-                if (shulkerDetail != null) {
-                    shulkerDetails.add(new ContainerEntry.ShulkerDetail(
-                            slot, shulkerDetail.color(), shulkerDetail.items()));
-                    for (var entry : shulkerDetail.items().entrySet()) {
-                        // Also add shulker contents to the container-level items
-                        items.merge(entry.getKey(), entry.getValue(), Integer::sum);
-                    }
-                }
-            }
-        }
 
         boolean actualDouble = (location.type() == BlockEntityType.CHEST
                 || location.type() == BlockEntityType.TRAPPED_CHEST)
@@ -76,9 +49,9 @@ public class ContainerReader {
             location.x(), location.y(), location.z(),
             blockType,
             actualDouble,
-            items,
-            shulkerCount,
-            shulkerDetails,
+            Map.of(),
+            0,
+            java.util.List.of(),
             System.currentTimeMillis(),
             null,
             hopperFacing,
@@ -89,9 +62,31 @@ public class ContainerReader {
             doubleChestAxis
         );
 
-        index.put(containerEntry);
+        index.put(snapshotContents(open, containerEntry, System.currentTimeMillis()));
 
         return true;
+    }
+
+    /** Refresh contents only; retain the scanned footprint, lane geometry, and label. */
+    public static ContainerEntry snapshotContents(Container open, ContainerEntry location, long timestamp) {
+        int slots = open.getSize() - 36;
+        Map<String, Integer> items = new LinkedHashMap<>();
+        var shulkers = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
+        ShulkerIntrospector introspector = new ShulkerIntrospector();
+        int shulkerCount = 0;
+        for (int slot = 0; slot < slots; slot++) {
+            ItemStack stack = open.getItemStack(slot);
+            if (stack == null || stack.getId() == 0 || stack.getAmount() <= 0) continue;
+            String itemId = ItemIdentifier.getItemId(stack);
+            items.merge(itemId, stack.getAmount(), Integer::sum);
+            if (!itemId.contains("shulker_box")) continue;
+            shulkerCount += stack.getAmount();
+            var detail = introspector.introspect(stack);
+            if (detail == null) continue;
+            shulkers.add(new ContainerEntry.ShulkerDetail(slot, detail.color(), detail.items()));
+            detail.items().forEach((item, count) -> items.merge(item, count, Integer::sum));
+        }
+        return location.withContents(items, shulkerCount, shulkers, timestamp);
     }
 
     private String doubleChestAxis(DoubleChestIdentity.Resolution identity) {
@@ -101,14 +96,6 @@ public class ContainerReader {
         if (first[0] != second[0]) return "X";
         if (first[2] != second[2]) return "Z";
         return null;
-    }
-
-    private String getItemId(ItemStack stack) {
-        return ItemIdentifier.getItemId(stack);
-    }
-
-    private boolean isShulkerBox(String itemId) {
-        return itemId.contains("shulker_box");
     }
 
     private String blockEntityTypeToId(BlockEntityType type) {

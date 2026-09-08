@@ -74,6 +74,9 @@ public class ApiHandler {
         body.put("database_connected", database != null && database.isInitialized());
         body.put("database_write_healthy", index.isDatabaseWriteHealthy());
         body.put("database_write_failures", index.getDatabaseWriteFailures());
+        body.put("database_last_write_attempt", index.getDatabaseLastWriteAttempt());
+        body.put("database_last_write_success", index.getDatabaseLastWriteSuccess());
+        body.put("last_inventory_observation", index.getLastInventoryObservation());
         body.put("import_chest_blocks", index.getImportChestBlockCount());
 
         if (config.pos1 != null && config.pos2 != null) {
@@ -326,6 +329,15 @@ public class ApiHandler {
         sb.append("# HELP stash_database_write_failures_total Container persistence failures since plugin startup\n");
         sb.append("# TYPE stash_database_write_failures_total counter\n");
         sb.append("stash_database_write_failures_total ").append(index.getDatabaseWriteFailures()).append('\n');
+        appendGauge(sb, "stash_database_last_write_attempt_timestamp_seconds",
+                "Latest container write attempt since startup (zero means none)",
+                index.getDatabaseLastWriteAttempt() / 1000.0);
+        appendGauge(sb, "stash_database_last_write_success_timestamp_seconds",
+                "Latest successful container write since startup (zero means none)",
+                index.getDatabaseLastWriteSuccess() / 1000.0);
+        appendGauge(sb, "stash_inventory_last_observation_timestamp_seconds",
+                "Latest organizer chest observation since startup (zero means none)",
+                index.getLastInventoryObservation() / 1000.0);
 
         if (database != null && database.isInitialized()) {
             try {
@@ -353,6 +365,10 @@ public class ApiHandler {
         // Organizer
         var organizer = module.getOrganizer();
         if (organizer != null) {
+            appendGauge(sb, "stash_organizer_failed", "Whether the organizer stopped with a failure",
+                    organizer.isFailed() ? 1 : 0);
+            appendGauge(sb, "stash_organizer_last_failure_timestamp_seconds", "Latest terminal organizer failure",
+                    organizer.getLastFailureTimestamp() / 1000.0);
             sb.append("# HELP stash_organizer_active Whether the organizer is running (1=yes, 0=no)\n");
             sb.append("# TYPE stash_organizer_active gauge\n");
             sb.append("stash_organizer_active ").append(organizer.isActive() ? 1 : 0).append('\n');
@@ -480,6 +496,10 @@ public class ApiHandler {
             body.put("available", true);
             body.put("state", organizer.getState().name());
             body.put("active", organizer.isActive());
+            body.put("failed", organizer.isFailed());
+            body.put("last_failure_reason", organizer.getLastFailureReason());
+            body.put("last_failure_state", organizer.getLastFailureState());
+            body.put("last_failure_timestamp", organizer.getLastFailureTimestamp());
             body.put("completed_tasks", organizer.getCompletedTasks());
             body.put("total_tasks", organizer.getTotalTasks());
             body.put("durable_checkpoint", organizer.hasDurableCheckpoint());
