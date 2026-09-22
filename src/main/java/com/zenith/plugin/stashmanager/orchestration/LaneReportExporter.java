@@ -116,7 +116,7 @@ public final class LaneReportExporter {
         sheet.mergedText(35, 1, 4, nextStep,
                 construction.requirements().isEmpty() ? STYLE_SUCCESS : STYLE_WARNING, 38);
         sheet.mergedText(37, 1, 4,
-                "Quick rule: a shulker has 27 slots. A double chest holds 54 shulkers. Stack size changes how many items fit inside each shulker.",
+                "A shulker has 27 slots; a double chest holds 54 shulkers. Named stacks stay in one item lane but count as separate occupied slots.",
                 STYLE_NOTE, 34);
         return sheet.finish(null, null, null);
     }
@@ -134,7 +134,7 @@ public final class LaneReportExporter {
                 19, 22, 24, 19, 22, 20, 18, 18, 62});
         sheet.mergedText(1, 1, headers.length, "What to Build", STYLE_TITLE, 28);
         sheet.mergedText(2, 1, headers.length,
-                "Start at the top and work your way down. Run another scan when you're finished.",
+                "Start at the top. Max per stack is a theoretical limit; planned spots also account for separate observed stacks. Rescan when you're finished.",
                 STYLE_SUBTITLE, 22);
         sheet.header(4, headers);
 

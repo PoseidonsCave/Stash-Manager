@@ -21,22 +21,30 @@ public record ContainerEntry(
     int inventoryX, int inventoryY, int inventoryZ,
     boolean inventoryIdentityKnown,
     // X or Z for a known double-chest footprint; null for singles and legacy rows.
-    String doubleChestAxis
+    String doubleChestAxis,
+    // Physical stack slots by item type for directly accessible cargo; no names are stored.
+    Map<String, Integer> directStackSlots
 ) {
 
     // Per-shulker breakdown: color and items inside.
     public record ShulkerDetail(
         int slot,
         String color,
-        Map<String, Integer> items
+        Map<String, Integer> items,
+        Map<String, Integer> stackSlots
     ) {
         public ShulkerDetail {
             items = items == null ? Collections.emptyMap() : new LinkedHashMap<>(items);
+            stackSlots = stackSlots == null ? Collections.emptyMap() : new LinkedHashMap<>(stackSlots);
+        }
+
+        public ShulkerDetail(int slot, String color, Map<String, Integer> items) {
+            this(slot, color, items, Map.of());
         }
 
         // Legacy scans/database rows were aggregated by color and have no physical slot.
         public ShulkerDetail(String color, Map<String, Integer> items) {
-            this(-1, color, items);
+            this(-1, color, items, Map.of());
         }
 
         public boolean isPhysicalInstance() {
@@ -48,6 +56,18 @@ public record ContainerEntry(
         items = items == null ? Collections.emptyMap() : new LinkedHashMap<>(items);
         shulkerDetails = shulkerDetails == null ? Collections.emptyList() : List.copyOf(shulkerDetails);
         doubleChestAxis = normalizeDoubleChestAxis(isDouble, doubleChestAxis);
+        directStackSlots = directStackSlots == null ? Collections.emptyMap() : new LinkedHashMap<>(directStackSlots);
+    }
+
+    public ContainerEntry(int x, int y, int z, String blockType, boolean isDouble,
+                          Map<String, Integer> items, int shulkerCount,
+                          List<ShulkerDetail> shulkerDetails, long timestamp,
+                          String label, String hopperFacing,
+                          int inventoryX, int inventoryY, int inventoryZ,
+                          boolean inventoryIdentityKnown, String doubleChestAxis) {
+        this(x, y, z, blockType, isDouble, items, shulkerCount, shulkerDetails, timestamp,
+                label, hopperFacing, inventoryX, inventoryY, inventoryZ,
+                inventoryIdentityKnown, doubleChestAxis, Map.of());
     }
 
     // Convenience constructor without label (backwards compatible).
@@ -141,7 +161,8 @@ public record ContainerEntry(
     public ContainerEntry withLabel(String newLabel) {
         return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
                 shulkerDetails, timestamp, newLabel, hopperFacing,
-                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis);
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis,
+                directStackSlots);
     }
 
     public long inventoryKey() {
@@ -152,9 +173,16 @@ public record ContainerEntry(
 
     public ContainerEntry withContents(Map<String, Integer> observedItems, int observedShulkers,
                                        List<ShulkerDetail> observedDetails, long observedAt) {
+        return withContents(observedItems, observedShulkers, observedDetails, observedAt, Map.of());
+    }
+
+    public ContainerEntry withContents(Map<String, Integer> observedItems, int observedShulkers,
+                                       List<ShulkerDetail> observedDetails, long observedAt,
+                                       Map<String, Integer> observedDirectStackSlots) {
         return new ContainerEntry(x, y, z, blockType, isDouble, observedItems, observedShulkers,
                 observedDetails, observedAt, label, hopperFacing,
-                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis);
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis,
+                observedDirectStackSlots);
     }
 
     public boolean inventoryFootprintKnown() {

@@ -71,6 +71,7 @@ public class ContainerReader {
     public static ContainerEntry snapshotContents(Container open, ContainerEntry location, long timestamp) {
         int slots = open.getSize() - 36;
         Map<String, Integer> items = new LinkedHashMap<>();
+        Map<String, Integer> directStackSlots = new LinkedHashMap<>();
         var shulkers = new java.util.ArrayList<ContainerEntry.ShulkerDetail>();
         ShulkerIntrospector introspector = new ShulkerIntrospector();
         int shulkerCount = 0;
@@ -79,14 +80,18 @@ public class ContainerReader {
             if (stack == null || stack.getId() == 0 || stack.getAmount() <= 0) continue;
             String itemId = ItemIdentifier.getItemId(stack);
             items.merge(itemId, stack.getAmount(), Integer::sum);
-            if (!itemId.contains("shulker_box")) continue;
+            if (!itemId.contains("shulker_box")) {
+                directStackSlots.merge(itemId, 1, Integer::sum);
+                continue;
+            }
             shulkerCount += stack.getAmount();
             var detail = introspector.introspect(stack);
             if (detail == null) continue;
-            shulkers.add(new ContainerEntry.ShulkerDetail(slot, detail.color(), detail.items()));
+            shulkers.add(new ContainerEntry.ShulkerDetail(slot, detail.color(), detail.items(),
+                    detail.stackSlots()));
             detail.items().forEach((item, count) -> items.merge(item, count, Integer::sum));
         }
-        return location.withContents(items, shulkerCount, shulkers, timestamp);
+        return location.withContents(items, shulkerCount, shulkers, timestamp, directStackSlots);
     }
 
     private String doubleChestAxis(DoubleChestIdentity.Resolution identity) {

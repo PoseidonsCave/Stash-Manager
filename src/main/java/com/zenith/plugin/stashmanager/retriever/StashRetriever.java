@@ -1,6 +1,7 @@
 package com.zenith.plugin.stashmanager.retriever;
 
 import com.zenith.Proxy;
+import com.zenith.cache.data.inventory.Container;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.ClickItem;
 import com.zenith.feature.inventory.actions.CloseContainer;
@@ -374,15 +375,16 @@ public final class StashRetriever {
             ItemStack stack = containerSlots[actionSlotIndex];
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
-                boolean wantedDirectly = isWanted(itemId);
+                String requestKey = requestKeyForItem(remaining, itemId);
+                boolean wantedDirectly = requestKey != null;
                 boolean wantedForContents = !wantedDirectly && containsWantedContents(stack);
-                Integer needed = remaining.get(itemId);
+                Integer needed = requestKey == null ? null : remaining.get(requestKey);
 
-                if ((wantedDirectly || wantedForContents) && hasInventoryRoom()) {
+                if ((wantedDirectly || wantedForContents) && hasInventoryRoom(stack)) {
                     
                     // Split stacks larger than the remaining request.
                     if (wantedDirectly && !wantedForContents && needed != null && needed > 0 && stack.getAmount() > needed) {
-                        beginSplitTake(actionSlotIndex, itemId, stack.getAmount(), needed);
+                        beginSplitTake(actionSlotIndex, requestKey, stack.getAmount(), needed);
                         actionSlotIndex++;
                         actionCooldown = CLICK_COOLDOWN_TICKS;
                         return;
@@ -410,7 +412,7 @@ public final class StashRetriever {
                     }
 
                     if (needed != null && needed > 0) {
-                        remaining.put(itemId, Math.max(0, needed - stack.getAmount()));
+                        remaining.put(requestKey, Math.max(0, needed - stack.getAmount()));
                     }
 
                     if (successfulTransfers % 5 == 0) {
@@ -638,10 +640,11 @@ public final class StashRetriever {
             ItemStack stack = containerSlots[actionSlotIndex];
             if (stack != null && stack.getAmount() > 0) {
                 String itemId = itemIdFromStack(stack);
-                Integer needed = remaining.get(itemId);
-                if (needed != null && needed > 0 && hasInventoryRoom()) {
+                String requestKey = requestKeyForItem(remaining, itemId);
+                Integer needed = requestKey == null ? null : remaining.get(requestKey);
+                if (needed != null && needed > 0 && hasInventoryRoom(stack)) {
                     if (stack.getAmount() > needed) {
-                        beginSplitTake(actionSlotIndex, itemId, stack.getAmount(), needed);
+                        beginSplitTake(actionSlotIndex, requestKey, stack.getAmount(), needed);
                         actionSlotIndex++;
                         actionCooldown = CLICK_COOLDOWN_TICKS;
                         return;
@@ -652,7 +655,7 @@ public final class StashRetriever {
                         return;
                     }
                     successfulTransfers++;
-                    remaining.put(itemId, Math.max(0, needed - stack.getAmount()));
+                    remaining.put(requestKey, Math.max(0, needed - stack.getAmount()));
                     actionSlotIndex++;
                     actionCooldown = CLICK_COOLDOWN_TICKS;
 
@@ -869,7 +872,7 @@ public final class StashRetriever {
         for (var kv : remaining.entrySet()) {
             int need = kv.getValue();
             if (need <= 0) continue;
-            int have = entry.items().getOrDefault(kv.getKey(), 0);
+            int have = amountMatchingRequest(entry.items(), kv.getKey());
             if (have > 0) {
                 score += Math.min(need, have);
             }
@@ -893,7 +896,7 @@ public final class StashRetriever {
         for (var kv : remaining.entrySet()) {
             int need = kv.getValue();
             if (need <= 0) continue;
-            int have = direct.getOrDefault(kv.getKey(), 0);
+            int have = amountMatchingRequest(direct, kv.getKey());
             if (have > 0) {
                 score += Math.min(need, have);
             }
@@ -918,8 +921,33 @@ public final class StashRetriever {
     }
 
     private boolean isWanted(String itemId) {
-        Integer needed = remaining.get(itemId);
-        return needed != null && needed > 0;
+        return requestKeyForItem(remaining, itemId) != null;
+    }
+
+    /** A plain request accepts named/enchantment variants; a qualified request stays exact. */
+    static String requestKeyForItem(Map<String, Integer> requests, String observedItemId) {
+        if (requests == null || observedItemId == null) return null;
+        Integer exact = requests.get(observedItemId);
+        if (exact != null && exact > 0) return observedItemId;
+        String base = ItemIdentifier.baseItemId(observedItemId);
+        Integer baseNeed = requests.get(base);
+        return baseNeed != null && baseNeed > 0 ? base : null;
+    }
+
+    static int amountMatchingRequest(Map<String, Integer> indexedItems, String requestItemId) {
+        if (indexedItems == null || requestItemId == null) return 0;
+        String requestBase = ItemIdentifier.baseItemId(requestItemId);
+        if (!requestItemId.equals(requestBase)) {
+            return Math.max(0, indexedItems.getOrDefault(requestItemId, 0));
+        }
+        int total = 0;
+        for (var entry : indexedItems.entrySet()) {
+            if (requestBase.equals(ItemIdentifier.baseItemId(entry.getKey()))
+                    && entry.getValue() != null && entry.getValue() > 0) {
+                total += entry.getValue();
+            }
+        }
+        return total;
     }
 
     private boolean isComplete() {
@@ -1006,15 +1034,29 @@ public final class StashRetriever {
     }
 
 
-    private boolean hasInventoryRoom() {
+    private boolean hasInventoryRoom(ItemStack incoming) {
         var invCache = CACHE.getPlayerCache().getInventoryCache();
         var playerContainer = invCache.getPlayerInventory();
         if (playerContainer == null) return false;
+
+        return hasPlayerInventoryRoomFor(playerContainer, incoming);
+    }
+
+    static boolean hasPlayerInventoryRoomFor(Container playerContainer, ItemStack incoming) {
+        if (playerContainer == null || incoming == null || incoming.getAmount() <= 0) return false;
+        var incomingData = ItemRegistry.REGISTRY.get(incoming.getId());
+        int maxStack = incomingData == null ? 1 : Math.max(1, incomingData.stackSize());
 
         // Player inventory: main 9-35, hotbar 36-44.
         for (int i = 9; i < 45; i++) {
             ItemStack stack = playerContainer.getItemStack(i);
             if (stack == null || stack.getAmount() == 0) return true;
+            if (stack.getId() == incoming.getId()
+                    && stack.getAmount() < maxStack
+                    && java.util.Objects.equals(
+                            stack.getDataComponents(), incoming.getDataComponents())) {
+                return true;
+            }
         }
         return false;
     }

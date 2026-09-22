@@ -10,6 +10,11 @@ final class CargoTransactionLedger {
         deposited = 0;
     }
 
+    void restore(int acquiredUnits, int depositedUnits) {
+        acquired = Math.max(0, acquiredUnits);
+        deposited = Math.min(acquired, Math.max(0, depositedUnits));
+    }
+
     void recordAcquired(int units) {
         acquired += Math.max(0, units);
     }

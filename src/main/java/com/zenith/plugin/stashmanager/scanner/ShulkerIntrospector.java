@@ -20,7 +20,8 @@ public class ShulkerIntrospector {
         try {
             String color = extractShulkerColor(shulkerStack);
             Map<String, Integer> items = ItemIdentifier.readShulkerContents(shulkerStack);
-            return new ContainerEntry.ShulkerDetail(color, items);
+            return new ContainerEntry.ShulkerDetail(-1, color, items,
+                    ItemIdentifier.readShulkerStackSlots(shulkerStack));
         } catch (Exception e) {
             return null;
         }

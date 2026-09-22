@@ -145,6 +145,23 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stash get status` | Show retrieval progress and remaining items |
 | `stash get stop` | Stop the active retrieval task |
 
+### 🍞 Bot supplies
+
+| Command | Description |
+|---------|-------------|
+| `stash keep add <item_id>` | Keep every matching item in the bot inventory |
+| `stash keep add <item_id> <count>` | Protect and replenish up to this quantity during long stash jobs |
+| `stash keep remove <item_id>` | Remove an item from the keep list |
+| `stash keep list` | Show the current protected items and quantity targets |
+
+Use a finite count for at least one safe food, such as `stash keep add golden_carrot 64`.
+When a scan or organization job starts, StashManager tops that supply up from the scanned stash.
+If Zenith's AutoEat reports that it has run out during the job, StashManager checkpoints the current
+work, retrieves the missing keep-list food, and resumes through the normal cooldown and quiet checks.
+An unlimited food rule protects existing food but does not define how much the bot may automatically
+take. If no safe finite food target or indexed stock is available, the job stays paused instead of
+continuing toward starvation.
+
 ### 🧭 Organizer
 
 | Command | Description |
@@ -171,7 +188,7 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | 3 | Mixed shulkers and returned kits are opened one at a time and their loose cargo is staged through registered import chests. The bot never guesses from a majority item. |
 | 4 | Staged cargo is packed into exact-item bulk shulkers, filling a matching partial box before using an empty one. |
 | 5 | Each completed bulk shulker goes to its assigned lane. When no suitable lane exists, it waits safely in an import chest instead. |
-| 6 | Partial matching shulkers are filled before empty ones are used. Each mixed box is fully cleared and its empty box is reused before the next mixed box starts. |
+| 6 | Once a mixed box is verified empty and picked back up, its shell becomes packing stock. Matching partial boxes are preferred, and spare shells go back into imports. |
 
 The capacity check uses each item's real stack size and the free room inside matching shulkers.
 `stash lanes` turns that into plain lane and double chest counts. `stash lanes export` gives you a
@@ -190,6 +207,11 @@ imports.
 > record both physical shulker instances and the X/Z footprint of every double chest. Older rows
 > stay blocked instead of guessing in dense storage banks.
 
+Lane planning also records how many physical stack slots each item type occupies. Differently named
+stacks stay in the same item lane, but the capacity report no longer assumes they can merge into a
+single 64-item stack. The scan stores slot counts, not item names. Refresh older scans to get this
+more accurate estimate; old rows use a conservative upper bound until rescanned.
+
 #### Import chests
 
 Normal standalone chests are left alone. Face a chest and run `stash import` when you want the
@@ -201,7 +223,9 @@ either half of a double chest assigns or removes the whole chest.
 Mixed-shulker reconciliation also needs at least one registered import chest. It uses imports as a
 small, reusable transfer buffer: unload one mixed box, repack those exact items, then continue.
 The organizer moves those stacks into known-empty inventory slots, so matching keep-list gear is
-not accidentally swept into the returned kit.
+not accidentally swept into the returned kit. Keep protection follows the configured items and
+quantities in the live inventory rather than permanently reserving their original slots. This lets
+another plugin consume or move kept supplies without turning the vacated slot into unusable space.
 Follow-up work remembers which item type went into which import chest, including partial deposits
 split across several chests. It no longer pairs every item type with every staging chest. If a
 connection drops during a deposit, only that attempted item/chest pair needs a cautious recheck.
@@ -218,12 +242,73 @@ Packing searches try matching partial boxes first, then known empty boxes. Withi
 recent observations come first, followed by nearer chests. Both halves of a known double chest count
 as one visit. Recent failed searches are checked last for five minutes, unless the indexed box stock
 changes; uncertain and apparently full sources remain available as a final live fallback.
+Each packing request checks at most eight chest candidates, including at most three speculative
+checks. Reconnecting does not reset that budget. If none can supply a usable box, the bot stages
+that cargo in imports and keeps its packing tasks queued while it works on other mixed boxes.
+All stored-source packing tasks for that exact item type wait together, including partial sources
+and newly queued follow-ups. Duplicate item/source/destination tasks are merged using known double
+chest identities, including when an older checkpoint is loaded. Staging cargo back into imports
+does not count as completed organization. The planned task count may shrink as duplicates are merged.
+After three staging handoffs for one item type without a productive packed-box delivery, that type
+waits for a verified empty shell instead of retrying indexed supply hints. Other work continues;
+the wait survives reconnects, and its cargo stays in imports. The job only stops for missing packing
+supply when no independent work can continue.
+
+Failed packing actions, including shulker placement, use the same tracked import handoff.
+Partial deposits keep every destination on record. Once all cargo is staged, the bot clears that
+batch's counters before selecting more work; an old counter cannot start packing an empty inventory.
+Missing handoff evidence still stops the job for inspection rather than assuming cargo was stored.
+
+An emptied mixed shulker is a useful output, not waste. Only a verified-empty box recovered into
+unprotected inventory counts as supply. The bot can keep one shell handy while topping up matching
+partial boxes; surplus and unused shells are stored in imports. A recovered shell wakes one deferred
+item group when the packing step claims it, including older loose-item tasks. The selected group
+gets that shell before another group can use it; mandatory inventory cleanup still comes first.
+Partial or interrupted staging deposits retain their exact import-chest references across restarts.
+Required inventory cleanup comes before optional shell reuse. If a spare empty box blocks the next
+mixed pickup, the bot stores it in an import chest and confirms the deposit before returning to that
+mixed box. A full import sends it to another registered import; if none can accept it, the job stops
+with the box still aboard. Restarting keeps that cleanup first, including for older saved jobs.
+If other work runs out and no usable box remains, the job saves its queue instead of claiming it is
+finished. Put an empty shulker in an unprotected bot inventory slot, then use `stash organize resume`.
+That route does not require a fresh scan. Shelves that were changed by hand still need their index
+refreshed before the planner can rely on them.
+
+If collecting loose items reaches the reserved inventory slot, the bot packs what it has before
+touching another mixed box. The unfinished source stays queued once; a partial pickup does not
+count as finishing that source. This handoff also survives a restart.
+
+If three inventory recoveries return to the same mixed box without freeing more space, delivering
+newly packed cargo, or finishing a mixed box, the organizer stops and sends a failure notification.
+Cargo and queued work stay saved. Look for `inventory_recovery_no_progress` in the status or logs;
+reconnecting alone does not reset this safeguard. Routine handoffs stay in console/debug output.
+
+On the way back to the reconciliation station, ten seconds without meaningful movement triggers a
+short sideways or backward detour. The bot tries at most three, using only loaded, level ground
+with solid footing and clear headroom. It will not mine or bridge to make a detour work. The cargo,
+assigned lane, and starting-position worksite stay unchanged; reaching a detour is not task completion.
+Return trips can use up to four times `organizerWalkTimeoutTicks` (four minutes by default), but
+stalled recovery stops sooner. The budget survives pauses and restarts. If it runs out, the job saves
+its cargo and queue; you can bring the bot back to its starting position before resuming. Console/debug
+events named `organize_station_walk_*` show distance, idle time, attempts, and path-request status.
 
 Packing boxes are checked for actual stack space before pickup. A box that cannot accept the cargo
 is skipped so the bot can use another matching box or an empty one. Completed boxes go directly to
 their assigned lane, including a box that fills up while more loose cargo remains aboard. The bot
 tries other chests in that same lane if the intake is full, then uses imports if the entire lane is
 full. No extra lane or follow-up move task is created for a successful direct delivery.
+
+After a packed box is collected, the destination inventory view gets a bounded chance to catch up
+before the organizer decides the box is missing. The player slots are rescanned during that wait.
+If the box still cannot be seen, the bot returns to pickup recovery instead of consuming chest-open
+retries or counting an unconfirmed delivery as complete. Pickup evidence and recovery attempts stay
+in the restart checkpoint.
+
+After collecting an emptied mixed shulker, the bot allows up to ten seconds of active ticks for
+the empty box to appear in its usable inventory. A pickup notification alone does not finish the
+task. This wait and any pending cargo tasks survive pauses and restarts. If confirmation never
+arrives, `mixed_shulker_inventory_sync_timeout` saves the job for recovery. Console/debug events
+named `organize_mixed_shell_*` show the wait and its outcome; routine waits do not ping users.
 
 The completion message calls out how many boxes and item types are waiting in imports. If no import
 can accept the current cargo, the organizer recovers the active reconciliation shulker into the bot

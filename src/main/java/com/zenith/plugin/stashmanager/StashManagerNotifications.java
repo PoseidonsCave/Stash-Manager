@@ -116,6 +116,19 @@ public final class StashManagerNotifications {
         DISCORD.sendEmbedMessage(embed);
     }
 
+    public void sendFoodContingencyBlocked(String job, @Nullable String reason) {
+        var embed = Embed.builder()
+            .title("Stash Job Paused: No Food")
+            .description("The bot ran out of usable food, so the stash job was paused before it could starve. Add safe food to its inventory or configure a finite `/stash keep add <food> <count>` target with scanned stock.")
+            .addField("Job", job, true)
+            .addField("Checkpoint", "Preserved", true)
+            .errorColor();
+        if (reason != null && !reason.isBlank()) {
+            embed.addField("Reason", reason, false);
+        }
+        DISCORD.sendEmbedMessage(embed);
+    }
+
     public void sendProxyControlWarning(@Nullable String playerName, String job,
                                         int graceSeconds, int cooldownSeconds,
                                         boolean temporaryShulkerOutstanding) {
