@@ -26,6 +26,9 @@ public final class LaneStorageCapacity {
             long itemsPerDoubleChest,
             boolean registryResolved) {}
 
+    /** One physical bulk shulker; occupied slots include differently named stacks. */
+    public record ShulkerStock(int items, int occupiedStackSlots) {}
+
     public record Demand(
             String storageClass,
             long looseItems,
@@ -54,6 +57,41 @@ public final class LaneStorageCapacity {
             return calculate(storageClass, looseItems, existingShulkerItemCounts,
                     itemCapacity.itemsPerShulker(), itemCapacity.maxStackSize(),
                     itemCapacity.registryResolved());
+        }
+
+        /** Conservative stack-aware demand. A scan counts each physical stack once. */
+        public static Demand calculateWithObservedSlots(
+                String storageClass,
+                long looseItems,
+                long looseObservedSlots,
+                Collection<ShulkerStock> existingShulkers) {
+            ItemCapacity itemCapacity = itemCapacityFor(storageClass);
+            int maxStack = itemCapacity.maxStackSize();
+            long looseSlots = Math.max(ceilingDivision(Math.max(0, looseItems), maxStack),
+                    Math.max(0, looseObservedSlots));
+            int existing = 0;
+            long boxedItems = 0;
+            long boxedSlots = 0;
+            long reusableSlots = 0;
+            if (existingShulkers != null) {
+                for (ShulkerStock stock : existingShulkers) {
+                    if (stock == null) continue;
+                    int units = Math.max(0, stock.items());
+                    long occupied = Math.min(SLOTS_PER_SHULKER,
+                            Math.max(ceilingDivision(units, maxStack),
+                                    Math.max(0, stock.occupiedStackSlots())));
+                    existing++;
+                    boxedItems = saturatingAdd(boxedItems, units);
+                    boxedSlots = saturatingAdd(boxedSlots, occupied);
+                    reusableSlots += SLOTS_PER_SHULKER - occupied;
+                }
+            }
+            long additional = ceilingDivision(Math.max(0, looseSlots - reusableSlots), SLOTS_PER_SHULKER);
+            long compacted = ceilingDivision(saturatingAdd(looseSlots, boxedSlots), SLOTS_PER_SHULKER);
+            return new Demand(storageClass, Math.max(0, looseItems), existing, boxedItems,
+                    reusableSlots * maxStack, maxStack, itemCapacity.registryResolved(),
+                    itemCapacity.itemsPerShulker(), boundedInt(saturatingAdd(existing, additional)),
+                    boundedInt(compacted));
         }
 
         public static Demand calculate(

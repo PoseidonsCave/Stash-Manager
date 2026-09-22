@@ -81,7 +81,8 @@ public class DatabaseManager implements AutoCloseable {
                     quantity INTEGER NOT NULL,
                     in_shulker BOOLEAN NOT NULL DEFAULT FALSE,
                     shulker_color VARCHAR(32),
-                    shulker_instance INTEGER
+                    shulker_instance INTEGER,
+                    observed_stack_slots INTEGER
                 )
                 """);
 
@@ -236,6 +237,7 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("ALTER TABLE keep_items ADD COLUMN IF NOT EXISTS keep_quantity INTEGER");
             // Older rows remain NULL and are treated as legacy aggregate data until rescanned.
             stmt.execute("ALTER TABLE container_items ADD COLUMN IF NOT EXISTS shulker_instance INTEGER");
+            stmt.execute("ALTER TABLE container_items ADD COLUMN IF NOT EXISTS observed_stack_slots INTEGER");
             // Existing completed rows remain trusted. New scans explicitly transition through
             // running -> complete/aborted so partial snapshots survive restarts as unsafe.
             stmt.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS completion_status VARCHAR(16) NOT NULL DEFAULT 'complete'");
@@ -382,7 +384,7 @@ public class DatabaseManager implements AutoCloseable {
         directItems.values().removeIf(qty -> qty <= 0);
 
         // Insert direct (non-shulker) container items
-        String insertSql = "INSERT INTO container_items (container_id, item_id, quantity, in_shulker, shulker_color, shulker_instance) VALUES (?, ?, ?, ?, ?, ?)";
+        String insertSql = "INSERT INTO container_items (container_id, item_id, quantity, in_shulker, shulker_color, shulker_instance, observed_stack_slots) VALUES (?, ?, ?, ?, ?, ?, ?)";
         try (PreparedStatement ps = conn.prepareStatement(insertSql)) {
             for (var item : directItems.entrySet()) {
                 ps.setLong(1, containerId);
@@ -391,6 +393,9 @@ public class DatabaseManager implements AutoCloseable {
                 ps.setBoolean(4, false);
                 ps.setNull(5, Types.VARCHAR);
                 ps.setNull(6, Types.INTEGER);
+                Integer slots = entry.directStackSlots().get(item.getKey());
+                if (slots == null) ps.setNull(7, Types.INTEGER);
+                else ps.setInt(7, slots);
                 ps.addBatch();
             }
 
@@ -404,6 +409,9 @@ public class DatabaseManager implements AutoCloseable {
                     ps.setString(5, shulker.color());
                     if (shulker.isPhysicalInstance()) ps.setInt(6, shulker.slot());
                     else ps.setNull(6, Types.INTEGER);
+                    Integer slots = shulker.stackSlots().get(item.getKey());
+                    if (slots == null) ps.setNull(7, Types.INTEGER);
+                    else ps.setInt(7, slots);
                     ps.addBatch();
                 }
             }
@@ -1293,10 +1301,13 @@ public class DatabaseManager implements AutoCloseable {
 
         // Load items
         Map<String, Integer> items = new LinkedHashMap<>();
+        Map<String, Integer> directStackSlots = new LinkedHashMap<>();
         List<ContainerEntry.ShulkerDetail> shulkerDetails = new ArrayList<>();
         Map<Integer, String> physicalShulkerColors = new LinkedHashMap<>();
         Map<Integer, Map<String, Integer>> physicalShulkerItems = new LinkedHashMap<>();
+        Map<Integer, Map<String, Integer>> physicalShulkerStackSlots = new LinkedHashMap<>();
         Map<String, Map<String, Integer>> legacyShulkerItemsByColor = new LinkedHashMap<>();
+        Map<String, Map<String, Integer>> legacyShulkerStackSlotsByColor = new LinkedHashMap<>();
 
         try (PreparedStatement shulkerPs = conn.prepareStatement(
                 "SELECT slot, color FROM container_shulkers WHERE container_id = ? ORDER BY slot")) {
@@ -1306,12 +1317,13 @@ public class DatabaseManager implements AutoCloseable {
                     int slot = shulkerRs.getInt("slot");
                     physicalShulkerColors.put(slot, shulkerRs.getString("color"));
                     physicalShulkerItems.put(slot, new LinkedHashMap<>());
+                    physicalShulkerStackSlots.put(slot, new LinkedHashMap<>());
                 }
             }
         }
 
         try (PreparedStatement itemPs = conn.prepareStatement(
-                 "SELECT item_id, quantity, in_shulker, shulker_color, shulker_instance FROM container_items WHERE container_id = ?")) {
+                 "SELECT item_id, quantity, in_shulker, shulker_color, shulker_instance, observed_stack_slots FROM container_items WHERE container_id = ?")) {
             itemPs.setLong(1, containerId);
 
             try (ResultSet itemRs = itemPs.executeQuery()) {
@@ -1322,16 +1334,26 @@ public class DatabaseManager implements AutoCloseable {
                     String shulkerColor = itemRs.getString("shulker_color");
                     int shulkerInstance = itemRs.getInt("shulker_instance");
                     boolean physicalInstance = !itemRs.wasNull();
+                    int observedSlots = itemRs.getInt("observed_stack_slots");
+                    boolean slotsKnown = !itemRs.wasNull();
 
                     if (inShulker && shulkerColor != null) {
                         if (physicalInstance) {
                             physicalShulkerColors.putIfAbsent(shulkerInstance, shulkerColor);
                             physicalShulkerItems.computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
                                     .merge(itemId, quantity, Integer::sum);
+                            if (slotsKnown) physicalShulkerStackSlots
+                                    .computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
+                                    .merge(itemId, observedSlots, Integer::sum);
                         } else {
                             legacyShulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
                                     .merge(itemId, quantity, Integer::sum);
+                            if (slotsKnown) legacyShulkerStackSlotsByColor
+                                    .computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
+                                    .merge(itemId, observedSlots, Integer::sum);
                         }
+                    } else if (!inShulker && slotsKnown) {
+                        directStackSlots.merge(itemId, observedSlots, Integer::sum);
                     }
                     // All items go into the main map (same as the in-memory behavior)
                     items.merge(itemId, quantity, Integer::sum);
@@ -1341,15 +1363,18 @@ public class DatabaseManager implements AutoCloseable {
 
         for (var entry : physicalShulkerItems.entrySet()) {
             shulkerDetails.add(new ContainerEntry.ShulkerDetail(
-                    entry.getKey(), physicalShulkerColors.get(entry.getKey()), entry.getValue()));
+                    entry.getKey(), physicalShulkerColors.get(entry.getKey()), entry.getValue(),
+                    physicalShulkerStackSlots.getOrDefault(entry.getKey(), Map.of())));
         }
         for (var entry : legacyShulkerItemsByColor.entrySet()) {
-            shulkerDetails.add(new ContainerEntry.ShulkerDetail(entry.getKey(), entry.getValue()));
+            shulkerDetails.add(new ContainerEntry.ShulkerDetail(-1, entry.getKey(), entry.getValue(),
+                    legacyShulkerStackSlotsByColor.getOrDefault(entry.getKey(), Map.of())));
         }
 
         return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
                 shulkerDetails, scanTimestamp, label, hopperFacing,
-                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis);
+                inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis,
+                directStackSlots);
     }
 
     @Override

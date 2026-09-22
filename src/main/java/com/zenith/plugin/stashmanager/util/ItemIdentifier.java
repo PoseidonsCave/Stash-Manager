@@ -66,6 +66,27 @@ public final class ItemIdentifier {
         return contents;
     }
 
+    /** Count physical occupied slots by item type without persisting names or components. */
+    public static Map<String, Integer> readShulkerStackSlots(ItemStack shulkerStack) {
+        Map<String, Integer> slots = new LinkedHashMap<>();
+        if (shulkerStack == null || shulkerStack.getAmount() <= 0) return slots;
+        try {
+            DataComponents components = shulkerStack.getDataComponents();
+            if (components == null) return slots;
+            Object value = components.get(DataComponentTypes.CONTAINER);
+            if (!(value instanceof List<?> entries)) return slots;
+            for (Object entry : entries) {
+                Object unwrapped = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
+                if (unwrapped instanceof ItemStack stack && stack.getId() != 0 && stack.getAmount() > 0) {
+                    slots.merge(getItemId(stack), 1, Integer::sum);
+                }
+            }
+        } catch (Exception ignored) {
+            // A missing count remains unknown; callers must use a conservative fallback.
+        }
+        return slots;
+    }
+
     // Physical stack count matters during mixed-box admission: 27 non-stackable tools need
     // more unpack room than 27 blocks even though both aggregate to a quantity of 27.
     public static int readShulkerOccupiedSlots(ItemStack shulkerStack) {
@@ -98,8 +119,22 @@ public final class ItemIdentifier {
     // otherwise never match a fresh live read of the same physical item.
     public static String baseItemId(String itemId) {
         if (itemId == null) return null;
-        int bracket = itemId.indexOf('[');
-        return bracket >= 0 ? itemId.substring(0, bracket) : itemId;
+        String normalized = itemId.trim().toLowerCase(java.util.Locale.ROOT);
+        if (normalized.startsWith("minecraft:")) {
+            normalized = normalized.substring("minecraft:".length());
+        }
+        int bracket = normalized.indexOf('[');
+        return bracket >= 0 ? normalized.substring(0, bracket) : normalized;
+    }
+
+    /** Names and lore never create a different inventory keep-list item type. */
+    public static boolean hasCustomPresentation(ItemStack stack) {
+        if (stack == null || stack.getAmount() <= 0) return false;
+        DataComponents components = stack.getDataComponents();
+        if (components == null) return false;
+        return components.get(DataComponentTypes.CUSTOM_NAME) != null
+                || components.get(DataComponentTypes.ITEM_NAME) != null
+                || components.get(DataComponentTypes.LORE) != null;
     }
 
     // Variant-aware compatibility match. Fresh fortune and silk-touch identifiers must stay

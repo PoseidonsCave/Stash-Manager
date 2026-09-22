@@ -30,7 +30,15 @@ final class OrganizerJournalStore {
             boolean alreadyInInventory,
             boolean mixedDecomposition,
             boolean mixedBatchConsolidation,
-            Map<String, Integer> mixedContents) {
+            Map<String, Integer> mixedContents,
+            boolean mandatoryInventoryDeposit) {
+        TaskSnapshot(int id, int[] source, int[] destination, String itemId,
+                     String shulkerContentFilter, boolean alreadyInInventory,
+                     boolean mixedDecomposition, boolean mixedBatchConsolidation,
+                     Map<String, Integer> mixedContents) {
+            this(id, source, destination, itemId, shulkerContentFilter, alreadyInInventory,
+                    mixedDecomposition, mixedBatchConsolidation, mixedContents, false);
+        }
         TaskSnapshot(int id, int[] source, int[] destination, String itemId,
                      String shulkerContentFilter, boolean alreadyInInventory) {
             this(id, source, destination, itemId, shulkerContentFilter, alreadyInInventory,
@@ -44,6 +52,21 @@ final class OrganizerJournalStore {
                            boolean atMaximumCapacity, boolean laneExhausted) {}
 
     record Failure(String reason, String state, long timestamp) {}
+
+    record PackingSupply(PackingSupplySearch.Snapshot search, List<Integer> deferredTaskIds,
+                         boolean stagingCargo, MixedStagingLedger.Snapshot stagingLedger,
+                         Map<String, Integer> stagesWithoutDelivery) {}
+
+    record MixedShellVerification(int elapsedTicks, boolean collectionConfirmed,
+                                  String pickupFingerprint, List<Integer> cargoTaskIds) {}
+
+    record ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
+                                 String pickupStorageKey, int inventorySyncRecoveries) {
+        ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
+                              int inventorySyncRecoveries) {
+            this(collectionConfirmed, pickupFingerprint, null, inventorySyncRecoveries);
+        }
+    }
 
     record Plan(
             int schemaVersion,
@@ -69,6 +92,8 @@ final class OrganizerJournalStore {
             int consolidationSourcesInBatch,
             int movedThisVisit,
             boolean sourceVisitFailed,
+            int taskCargoAcquired,
+            int taskCargoDeposited,
             int totalTasks,
             int completedTasks,
             int nextProgressMilestone,
@@ -102,7 +127,13 @@ final class OrganizerJournalStore {
             String shulkerRecoveryTrigger,
             PackingProgress packingProgress,
             Failure lastFailure,
-            MixedStagingLedger.Snapshot mixedStagingLedger) {}
+            MixedStagingLedger.Snapshot mixedStagingLedger,
+            PackingSupply packingSupply,
+            InventoryRecoveryGuard.Snapshot inventoryRecovery,
+            StationWalkRecovery.Snapshot stationWalkRecovery,
+            MixedShellVerification mixedShellVerification,
+            List<Long> packedImportTriedDestinationKeys,
+            ShulkerPickupEvidence shulkerPickupEvidence) {}
 
     record Loaded(Plan plan, Checkpoint checkpoint) {}
 
@@ -177,6 +208,13 @@ final class OrganizerJournalStore {
                 throw new IOException("Organizer checkpoint references unknown consolidation task " + id);
             }
         }
+        if (checkpoint.packingSupply() != null && checkpoint.packingSupply().deferredTaskIds() != null) {
+            for (Integer id : checkpoint.packingSupply().deferredTaskIds()) {
+                if (!checkpoint.consolidationQueue().contains(id)) {
+                    throw new IOException("Deferred packing task is missing from the consolidation queue");
+                }
+            }
+        }
         return Optional.of(new Loaded(plan, checkpoint));
     }
 
@@ -230,6 +268,28 @@ final class OrganizerJournalStore {
         }
         if (checkpoint.completedTasks() < 0 || checkpoint.totalTasks() < 0) {
             throw new IOException("Organizer checkpoint has invalid task counts");
+        }
+        var supply = checkpoint.packingSupply();
+        if (supply != null && supply.stagesWithoutDelivery() != null
+                && supply.stagesWithoutDelivery().entrySet().stream().anyMatch(e ->
+                        e.getKey() == null || e.getKey().isBlank() || e.getValue() == null || e.getValue() < 0)) {
+            throw new IOException("Organizer checkpoint has invalid packing-supply progress");
+        }
+        MixedShellVerification shell = checkpoint.mixedShellVerification();
+        if ("MIXED_SHELL_VERIFY".equals(checkpoint.interruptedState()) && shell == null) {
+            throw new IOException("Organizer checkpoint is missing its empty-shell verification state");
+        }
+        if (shell != null && (shell.elapsedTicks() < 0 || shell.cargoTaskIds() == null
+                || shell.cargoTaskIds().stream().anyMatch(id -> id == null || id < 1))) {
+            throw new IOException("Organizer checkpoint has invalid empty-shell verification state");
+        }
+        ShulkerPickupEvidence pickup = checkpoint.shulkerPickupEvidence();
+        if (pickup != null && pickup.inventorySyncRecoveries() < 0) {
+            throw new IOException("Organizer checkpoint has invalid shulker-pickup recovery state");
+        }
+        if (checkpoint.packedImportTriedDestinationKeys() != null
+                && checkpoint.packedImportTriedDestinationKeys().stream().anyMatch(Objects::isNull)) {
+            throw new IOException("Organizer checkpoint has an invalid import-probe destination");
         }
         if (checkpoint.protectedInventorySlots() != null
                 && checkpoint.protectedInventorySlots().stream()

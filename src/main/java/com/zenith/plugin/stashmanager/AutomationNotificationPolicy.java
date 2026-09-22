@@ -8,6 +8,8 @@ final class AutomationNotificationPolicy {
 
     static boolean sendGenericDiscord(String event, Map<String, Object> payload) {
         if (event == null) return false;
+        if ("stash_food_contingency".equals(String.valueOf(
+                payload == null ? null : payload.get("request_name")))) return false;
         return switch (event) {
             case "organize_started",
                  "organize_start_blocked",

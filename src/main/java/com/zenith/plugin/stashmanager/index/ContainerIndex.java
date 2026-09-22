@@ -94,7 +94,8 @@ public class ContainerIndex {
                 .toList();
         for (ContainerEntry alias : aliases) {
             put(alias.withContents(observation.items(), observation.shulkerCount(),
-                    observation.shulkerDetails(), observation.timestamp()), false);
+                    observation.shulkerDetails(), observation.timestamp(),
+                    observation.directStackSlots()), false);
         }
         lastInventoryObservation = observation.timestamp();
     }
