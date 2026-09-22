@@ -574,6 +574,7 @@ public class StashManagerModule extends Module {
         }
         if (!organizer.isYielded()) return false;
         if (getOrganizerCheckpointResumeBlocker() != null) return false;
+        if (!organizer.prepareManualCheckpointResume()) return false;
         organizer.emitPackedShulkerInventoryAudit();
         if (!organizerPreemptionGate.isYielded()) {
             organizerPreemptionGate = newOrganizerPreemptionGate();

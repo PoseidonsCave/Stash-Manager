@@ -132,6 +132,7 @@ final class OrganizerJournalStore {
             InventoryRecoveryGuard.Snapshot inventoryRecovery,
             StationWalkRecovery.Snapshot stationWalkRecovery,
             MixedShellVerification mixedShellVerification,
+            List<Long> packedImportTriedDestinationKeys,
             ShulkerPickupEvidence shulkerPickupEvidence) {}
 
     record Loaded(Plan plan, Checkpoint checkpoint) {}
@@ -285,6 +286,10 @@ final class OrganizerJournalStore {
         ShulkerPickupEvidence pickup = checkpoint.shulkerPickupEvidence();
         if (pickup != null && pickup.inventorySyncRecoveries() < 0) {
             throw new IOException("Organizer checkpoint has invalid shulker-pickup recovery state");
+        }
+        if (checkpoint.packedImportTriedDestinationKeys() != null
+                && checkpoint.packedImportTriedDestinationKeys().stream().anyMatch(Objects::isNull)) {
+            throw new IOException("Organizer checkpoint has an invalid import-probe destination");
         }
         if (checkpoint.protectedInventorySlots() != null
                 && checkpoint.protectedInventorySlots().stream()
