@@ -369,7 +369,7 @@ public final class StashOrganizer {
     private static final int MAX_PACKED_IMPORT_CAPACITY_PROBES = 8;
     private static final int MAX_MIXED_STAGING_CAPACITY_PROBES = 8;
     private static final int MAX_PACKED_SHULKER_INVENTORY_SYNC_RECOVERIES = 3;
-    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 1;
+    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 2;
     private static final int MAX_SOURCE_TASK_RETRIES = 3;
     private static final int MAX_SHULKER_RECOVERY_BREAK_ATTEMPTS = 3;
     private static final int SHULKER_PICKUP_TIMEOUT_TICKS = 300;
@@ -4257,6 +4257,14 @@ public final class StashOrganizer {
         details.put("ack_ticks", shulkerTicks);
         emit("organize_shulker_place_confirmed", details);
         temporaryShulkerOutstanding = true;
+        // Container(0) can retain the selected pre-placement box after the world already
+        // confirms placement. Save that exact stale shape now, so it cannot be mistaken for
+        // the packed box after breaking. Collection must change the signature or provide an
+        // authoritative take-item packet before the destination walk begins.
+        if (!mixedDecompositionMode) {
+            rejectedPackedShulkerInventorySignature =
+                    transactionEligibleShulkerInventorySignature();
+        }
         state = State.SHULKER_OPENING;
         shulkerTicks = 0;
         resetContainerOpenTracking();
@@ -4958,11 +4966,16 @@ public final class StashOrganizer {
         }
 
         pathToShulkerDrop();
-        if (shulkerTicks >= SHULKER_PICKUP_TIMEOUT_TICKS) {
+        boolean inventorySyncRecovery = packedShulkerInventorySyncRecoveries > 0
+                || PACKED_SHULKER_INVENTORY_SYNC_RECOVERY.equals(shulkerRecoveryTrigger);
+        int pickupTimeoutTicks = inventorySyncRecovery
+                ? SHULKER_RECOVERY_PICKUP_TIMEOUT_TICKS
+                : SHULKER_PICKUP_TIMEOUT_TICKS;
+        if (shulkerTicks >= pickupTimeoutTicks) {
             BARITONE.stop();
-            if (packedShulkerInventorySyncRecoveries > 0) {
-                abortWithCargo("packed_shulker_inventory_sync_unresolved",
-                        "The packed shulker pickup was confirmed but did not become visible in inventory; its checkpoint is preserved.");
+            if (inventorySyncRecovery) {
+                recoverPackedShulkerInventoryVisibility(
+                        "packed_shulker_pickup_sweep_timeout");
                 return;
             }
             info("Shulker pickup failed");
