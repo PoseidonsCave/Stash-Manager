@@ -457,6 +457,7 @@ public final class StashOrganizer {
     private int packStoreMatchingShulkersBefore;
     private int packStoreVerificationTicks;
     private int packedShulkerInventorySyncRecoveries;
+    private String rejectedPackedShulkerInventorySignature;
     private String stagingReason;
     private final SneakReleaseGate containerOpenGate = new SneakReleaseGate();
 
@@ -4904,9 +4905,17 @@ public final class StashOrganizer {
         // Breaking only proves that the block became air. Walk onto the former block position
         // like MOAR does so collection is an explicit part of the transaction, then verify that
         // the inventory regained both the placed box and a compatible packed box.
-        if (hasPackedShulkerInInventory() || pickupEvidenceMatchesPackedShulker()) {
+        String inventorySignature = transactionEligibleShulkerInventorySignature();
+        boolean ordinaryEvidence = hasPackedShulkerInInventory()
+                || pickupEvidenceMatchesPackedShulker();
+        if (packedShulkerPickupReady(
+                rejectedPackedShulkerInventorySignature,
+                inventorySignature,
+                temporaryShulkerPickupConfirmed,
+                ordinaryEvidence)) {
             BARITONE.stop();
             temporaryShulkerOutstanding = false;
+            rejectedPackedShulkerInventorySignature = null;
             walkToPackedShulkerDestination(packDestination);
             return;
         }
@@ -8273,6 +8282,12 @@ public final class StashOrganizer {
         packStoreVerificationTicks = 0;
         packStoreMatchingShulkersBefore = 0;
         packDestinationOpenFailures = 0;
+        // The live destination window just proved that no transaction box was present. Keep
+        // the current Container(0) candidate as a rejected baseline so its stale copy cannot
+        // immediately bounce this recovery back to the destination. A collection packet or a
+        // changed inventory signature is fresh evidence that the worksite drop was recovered.
+        rejectedPackedShulkerInventorySignature =
+                transactionEligibleShulkerInventorySignature();
         temporaryShulkerOutstanding = true;
         shulkerRecoveryTrigger = PACKED_SHULKER_INVENTORY_SYNC_RECOVERY;
         state = State.SHULKER_PICKUP;
@@ -9594,6 +9609,7 @@ public final class StashOrganizer {
         temporaryShulkerPickupStorageKey = null;
         temporaryShulkerPickupStack = null;
         packedShulkerInventorySyncRecoveries = 0;
+        rejectedPackedShulkerInventorySignature = null;
         stopAfterShulkerRecovery = false;
         shulkerRecoveryTrigger = null;
         shulkerRecoveryBreakAttempts = 0;
@@ -9875,6 +9891,36 @@ public final class StashOrganizer {
         // returns to its old count, while an empty box becomes the first compatible box. The
         // aggregate shulker count can lag behind the collection packet and must not veto this.
         return countCompatibleBulkShulkersInInventory(packItemId) >= expectedCompatible;
+    }
+
+    private String transactionEligibleShulkerInventorySignature() {
+        Container inventory = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (inventory == null) return "unavailable";
+
+        StringBuilder signature = new StringBuilder();
+        for (int rawSlot = 9; rawSlot <= 44; rawSlot++) {
+            if (isProtectedInventorySlot(rawSlot)) continue;
+            ItemStack stack = inventory.getItemStack(rawSlot);
+            if (!isTransactionEligibleShulker(stack)) continue;
+            ShulkerClassification classification = ShulkerClassification.classify(
+                    ItemIdentifier.readShulkerContents(stack));
+            signature.append(rawSlot)
+                    .append(':').append(itemIdFromStack(stack))
+                    .append(':').append(classification.fingerprint())
+                    .append(';');
+        }
+        return signature.toString();
+    }
+
+    static boolean packedShulkerPickupReady(
+            String rejectedInventorySignature,
+            String currentInventorySignature,
+            boolean collectionConfirmed,
+            boolean ordinaryEvidence) {
+        if (!ordinaryEvidence) return false;
+        return rejectedInventorySignature == null
+                || collectionConfirmed
+                || !Objects.equals(rejectedInventorySignature, currentInventorySignature);
     }
 
     /** Accept only an empty or exact bulk box proven by the active fill transaction. */
