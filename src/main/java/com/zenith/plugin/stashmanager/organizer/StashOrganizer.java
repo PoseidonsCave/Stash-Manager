@@ -4077,6 +4077,7 @@ public final class StashOrganizer {
                 : findPackingShulkerInInventory();
         if (shulkerSlot < 0) {
             if (mixedDecompositionMode) {
+                if (recoverMissingMixedShulkerFromImport()) return;
                 abortWithCargo("mixed_shulker_cargo_missing",
                         "The selected mixed shulker is no longer in inventory; the task was stopped safely.");
                 return;
@@ -6129,6 +6130,12 @@ public final class StashOrganizer {
         // for loose cargo that was already sealed inside it.
         if (resumePackedShulkerFromOverflowWindow(open, chestSlots)) return;
 
+        // A mixed decomposition task owns one physical box. Once that box is durably staged,
+        // stop this handoff before scanning another identical box from the player inventory.
+        // Without this boundary, one rejected placement could evacuate every matching mixed
+        // box while only one queued task was being retired.
+        if (finishCompletedOverflowHandoff()) return;
+
         // Overflow is still one transaction. Move only cargo owned by currentTask; sweeping
         // every unprotected slot lets a failed handoff silently consume unrelated recovery
         // shells and later tasks.
@@ -6199,9 +6206,61 @@ public final class StashOrganizer {
                     "Overflow could not prove a complete handoff for the current task cargo. The checkpoint was preserved for inspection.");
             return;
         }
+        finishCompletedOverflowHandoff();
+    }
+
+    private boolean finishCompletedOverflowHandoff() {
+        if (!taskCargo.fullyDeposited()) return false;
         closeCurrentContainer();
-        if (stagingForPackingSupply && !finishSupplyStaging()) return;
+        if (stagingForPackingSupply && !finishSupplyStaging()) return true;
+        if (finishStagedMixedPlacementFallback()) return true;
         advanceToNextTask();
+        return true;
+    }
+
+    /** Keep an untouched mixed box discoverable after its worksite placement was rejected. */
+    private boolean finishStagedMixedPlacementFallback() {
+        if (!mixedDecompositionMode || mixedBoxDrained || currentTask == null
+                || !currentTask.mixedDecomposition() || overflowChestPos == null) {
+            return false;
+        }
+
+        MoveTask stagedTask = currentTask;
+        int[] stagedAt = canonicalStagingPosition(overflowChestPos);
+        boolean retryAtTail = !stagedTask.mandatoryInventoryDeposit();
+        if (retryAtTail) {
+            taskQueue.addLast(new MoveTask(
+                    copyPos(stagedAt),
+                    copyPos(stagedAt),
+                    stagedTask.itemId(),
+                    stagedTask.shulkerContentFilter(),
+                    false,
+                    true,
+                    false,
+                    stagedTask.mixedContents(),
+                    true));
+        } else {
+            // A second bounded placement failure is non-destructive. Leave the box in import
+            // storage for a later scan instead of rotating one impossible task forever.
+            completedTasks++;
+            overflowItems.merge(stagedTask.itemId(), 1, Integer::sum);
+            emitProgressMilestoneIfCrossed();
+        }
+
+        emit("organize_mixed_shulker_staged", Map.of(
+                "reason", "shulker_place_server_unacknowledged",
+                "disposition", retryAtTail
+                        ? "retry_from_import_at_queue_tail"
+                        : "deferred_in_import_after_bounded_retry",
+                "staging_position", posString(stagedAt),
+                "cargo_preserved", true));
+
+        currentTask = null;
+        taskCargo.reset(0);
+        clearMixedDecompositionState();
+        resetTemporaryShulkerState();
+        advanceToNextTask();
+        return true;
     }
 
     private boolean confirmOverflowCargoTransfer(int observedMoved) {
@@ -7537,7 +7596,53 @@ public final class StashOrganizer {
                 units += stack.getAmount();
             }
         }
-        return units;
+        return inventoryCargoUnitsForTask(currentTask, units);
+    }
+
+    /** Mixed decomposition is a one-box transaction even when several boxes share a fingerprint. */
+    static int inventoryCargoUnitsForTask(MoveTask task, int matchingUnits) {
+        int boundedUnits = Math.max(0, matchingUnits);
+        return task != null && task.mixedDecomposition()
+                ? Math.min(1, boundedUnits)
+                : boundedUnits;
+    }
+
+    private boolean recoverMissingMixedShulkerFromImport() {
+        if (currentTask == null || !currentTask.mixedDecomposition()
+                || currentTask.mandatoryInventoryDeposit()) {
+            return false;
+        }
+        int[] staging = currentTask.destination();
+        if (staging == null || !index.isImportChest(staging[0], staging[1], staging[2])) {
+            return false;
+        }
+
+        MoveTask missing = currentTask;
+        currentTask = new MoveTask(
+                copyPos(staging),
+                copyPos(staging),
+                missing.itemId(),
+                missing.shulkerContentFilter(),
+                false,
+                true,
+                false,
+                missing.mixedContents(),
+                true);
+        taskCargo.reset(0);
+        clearMixedDecompositionState();
+        resetTemporaryShulkerState();
+        currentRole = TargetRole.SOURCE;
+        walkTarget = copyPos(staging);
+        trackedWalkTargetKey = Long.MIN_VALUE;
+        actionSlotIndex = 0;
+        containerDataReceived = false;
+        state = State.WALKING;
+        emit("organize_mixed_shulker_recovery_started", Map.of(
+                "reason", "inventory_cargo_missing_after_import_handoff",
+                "disposition", "verify_and_retake_from_import",
+                "staging_position", posString(staging)));
+        persistDurableCheckpoint(state);
+        return true;
     }
 
     /** Include ledger-owned units merged into a finite protected stack after restart. */
