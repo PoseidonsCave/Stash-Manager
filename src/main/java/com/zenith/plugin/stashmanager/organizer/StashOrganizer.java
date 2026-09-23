@@ -369,6 +369,7 @@ public final class StashOrganizer {
     private static final int MAX_PACKED_IMPORT_CAPACITY_PROBES = 8;
     private static final int MAX_MIXED_STAGING_CAPACITY_PROBES = 8;
     private static final int MAX_PACKED_SHULKER_INVENTORY_SYNC_RECOVERIES = 3;
+    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 1;
     private static final int MAX_SOURCE_TASK_RETRIES = 3;
     private static final int MAX_SHULKER_RECOVERY_BREAK_ATTEMPTS = 3;
     private static final int SHULKER_PICKUP_TIMEOUT_TICKS = 300;
@@ -604,7 +605,7 @@ public final class StashOrganizer {
 
     // Public API
     public State getState() { return state; }
-    public boolean isActive() { return state != State.IDLE && state != State.DONE && state != State.FAILED; }
+    public boolean isActive() { return isActiveState(state); }
     public boolean isFailed() { return state == State.FAILED; }
     public String getLastFailureReason() { return lastFailure == null ? null : lastFailure.reason(); }
     public String getLastFailureState() { return lastFailure == null ? null : lastFailure.state(); }
@@ -852,8 +853,18 @@ public final class StashOrganizer {
                 : shellVerification == null ? null : shellVerification.pickupFingerprint();
         temporaryShulkerPickupStorageKey = pickupEvidence == null
                 ? null : pickupEvidence.pickupStorageKey();
+        boolean packedShulkerRecoveryStrategyMigrated = pickupEvidence != null
+                && pickupEvidence.inventorySyncStrategyVersion()
+                        < PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION
+                && pickupEvidence.inventorySyncRecoveries() > 0
+                && checkpoint.lastFailure() != null
+                && "packed_shulker_inventory_sync_unresolved".equals(
+                        checkpoint.lastFailure().reason());
         packedShulkerInventorySyncRecoveries = pickupEvidence == null ? 0
-                : pickupEvidence.inventorySyncRecoveries();
+                : migratedPackedShulkerRecoveryCount(
+                        pickupEvidence.inventorySyncStrategyVersion(),
+                        pickupEvidence.inventorySyncRecoveries(),
+                        checkpoint.lastFailure() == null ? null : checkpoint.lastFailure().reason());
         stationPathTarget = null;
         stationLastPathTick = -20;
         stagingForPackingSupply = supply != null && supply.stagingCargo();
@@ -898,6 +909,13 @@ public final class StashOrganizer {
         openIndexedContainer = null;
         state = State.YIELDED;
         normalizeSupplyDeferredTasks();
+
+        if (packedShulkerRecoveryStrategyMigrated) {
+            emit("organize_packed_shulker_recovery_migrated", Map.of(
+                    "previous_attempts", pickupEvidence.inventorySyncRecoveries(),
+                    "strategy_version", PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION,
+                    "disposition", "fresh_bounded_recovery"));
+        }
 
         info("Loaded organizer restart checkpoint at " + completedTasks + "/" + totalTasks
                 + " tasks; normal cooldown and quiet checks will run before resume.");
@@ -1066,12 +1084,30 @@ public final class StashOrganizer {
         lateOpenQuarantineTicks = 0;
 
         resumeInterruptedCheckpoint(interrupted);
-        if (state != State.YIELDED) {
+        boolean resumed = isActiveState(state) && state != State.YIELDED;
+        if (resumed) {
             durableRecoveryLoaded = false;
             durableRecoveryError = null;
             persistDurableCheckpoint(state);
+        } else if (state != State.YIELDED) {
+            // A resume routine can discover a terminal blocker while rebuilding live state.
+            // Keep the durable files, but allow an explicit later resume to reload them.
+            durableRecoveryLoaded = false;
         }
-        return state != State.YIELDED;
+        return resumed;
+    }
+
+    static int migratedPackedShulkerRecoveryCount(
+            int strategyVersion, int recoveryCount, String lastFailureReason) {
+        if (strategyVersion < PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION
+                && "packed_shulker_inventory_sync_unresolved".equals(lastFailureReason)) {
+            return 0;
+        }
+        return Math.max(0, recoveryCount);
+    }
+
+    static boolean isActiveState(State state) {
+        return state != null && state != State.IDLE && state != State.DONE && state != State.FAILED;
     }
 
     /** Drop an in-memory checkpoint after proxy control exceeds its grace window. */
@@ -9405,7 +9441,8 @@ public final class StashOrganizer {
                 packStoreTriedDestinations.stream().sorted().toList(),
                 new OrganizerJournalStore.ShulkerPickupEvidence(
                         temporaryShulkerPickupConfirmed, temporaryShulkerPickupFingerprint,
-                        temporaryShulkerPickupStorageKey, packedShulkerInventorySyncRecoveries));
+                        temporaryShulkerPickupStorageKey, packedShulkerInventorySyncRecoveries,
+                        PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION));
     }
 
     private void syncJournalTaskCatalog() {

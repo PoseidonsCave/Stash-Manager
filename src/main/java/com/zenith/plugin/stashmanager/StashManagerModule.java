@@ -62,6 +62,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -1987,6 +1988,9 @@ public class StashManagerModule extends Module {
         if (!organizer.resumeFromYield()) {
             debugRecorder.record("organize_resume_failed",
                     "interrupted_state=" + interruptedState
+                            + ", resume_state=" + organizer.getState().name()
+                            + ", failure_reason="
+                            + Objects.toString(organizer.getLastFailureReason(), "none")
                             + ", paused_seconds=" + pausedTicks / 20);
             return;
         }

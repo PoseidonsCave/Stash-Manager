@@ -61,10 +61,17 @@ final class OrganizerJournalStore {
                                   String pickupFingerprint, List<Integer> cargoTaskIds) {}
 
     record ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
-                                 String pickupStorageKey, int inventorySyncRecoveries) {
+                                 String pickupStorageKey, int inventorySyncRecoveries,
+                                 int inventorySyncStrategyVersion) {
+        ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
+                              String pickupStorageKey, int inventorySyncRecoveries) {
+            this(collectionConfirmed, pickupFingerprint, pickupStorageKey,
+                    inventorySyncRecoveries, 0);
+        }
+
         ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
                               int inventorySyncRecoveries) {
-            this(collectionConfirmed, pickupFingerprint, null, inventorySyncRecoveries);
+            this(collectionConfirmed, pickupFingerprint, null, inventorySyncRecoveries, 0);
         }
     }
 
