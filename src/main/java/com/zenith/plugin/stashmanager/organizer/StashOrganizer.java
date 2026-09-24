@@ -369,7 +369,7 @@ public final class StashOrganizer {
     private static final int MAX_PACKED_IMPORT_CAPACITY_PROBES = 8;
     private static final int MAX_MIXED_STAGING_CAPACITY_PROBES = 8;
     private static final int MAX_PACKED_SHULKER_INVENTORY_SYNC_RECOVERIES = 3;
-    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 2;
+    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 3;
     private static final int MAX_SOURCE_TASK_RETRIES = 3;
     private static final int MAX_SHULKER_RECOVERY_BREAK_ATTEMPTS = 3;
     private static final int SHULKER_PICKUP_TIMEOUT_TICKS = 300;
@@ -10326,7 +10326,75 @@ public final class StashOrganizer {
             }
         }
 
+        // Live windows can restore a drained shell's stale pre-drain MIXED components. Accept
+        // only the sole movable candidate when empty-pickup and cargo-ledger evidence agree.
+        int staleMixedCandidate = uniqueMovableShulkerSlot(inventory, chestSlots);
+        if (staleMixedCandidate >= 0) {
+            int candidateSlot = chestSlots < 0
+                    ? staleMixedCandidate
+                    : rawPlayerSlotToWindowSlot(chestSlots, staleMixedCandidate);
+            ShulkerClassification candidateShape = ShulkerClassification.classify(
+                    ItemIdentifier.readShulkerContents(inventory.getItemStack(candidateSlot)));
+            if (candidateShape.kind() == ShulkerClassification.Kind.MIXED
+                    && recoveredEmptyPackingShellTransactionProven(
+                            temporaryShulkerPickupConfirmed,
+                            temporaryShulkerPickupFingerprint,
+                            shulkerInventoryCountBeforePlacement,
+                            countShulkerBoxes(inventory, chestSlots),
+                            compatibleShulkerCountBeforePlacement,
+                            mixedDecompositionMode,
+                            currentTask != null && currentTask.mixedBatchConsolidation(),
+                            shulkerFillMovedUnits,
+                            taskCargo.acquired(),
+                            taskCargo.deposited(),
+                            looseCargoUnits,
+                            packDestination != null,
+                            worksiteBlockPresent)) {
+                return staleMixedCandidate;
+            }
+        }
+
         return -1;
+    }
+
+    private int countShulkerBoxes(Container inventory, int chestSlots) {
+        int count = 0;
+        for (int rawSlot = 9; rawSlot <= 44; rawSlot++) {
+            int slot = chestSlots < 0
+                    ? rawSlot
+                    : rawPlayerSlotToWindowSlot(chestSlots, rawSlot);
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack != null && stack.getAmount() > 0
+                    && isShulkerBoxItem(itemIdFromStack(stack))) {
+                count += stack.getAmount();
+            }
+        }
+        return count;
+    }
+
+    static boolean recoveredEmptyPackingShellTransactionProven(
+            boolean collectionConfirmed,
+            String pickupFingerprint,
+            int shulkersBeforePlacement,
+            int observedShulkers,
+            int compatibleShulkersBeforePlacement,
+            boolean mixedDecomposition,
+            boolean packingTask,
+            int fillMovedUnits,
+            int cargoAcquired,
+            int cargoDeposited,
+            int looseCargoUnits,
+            boolean destinationPresent,
+            boolean worksiteBlockPresent) {
+        return collectionConfirmed
+                && isEmptyShulkerFingerprint(pickupFingerprint)
+                && shulkersBeforePlacement > 0
+                && observedShulkers == shulkersBeforePlacement
+                && compatibleShulkersBeforePlacement == 0
+                && packedShulkerTransactionLedgerProven(
+                        mixedDecomposition, packingTask, fillMovedUnits,
+                        cargoAcquired, cargoDeposited, looseCargoUnits,
+                        destinationPresent, worksiteBlockPresent);
     }
 
     private void pathToShulkerDrop() {
