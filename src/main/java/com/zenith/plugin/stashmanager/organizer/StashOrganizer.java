@@ -369,7 +369,7 @@ public final class StashOrganizer {
     private static final int MAX_PACKED_IMPORT_CAPACITY_PROBES = 8;
     private static final int MAX_MIXED_STAGING_CAPACITY_PROBES = 8;
     private static final int MAX_PACKED_SHULKER_INVENTORY_SYNC_RECOVERIES = 3;
-    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 3;
+    private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 4;
     private static final int MAX_SOURCE_TASK_RETRIES = 3;
     private static final int MAX_SHULKER_RECOVERY_BREAK_ATTEMPTS = 3;
     private static final int SHULKER_PICKUP_TIMEOUT_TICKS = 300;
@@ -518,6 +518,7 @@ public final class StashOrganizer {
     private volatile boolean temporaryShulkerPickupConfirmed;
     private volatile String temporaryShulkerPickupFingerprint;
     private volatile String temporaryShulkerPickupStorageKey;
+    private volatile String temporaryShulkerPickupItemId;
     private volatile ItemStack temporaryShulkerPickupStack;
     private boolean stopAfterShulkerRecovery;
     private String shulkerRecoveryTrigger;
@@ -853,6 +854,8 @@ public final class StashOrganizer {
                 : shellVerification == null ? null : shellVerification.pickupFingerprint();
         temporaryShulkerPickupStorageKey = pickupEvidence == null
                 ? null : pickupEvidence.pickupStorageKey();
+        temporaryShulkerPickupItemId = pickupEvidence == null
+                ? null : pickupEvidence.pickupItemId();
         boolean packedShulkerRecoveryStrategyMigrated = pickupEvidence != null
                 && pickupEvidence.inventorySyncStrategyVersion()
                         < PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION
@@ -1583,6 +1586,7 @@ public final class StashOrganizer {
         temporaryShulkerPickupStack = collected;
         temporaryShulkerPickupFingerprint = collectedShape.fingerprint();
         temporaryShulkerPickupStorageKey = collectedShape.storageKey();
+        temporaryShulkerPickupItemId = collectedItemId;
         if (!temporaryShulkerPickupConfirmed) {
             temporaryShulkerPickupConfirmed = true;
             emit("organize_shulker_pickup_confirmed", Map.of(
@@ -4060,6 +4064,7 @@ public final class StashOrganizer {
             temporaryShulkerPickupConfirmed = false;
             temporaryShulkerPickupFingerprint = null;
             temporaryShulkerPickupStorageKey = null;
+            temporaryShulkerPickupItemId = null;
             temporaryShulkerPickupStack = null;
             stopAfterShulkerRecovery = false;
             beginTemporaryShulkerRecovery(ORPHANED_WORKSITE_RECOVERY);
@@ -4122,6 +4127,7 @@ public final class StashOrganizer {
         temporaryShulkerPickupConfirmed = false;
         temporaryShulkerPickupFingerprint = null;
         temporaryShulkerPickupStorageKey = null;
+        temporaryShulkerPickupItemId = null;
         temporaryShulkerPickupStack = null;
         if (!moveShulkerToHotbar(shulkerSlot)) {
             abortWithCargo("safe_hotbar_slot_unavailable",
@@ -5466,6 +5472,7 @@ public final class StashOrganizer {
             temporaryShulkerPickupConfirmed = false;
             temporaryShulkerPickupFingerprint = null;
             temporaryShulkerPickupStorageKey = null;
+            temporaryShulkerPickupItemId = null;
             temporaryShulkerPickupStack = null;
         }
 
@@ -9559,7 +9566,8 @@ public final class StashOrganizer {
                 packStoreTriedDestinations.stream().sorted().toList(),
                 new OrganizerJournalStore.ShulkerPickupEvidence(
                         temporaryShulkerPickupConfirmed, temporaryShulkerPickupFingerprint,
-                        temporaryShulkerPickupStorageKey, packedShulkerInventorySyncRecoveries,
+                        temporaryShulkerPickupStorageKey, temporaryShulkerPickupItemId,
+                        packedShulkerInventorySyncRecoveries,
                         PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION));
     }
 
@@ -9762,6 +9770,7 @@ public final class StashOrganizer {
         temporaryShulkerPickupConfirmed = false;
         temporaryShulkerPickupFingerprint = null;
         temporaryShulkerPickupStorageKey = null;
+        temporaryShulkerPickupItemId = null;
         temporaryShulkerPickupStack = null;
         packedShulkerInventorySyncRecoveries = 0;
         rejectedPackedShulkerInventorySignature = null;
@@ -10326,19 +10335,27 @@ public final class StashOrganizer {
             }
         }
 
-        // Live windows can restore a drained shell's stale pre-drain MIXED components. Accept
-        // only the sole movable candidate when empty-pickup and cargo-ledger evidence agree.
-        int staleMixedCandidate = uniqueMovableShulkerSlot(inventory, chestSlots);
+        // Live windows can restore a drained shell's old components. Prefer its durable base
+        // item identity; legacy checkpoints still require one sole movable mixed candidate.
+        int staleMixedCandidate = temporaryShulkerPickupItemId == null
+                ? uniqueMovableShulkerSlot(inventory, chestSlots)
+                : uniqueMovableShulkerSlot(
+                        inventory, chestSlots, temporaryShulkerPickupItemId);
         if (staleMixedCandidate >= 0) {
             int candidateSlot = chestSlots < 0
                     ? staleMixedCandidate
                     : rawPlayerSlotToWindowSlot(chestSlots, staleMixedCandidate);
+            ItemStack candidate = inventory.getItemStack(candidateSlot);
             ShulkerClassification candidateShape = ShulkerClassification.classify(
-                    ItemIdentifier.readShulkerContents(inventory.getItemStack(candidateSlot)));
-            if (candidateShape.kind() == ShulkerClassification.Kind.MIXED
+                    ItemIdentifier.readShulkerContents(candidate));
+            boolean pickupItemIdentityConfirmed = temporaryShulkerPickupItemId != null
+                    && temporaryShulkerPickupItemId.equals(itemIdFromStack(candidate));
+            if ((candidateShape.kind() == ShulkerClassification.Kind.MIXED
+                    || pickupItemIdentityConfirmed)
                     && recoveredEmptyPackingShellTransactionProven(
                             temporaryShulkerPickupConfirmed,
                             temporaryShulkerPickupFingerprint,
+                            pickupItemIdentityConfirmed,
                             shulkerInventoryCountBeforePlacement,
                             countShulkerBoxes(inventory, chestSlots),
                             compatibleShulkerCountBeforePlacement,
@@ -10355,6 +10372,23 @@ public final class StashOrganizer {
         }
 
         return -1;
+    }
+
+    private int uniqueMovableShulkerSlot(
+            Container inventory, int chestSlots, String expectedItemId) {
+        int candidate = -1;
+        for (int rawSlot = 9; rawSlot <= 44; rawSlot++) {
+            if (isProtectedInventorySlot(rawSlot)) continue;
+            int slot = chestSlots < 0
+                    ? rawSlot
+                    : rawPlayerSlotToWindowSlot(chestSlots, rawSlot);
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack == null || stack.getAmount() != 1
+                    || !expectedItemId.equals(itemIdFromStack(stack))) continue;
+            if (candidate >= 0) return -1;
+            candidate = rawSlot;
+        }
+        return candidate;
     }
 
     private int countShulkerBoxes(Container inventory, int chestSlots) {
@@ -10375,6 +10409,7 @@ public final class StashOrganizer {
     static boolean recoveredEmptyPackingShellTransactionProven(
             boolean collectionConfirmed,
             String pickupFingerprint,
+            boolean pickupItemIdentityConfirmed,
             int shulkersBeforePlacement,
             int observedShulkers,
             int compatibleShulkersBeforePlacement,
@@ -10389,7 +10424,9 @@ public final class StashOrganizer {
         return collectionConfirmed
                 && isEmptyShulkerFingerprint(pickupFingerprint)
                 && shulkersBeforePlacement > 0
-                && observedShulkers == shulkersBeforePlacement
+                && (pickupItemIdentityConfirmed
+                    ? observedShulkers >= shulkersBeforePlacement
+                    : observedShulkers == shulkersBeforePlacement)
                 && compatibleShulkersBeforePlacement == 0
                 && packedShulkerTransactionLedgerProven(
                         mixedDecomposition, packingTask, fillMovedUnits,
