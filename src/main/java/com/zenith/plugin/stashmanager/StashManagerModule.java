@@ -1395,7 +1395,8 @@ public class StashManagerModule extends Module {
                 entries,
                 config.pos1,
                 config.pos2,
-                getReservedContainerKeys());
+                getReservedContainerKeys(),
+                true);
         if (!started && foodContingencyActive) {
             foodContingencyActive = false;
             foodContingencyTerminalReason = "retrieval_start_rejected";

@@ -67,6 +67,7 @@ public final class StashRetriever {
     private static final int CLICK_COOLDOWN_TICKS = 6;
     private static final int WALK_TIMEOUT_TICKS = 400;
     private static final int MAX_CONSECUTIVE_FAILURES = 4;
+    private static final int FOOD_REACH_FALLBACK_STILL_TICKS = 40;
 
     private static final int SHULKER_TOTAL_TIMEOUT_TICKS = 200;
     private static final int SHULKER_PLACE_TIMEOUT_TICKS = 60;
@@ -91,6 +92,10 @@ public final class StashRetriever {
     private int actionCooldown;
     private int actionSlotIndex;
     private int walkingTicks;
+    private int stationaryWalkTicks;
+    private double lastWalkX, lastWalkY, lastWalkZ;
+    private boolean preferNearbyFoodTargets;
+    private boolean foodPathRearmed;
     private int consecutiveFailures;
     private int initialRequestedTotal;
     private int successfulTransfers;
@@ -182,6 +187,17 @@ public final class StashRetriever {
                             int[] regionPos1,
                             int[] regionPos2,
                             Set<Long> excludedPositions) {
+        return startKit(requestName, kitItems, candidates,
+                regionPos1, regionPos2, excludedPositions, false);
+    }
+
+    public boolean startKit(String requestName,
+                            Map<String, Integer> kitItems,
+                            List<ContainerEntry> candidates,
+                            int[] regionPos1,
+                            int[] regionPos2,
+                            Set<Long> excludedPositions,
+                            boolean preferNearbyFoodTargets) {
         if (kitItems == null || kitItems.isEmpty()) return false;
         if (isActive()) return false;
 
@@ -192,7 +208,8 @@ public final class StashRetriever {
 
         resetState();
         activeRequestName = requestName;
-    setTargetPolicy(regionPos1, regionPos2, excludedPositions);
+        this.preferNearbyFoodTargets = preferNearbyFoodTargets;
+        setTargetPolicy(regionPos1, regionPos2, excludedPositions);
         kitItems.forEach((k, v) -> {
             if (v != null && v > 0) remaining.put(k, v);
         });
@@ -212,11 +229,21 @@ public final class StashRetriever {
         }
 
         List<ContainerEntry> sorted = new ArrayList<>(candidates);
-        sorted.sort(Comparator
+        Comparator<ContainerEntry> normalOrder = Comparator
             .comparingInt((ContainerEntry e) -> -matchScore(e))
             .thenComparingInt(e -> directMatchScore(e) > 0 ? 0 : 1)
             .thenComparingInt(e -> laneOutputKeys.contains(posKey(e.x(), e.y(), e.z())) ? 0 : 1)
-            .thenComparingDouble(e -> distanceTo(e.x(), e.y(), e.z())));
+            .thenComparingDouble(e -> distanceTo(e.x(), e.y(), e.z()));
+        if (preferNearbyFoodTargets) {
+            var player = CACHE.getPlayerCache();
+            sorted.sort(Comparator
+                    .comparingInt((ContainerEntry e) -> foodAccessBand(
+                            player.getX(), player.getY(), player.getZ(), e))
+                    .thenComparingDouble(e -> distanceTo(e.x(), e.y(), e.z()))
+                    .thenComparing(normalOrder));
+        } else {
+            sorted.sort(normalOrder);
+        }
 
         for (ContainerEntry entry : sorted) {
             if (matchScore(entry) <= 0) continue;
@@ -290,14 +317,44 @@ public final class StashRetriever {
         }
 
         walkingTicks++;
+        var player = CACHE.getPlayerCache();
+        double movedSquared = Math.pow(player.getX() - lastWalkX, 2)
+                + Math.pow(player.getY() - lastWalkY, 2)
+                + Math.pow(player.getZ() - lastWalkZ, 2);
+        stationaryWalkTicks = movedSquared < 0.0025 ? stationaryWalkTicks + 1 : 0;
+        lastWalkX = player.getX();
+        lastWalkY = player.getY();
+        lastWalkZ = player.getZ();
 
         double dist = distanceTo(currentTarget[0], currentTarget[1], currentTarget[2]);
         if (isAtTargetAccessPosition()) {
+            beginOpeningTarget();
+            return;
+        }
+        if (preferNearbyFoodTargets
+                && stationaryWalkTicks >= FOOD_REACH_FALLBACK_STILL_TICKS
+                && ContainerApproach.isWithinVanillaReach(
+                        player.getX(), player.getY(), player.getZ(),
+                        currentTarget[0], currentTarget[1], currentTarget[2])) {
+            emit("retrieve_food_reach_fallback", Map.of(
+                    "reason", "path_stalled_within_vanilla_reach",
+                    "stationary_ticks", stationaryWalkTicks,
+                    "distance", String.format("%.1f", dist)));
+            beginOpeningTarget();
+            return;
+        }
+        if (preferNearbyFoodTargets
+                && stationaryWalkTicks >= FOOD_REACH_FALLBACK_STILL_TICKS
+                && !foodPathRearmed) {
+            foodPathRearmed = true;
             BARITONE.stop();
-            state = State.OPENING;
-            containerOpenGate.reset();
-            openWaitTicks = 0;
-            containerDataReceived = false;
+            emit("retrieve_food_path_rearmed", Map.of(
+                    "reason", "no_movement_after_path_request",
+                    "stationary_ticks", stationaryWalkTicks,
+                    "distance", String.format("%.1f", dist),
+                    "feet_block", blockNameAtPlayer(0),
+                    "floor_block", blockNameAtPlayer(-1)));
+            pathToTarget();
             return;
         }
 
@@ -318,6 +375,23 @@ public final class StashRetriever {
         if (!BARITONE.getCustomGoalProcess().isActive()) {
             pathToTarget();
         }
+    }
+
+    private void beginOpeningTarget() {
+        BARITONE.stop();
+        state = State.OPENING;
+        containerOpenGate.reset();
+        openWaitTicks = 0;
+        containerDataReceived = false;
+    }
+
+    private String blockNameAtPlayer(int yOffset) {
+        var player = CACHE.getPlayerCache();
+        var block = World.getBlock(
+                (int) Math.floor(player.getX()),
+                (int) Math.floor(player.getY()) + yOffset,
+                (int) Math.floor(player.getZ()));
+        return block == null ? "unknown" : block.name();
     }
 
     private void tickOpening() {
@@ -767,6 +841,12 @@ public final class StashRetriever {
         actionCooldown = 0;
         actionSlotIndex = 0;
         walkingTicks = 0;
+        stationaryWalkTicks = 0;
+        foodPathRearmed = false;
+        var player = CACHE.getPlayerCache();
+        lastWalkX = player.getX();
+        lastWalkY = player.getY();
+        lastWalkZ = player.getZ();
         containerDataReceived = false;
         BARITONE.stop();
         emit("retrieve_target_selected", Map.of(
@@ -803,6 +883,9 @@ public final class StashRetriever {
         actionCooldown = 0;
         actionSlotIndex = 0;
         walkingTicks = 0;
+        stationaryWalkTicks = 0;
+        foodPathRearmed = false;
+        preferNearbyFoodTargets = false;
         consecutiveFailures = 0;
         initialRequestedTotal = 0;
         successfulTransfers = 0;
@@ -865,6 +948,15 @@ public final class StashRetriever {
         unloadBreakFuture = null;
         shulkerInventorySearchDelay = 0;
         shulkerOpenRetries = 0;
+    }
+
+    static int foodAccessBand(double playerX, double playerY, double playerZ,
+                              ContainerEntry entry) {
+        if (ContainerApproach.isAtAccessPosition(
+                playerX, playerY, playerZ, entry.x(), entry.y(), entry.z())) return 0;
+        if (ContainerApproach.isWithinVanillaReach(
+                playerX, playerY, playerZ, entry.x(), entry.y(), entry.z())) return 1;
+        return 2;
     }
 
     private int matchScore(ContainerEntry entry) {

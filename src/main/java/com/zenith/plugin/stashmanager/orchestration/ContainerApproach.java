@@ -6,6 +6,7 @@ public final class ContainerApproach {
     // Vanilla/Zenith block reach is normally 4.5 blocks. Keep half a block of margin so
     // this predicate only hands off targets that the interaction process can plausibly hit.
     private static final double CONSERVATIVE_BLOCK_REACH = 4.0;
+    private static final double VANILLA_BLOCK_REACH = 4.5;
 
     private ContainerApproach() { }
 
@@ -33,6 +34,21 @@ public final class ContainerApproach {
         // in its exact-adjacency goal. At that point Zenith's InteractWithProcess should own
         // the final rotation, raycast, and (when necessary) short approach. Measure to the
         // target block's unit AABB rather than its origin so the check matches physical reach.
+        return isWithinBlockReach(playerX, playerY, playerZ,
+                targetX, targetY, targetZ, CONSERVATIVE_BLOCK_REACH);
+    }
+
+    /** Last-chance reach check when pathing cannot move; the interaction still must be confirmed. */
+    public static boolean isWithinVanillaReach(
+            double playerX, double playerY, double playerZ,
+            int targetX, int targetY, int targetZ) {
+        return isWithinBlockReach(playerX, playerY, playerZ,
+                targetX, targetY, targetZ, VANILLA_BLOCK_REACH);
+    }
+
+    private static boolean isWithinBlockReach(
+            double playerX, double playerY, double playerZ,
+            int targetX, int targetY, int targetZ, double reach) {
         double eyeY = playerY + STANDING_EYE_HEIGHT;
         double dxToBlock = distanceToInterval(playerX, targetX, targetX + 1.0);
         double dyToBlock = distanceToInterval(eyeY, targetY, targetY + 1.0);
@@ -40,7 +56,7 @@ public final class ContainerApproach {
         return dxToBlock * dxToBlock
                 + dyToBlock * dyToBlock
                 + dzToBlock * dzToBlock
-                <= CONSERVATIVE_BLOCK_REACH * CONSERVATIVE_BLOCK_REACH;
+                <= reach * reach;
     }
 
     private static double distanceToInterval(double value, double min, double max) {
