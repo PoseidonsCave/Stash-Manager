@@ -3764,9 +3764,10 @@ public final class StashOrganizer {
             if (transfer.outcome() == QuickMoveOutcome.CONFIRMED_DRAINED) {
                 actionSlotIndex++;
                 movedThisVisit++;
-                // The packed shulker is the final handoff for every loose unit still owned
-                // by this reconciliation transaction.
-                taskCargo.recordDeposited(taskCargo.remaining());
+                // A partial box only delivers the units confirmed during this fill. The
+                // remaining loose cargo still needs another box or a staged receipt.
+                taskCargo.recordDeposited(Math.min(
+                        taskCargo.remaining(), Math.max(0, shulkerFillMovedUnits)));
                 packStoreVerificationTicks = 0;
                 if (isImportStagingPack()) {
                     recordWritableImportDestination(
