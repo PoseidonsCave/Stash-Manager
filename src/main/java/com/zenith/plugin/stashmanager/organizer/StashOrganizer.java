@@ -3448,6 +3448,7 @@ public final class StashOrganizer {
                                         && deferCurrentPackedImportHandoffForCapacityRecovery()) {
                                     return;
                                 }
+                                if (deferBlockedMixedInventoryBoxForCapacityRecovery()) return;
                                 if (rollbackBlockedMixedShulkerToSource(
                                         "import_staging_capacity_exhausted")) {
                                     return;
@@ -6186,6 +6187,7 @@ public final class StashOrganizer {
                             && deferCurrentPackedImportHandoffForCapacityRecovery()) {
                         return;
                     }
+                    if (deferBlockedMixedInventoryBoxForCapacityRecovery()) return;
                     if (rollbackBlockedMixedShulkerToSource(
                             "overflow_import_capacity_exhausted")) {
                         return;
@@ -7281,6 +7283,40 @@ public final class StashOrganizer {
     private void resumeMoveCheckpoint(State interrupted) {
         if (currentTask == null) {
             advanceToNextTask();
+            return;
+        }
+
+        if (isMixedSourceRollbackTask(currentTask)
+                && (!isIndexedSourceContainer(currentTask.source())
+                        || (interrupted == State.OPENING
+                                && BlockCompat.isAir(World.getBlock(
+                                        currentTask.source()[0], currentTask.source()[1],
+                                        currentTask.source()[2]))))) {
+            MoveTask rollback = currentTask;
+            MoveTask deferred = taskQueue.stream()
+                    .filter(task -> task.mixedDecomposition()
+                            && task.mandatoryInventoryDeposit()
+                            && !isMixedSourceRollbackTask(task)
+                            && Objects.equals(task.itemId(), rollback.itemId())
+                            && Objects.equals(task.shulkerContentFilter(),
+                                    rollback.shulkerContentFilter())
+                            && Arrays.equals(task.source(), rollback.source()))
+                    .findFirst().orElse(null);
+            if (deferred == null || countCurrentTaskCargoUnitsInInventory() <= 0) {
+                abortWithCargo("mixed_rollback_source_missing",
+                        "The saved rollback source is not a container; mixed cargo remains in inventory.");
+                return;
+            }
+            taskQueue.remove(deferred);
+            currentTask = deferred.markAlreadyInInventory();
+            totalTasks = Math.max(completedTasks, totalTasks - 1);
+            taskCargo.reset(countCurrentTaskCargoUnitsInInventory());
+            clearMixedDecompositionState();
+            emit("organize_mixed_rollback_repaired", Map.of(
+                    "reason", "inventory_origin_is_not_a_source_container",
+                    "disposition", "resume_mixed_decomposition_from_inventory",
+                    "cargo_preserved", true));
+            startMixedShulkerDecomposition();
             return;
         }
 
@@ -8632,6 +8668,8 @@ public final class StashOrganizer {
                 || !mixedDecompositionMode
                 || currentTask == null
                 || !currentTask.mixedDecomposition()
+                || currentTask.alreadyInInventory()
+                || !isIndexedSourceContainer(currentTask.source())
                 || mixedBoxDrained
                 || !mixedCargoSlots.isEmpty()
                 || Arrays.equals(currentTask.source(), currentTask.destination())) {
@@ -8641,6 +8679,38 @@ public final class StashOrganizer {
         return classification != null
                 && classification.kind() == ShulkerClassification.Kind.MIXED
                 && currentTask.shulkerContentFilter().equals(classification.fingerprint());
+    }
+
+    private boolean isIndexedSourceContainer(int[] source) {
+        return source != null && index.get(source[0], source[1], source[2]) != null;
+    }
+
+    /** Free an import slot before retrying a mixed box that never vacated a source chest. */
+    private boolean deferBlockedMixedInventoryBoxForCapacityRecovery() {
+        if (!mixedDecompositionMode || currentTask == null
+                || !currentTask.mixedDecomposition()
+                || !currentTask.alreadyInInventory()
+                || mixedBoxDrained || !mixedCargoSlots.isEmpty()) return false;
+        ShulkerClassification classification = currentMixedShulkerClassificationInInventory();
+        if (classification == null
+                || classification.kind() != ShulkerClassification.Kind.MIXED
+                || !Objects.equals(currentTask.shulkerContentFilter(),
+                        classification.fingerprint())) return false;
+        MoveTask capacityRecovery = takeImportCapacityRecoveryTask();
+        if (capacityRecovery == null) return false;
+
+        MoveTask deferred = currentTask.requireInventoryDeposit();
+        if (!taskQueue.contains(deferred)) taskQueue.addFirst(deferred);
+        currentTask = null;
+        clearMixedDecompositionState();
+        resetTemporaryShulkerState();
+        emit("organize_mixed_shulker_deferred", Map.of(
+                "reason", "import_staging_capacity_exhausted",
+                "disposition", "compact_staged_import_cargo_then_retry",
+                "cargo_preserved", true));
+        startImportCapacityRecovery(capacityRecovery,
+                "deferred_mixed_box_capacity_exhausted");
+        return true;
     }
 
     /** Return an untouched mixed box to the source slot it vacated, then retry it once. */
