@@ -62,6 +62,26 @@ public final class StashRetriever {
         DONE
     }
 
+    /** Explains why a retrieval could not enter its first state. */
+    public enum StartFailureReason {
+        NONE(false),
+        EMPTY_REQUEST(false),
+        ALREADY_ACTIVE(true),
+        BOT_DISCONNECTED(true),
+        PROXY_IN_USE(true),
+        NO_MATCHES(false);
+
+        private final boolean retryable;
+
+        StartFailureReason(boolean retryable) {
+            this.retryable = retryable;
+        }
+
+        public boolean retryable() {
+            return retryable;
+        }
+    }
+
     private static final int OPEN_TIMEOUT_TICKS = 60;
     // Match Zenith's default 5-tick click cadence; faster submissions are rejected.
     private static final int CLICK_COOLDOWN_TICKS = 6;
@@ -80,6 +100,7 @@ public final class StashRetriever {
 
     private State state = State.IDLE;
     private String activeRequestName;
+    private StartFailureReason lastStartFailureReason = StartFailureReason.NONE;
 
     private final Deque<int[]> targetQueue = new ArrayDeque<>();
     private int[] currentTarget;
@@ -156,6 +177,10 @@ public final class StashRetriever {
         return activeRequestName;
     }
 
+    public StartFailureReason getLastStartFailureReason() {
+        return lastStartFailureReason;
+    }
+
     public int getRemainingTotal() {
         return remaining.values().stream().mapToInt(Integer::intValue).sum();
     }
@@ -198,11 +223,23 @@ public final class StashRetriever {
                             int[] regionPos2,
                             Set<Long> excludedPositions,
                             boolean preferNearbyFoodTargets) {
-        if (kitItems == null || kitItems.isEmpty()) return false;
-        if (isActive()) return false;
+        lastStartFailureReason = StartFailureReason.NONE;
+        if (kitItems == null || kitItems.isEmpty()) {
+            lastStartFailureReason = StartFailureReason.EMPTY_REQUEST;
+            return false;
+        }
+        if (isActive()) {
+            lastStartFailureReason = StartFailureReason.ALREADY_ACTIVE;
+            return false;
+        }
 
         var proxy = Proxy.getInstance();
-        if (!proxy.isConnected() || proxy.hasActivePlayer()) {
+        if (!proxy.isConnected()) {
+            lastStartFailureReason = StartFailureReason.BOT_DISCONNECTED;
+            return false;
+        }
+        if (proxy.hasActivePlayer()) {
+            lastStartFailureReason = StartFailureReason.PROXY_IN_USE;
             return false;
         }
 
@@ -215,6 +252,7 @@ public final class StashRetriever {
         });
 
         if (remaining.isEmpty()) {
+            lastStartFailureReason = StartFailureReason.EMPTY_REQUEST;
             state = State.DONE;
             emit("retrieve_no_targets", Map.of("reason", "empty_request"));
             return false;
@@ -252,6 +290,7 @@ public final class StashRetriever {
         }
 
         if (targetQueue.isEmpty()) {
+            lastStartFailureReason = StartFailureReason.NO_MATCHES;
             state = State.DONE;
             emit("retrieve_no_targets", Map.of(
                 "reason", "no_matches",

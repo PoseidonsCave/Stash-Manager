@@ -145,6 +145,7 @@ public class StashManagerModule extends Module {
     private boolean foodContingencyBlocked = false;
     private int foodContingencyVerificationTicks = 0;
     private int foodContingencyBlockedRecheckTicks = 0;
+    private int foodContingencyStartRetryTicks = 0;
     private boolean foodContingencyCleanupPending = false;
     private final FoodContingencyCloseGate foodContingencyCloseGate =
             new FoodContingencyCloseGate();
@@ -154,6 +155,7 @@ public class StashManagerModule extends Module {
     private volatile @Nullable String controllingPlayerName;
     private static final int SCAN_PREEMPTION_QUIET_TICKS = 40;
     private static final int LATE_OPEN_QUARANTINE_TICKS = 100;
+    private static final int FOOD_CONTINGENCY_START_RETRY_TICKS = 40;
 
     // Starting position — used for return-to-start
     private double startX, startY, startZ;
@@ -1279,6 +1281,12 @@ public class StashManagerModule extends Module {
             return true;
         }
 
+        if (foodContingencyStartRetryTicks > 0) {
+            holdFoodContingencyGate();
+            foodContingencyStartRetryTicks--;
+            return true;
+        }
+
         if (foodContingencyBlocked) {
             holdFoodContingencyGate();
             if (++foodContingencyBlockedRecheckTicks >= 20) {
@@ -1347,6 +1355,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = "none";
@@ -1399,8 +1408,23 @@ public class StashManagerModule extends Module {
                 true);
         if (!started && foodContingencyActive) {
             foodContingencyActive = false;
-            foodContingencyTerminalReason = "retrieval_start_rejected";
-            foodContingencyVerificationTicks = 10;
+            StashRetriever.StartFailureReason failure = retriever.getLastStartFailureReason();
+            foodContingencyTerminalReason = "retrieval_start_"
+                    + failure.name().toLowerCase();
+            if (failure.retryable()) {
+                // Connection and proxy-control transitions are temporary ownership failures,
+                // not evidence that the indexed stash lacks food. Keep the parent checkpoint
+                // yielded and rebuild the request from live inventory after a short backoff.
+                foodContingencyRequested = true;
+                foodContingencyStartRetryTicks = FOOD_CONTINGENCY_START_RETRY_TICKS;
+                debugRecorder.record("food_contingency_start_deferred",
+                        "job=" + foodContingencyJob.name().toLowerCase()
+                                + ", reason=" + failure.name().toLowerCase()
+                                + ", retry_ticks=" + foodContingencyStartRetryTicks
+                                + ", disposition=retry_from_live_inventory");
+            } else {
+                foodContingencyVerificationTicks = 10;
+            }
         }
         holdFoodContingencyGate();
         return true;
@@ -1512,6 +1536,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = "none";
@@ -1525,6 +1550,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = true;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = reason;
@@ -1566,6 +1592,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTrigger = "none";
