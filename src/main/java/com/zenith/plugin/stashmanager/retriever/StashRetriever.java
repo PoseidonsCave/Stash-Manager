@@ -25,6 +25,7 @@ import com.zenith.plugin.stashmanager.util.BaritoneCompat;
 import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import com.zenith.plugin.stashmanager.util.PathfinderCompat;
+import com.zenith.util.RequestFuture;
 import org.geysermc.mcprotocollib.network.Session;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.MoveToHotbarAction;
@@ -89,12 +90,18 @@ public final class StashRetriever {
     private static final int MAX_CONSECUTIVE_FAILURES = 4;
     private static final int FOOD_REACH_FALLBACK_STILL_TICKS = 40;
 
-    private static final int SHULKER_TOTAL_TIMEOUT_TICKS = 200;
-    private static final int SHULKER_PLACE_TIMEOUT_TICKS = 60;
-    private static final int SHULKER_OPEN_TIMEOUT_TICKS = 60;
-    private static final int SHULKER_BREAK_TIMEOUT_TICKS = 80;
+    // Nested retrieval has to place, open, empty, break, and recover a borrowed box. A
+    // ten-second budget was shorter than a single difficult Baritone approach in large stashes.
+    private static final int SHULKER_TOTAL_TIMEOUT_TICKS = 2400;
+    private static final int SHULKER_PLACE_TIMEOUT_TICKS = 400;
+    private static final int SHULKER_OPEN_TIMEOUT_TICKS = 200;
+    private static final int SHULKER_BREAK_TIMEOUT_TICKS = 300;
+    private static final int MAX_SHULKER_PLACE_REPLANS = 4;
     private static final int SHULKER_PICKUP_WAIT_TICKS = 16;
     private static final int SHULKER_SEARCH_SETTLE_TICKS = 4;
+    private static final int SHULKER_PLACE_RETRY_DELAY_TICKS = 10;
+    private static final int SHULKER_HELD_RESELECT_TICKS = 40;
+    private static final int MAX_SHULKER_HELD_RESELECTS = 5;
     private static final int TELEPORT_CALM_TICKS = 6;
     private static final int SHULKER_HOTBAR_SLOT = 6;
 
@@ -138,8 +145,12 @@ public final class StashRetriever {
     private ItemData unloadShulkerItemData;
     private PathingRequestFuture unloadPlaceFuture;
     private PathingRequestFuture unloadBreakFuture;
+    private RequestFuture unloadHotbarRequest;
+    private int unloadHotbarRawSlot = -1;
     private int shulkerInventorySearchDelay;
     private int shulkerOpenRetries;
+    private int shulkerPlaceReplans;
+    private int shulkerHeldReselects;
 
     private int lastTeleportQueueSize = -1;
     private int ticksSinceTeleportQueueChange;
@@ -289,7 +300,10 @@ public final class StashRetriever {
             targetQueue.add(new int[]{entry.x(), entry.y(), entry.z()});
         }
 
-        if (targetQueue.isEmpty()) {
+        // A restart can occur after a nested shulker was borrowed but before its contents were
+        // extracted. Recover from the live inventory first instead of borrowing a duplicate.
+        int inventoryShulkerSlot = findInventoryShulkerWithWantedContents();
+        if (targetQueue.isEmpty() && inventoryShulkerSlot < 0) {
             lastStartFailureReason = StartFailureReason.NO_MATCHES;
             state = State.DONE;
             emit("retrieve_no_targets", Map.of(
@@ -303,10 +317,21 @@ public final class StashRetriever {
         emit("retrieve_started", Map.of(
             "total_requested", initialRequestedTotal,
             "unique_items", remaining.size(),
-            "candidate_targets", targetQueue.size()
+            "candidate_targets", targetQueue.size(),
+            "inventory_shulker_available", inventoryShulkerSlot >= 0
         ));
 
         BARITONE.stop();
+        if (inventoryShulkerSlot >= 0) {
+            ItemStack inventoryShulker = getPlayerInventoryStack(inventoryShulkerSlot);
+            ownedShulkerSlots.add(inventoryShulkerSlot);
+            emit("retrieve_inventory_shulker_selected", Map.of(
+                "inventory_slot", inventoryShulkerSlot,
+                "reason", "wanted_contents_already_in_inventory"
+            ));
+            beginShulkerUnload(-1, inventoryShulker);
+            return true;
+        }
         advanceToNextTarget(null);
         return true;
     }
@@ -549,6 +574,9 @@ public final class StashRetriever {
     }
 
     private void beginShulkerUnload(int chestSlot, ItemStack shulkerStack) {
+        // The container approach may still own a path request when a within-reach open succeeds.
+        // Do not let that request carry the bot away after we select a local placement cell.
+        BARITONE.stop();
         unloadPhase = 0;
         unloadTicks = 0;
         unloadTotalTicks = 0;
@@ -558,8 +586,12 @@ public final class StashRetriever {
         unloadShulkerItemData = ItemRegistry.REGISTRY.get(shulkerStack.getId());
         unloadPlaceFuture = null;
         unloadBreakFuture = null;
+        unloadHotbarRequest = null;
+        unloadHotbarRawSlot = -1;
         shulkerInventorySearchDelay = SHULKER_SEARCH_SETTLE_TICKS;
         shulkerOpenRetries = 0;
+        shulkerPlaceReplans = 0;
+        shulkerHeldReselects = 0;
         state = State.UNLOADING_SHULKER;
         emit("retrieve_shulker_unload_started", Map.of(
             "source_container_slot", chestSlot,
@@ -572,7 +604,12 @@ public final class StashRetriever {
         unloadTotalTicks++;
 
         if (unloadTotalTicks > SHULKER_TOTAL_TIMEOUT_TICKS) {
-            emit("retrieve_shulker_unload_failed", Map.of("reason", "timeout"));
+            emit("retrieve_shulker_unload_failed", Map.of(
+                "reason", "timeout",
+                "phase", unloadPhase,
+                "phase_ticks", unloadTicks,
+                "place_replans", shulkerPlaceReplans
+            ));
             finish(false, "shulker_unload_timeout");
             return;
         }
@@ -626,8 +663,7 @@ public final class StashRetriever {
         if (placedShulkerPos == null) {
             placedShulkerPos = findShulkerPlaceSpot();
             if (placedShulkerPos == null) {
-                emit("retrieve_shulker_unload_failed", Map.of("reason", "no_place_spot"));
-                finish(false, "no_shulker_place_spot");
+                retryShulkerPlacement("no_place_spot");
                 return;
             }
         }
@@ -648,7 +684,51 @@ public final class StashRetriever {
             return;
         }
 
-        moveShulkerToHotbar(unloadShulkerSlot);
+        if (unloadHotbarRequest == null) {
+            if (!moveShulkerToHotbar(unloadShulkerSlot)) {
+                emit("retrieve_shulker_unload_failed", Map.of(
+                    "reason", "hotbar_transfer_rejected"
+                ));
+                finish(false, "shulker_hotbar_transfer_rejected");
+            }
+            unloadTicks = 0;
+            return;
+        }
+        if (!unloadHotbarRequest.isCompleted()) return;
+        if (!unloadHotbarRequest.getNow()) {
+            emit("retrieve_shulker_unload_failed", Map.of(
+                "reason", "hotbar_transfer_rejected"
+            ));
+            finish(false, "shulker_hotbar_transfer_rejected");
+            return;
+        }
+        if (!unloadShulkerReadyForPlacement()) {
+            if (unloadTicks >= SHULKER_HELD_RESELECT_TICKS
+                    && shulkerHeldReselects < MAX_SHULKER_HELD_RESELECTS) {
+                shulkerHeldReselects++;
+                // A completed SetHeldItem can still be superseded by another automation owner.
+                // Re-issue selection against the live hotbar slot without moving the box again.
+                unloadShulkerSlot = unloadHotbarRawSlot;
+                unloadHotbarRequest = null;
+                unloadTicks = 0;
+                emit("retrieve_shulker_held_reselected", Map.of(
+                    "attempt", shulkerHeldReselects,
+                    "max_attempts", MAX_SHULKER_HELD_RESELECTS,
+                    "expected_hotbar_slot", unloadHotbarRawSlot,
+                    "held_hotbar_index", CACHE.getPlayerCache().getHeldItemSlot()
+                ));
+                return;
+            }
+            if (unloadTicks > SHULKER_PLACE_TIMEOUT_TICKS) {
+                emit("retrieve_shulker_unload_failed", Map.of(
+                    "reason", "hotbar_transfer_unverified",
+                    "expected_hotbar_slot", unloadHotbarRawSlot,
+                    "held_hotbar_index", CACHE.getPlayerCache().getHeldItemSlot()
+                ));
+                finish(false, "shulker_hotbar_transfer_unverified");
+            }
+            return;
+        }
         unloadPhase = 1;
         unloadTicks = 0;
     }
@@ -671,9 +751,16 @@ public final class StashRetriever {
             return;
         }
 
+        // Revalidate immediately before placement. The bot can still receive movement/teleport
+        // corrections after opening the source, making the previously local cell stale.
+        if (!isSafeShulkerPlaceSpot(placedShulkerPos)
+                || !isWithinShulkerPlacementReach(placedShulkerPos)) {
+            retryShulkerPlacement("placement_cell_stale");
+            return;
+        }
+
         if (unloadTicks > SHULKER_PLACE_TIMEOUT_TICKS) {
-            emit("retrieve_shulker_unload_failed", Map.of("reason", "place_timeout"));
-            finish(false, "shulker_place_timeout");
+            retryShulkerPlacement("place_timeout");
             return;
         }
 
@@ -692,9 +779,33 @@ public final class StashRetriever {
         }
 
         if (unloadPlaceFuture.isDone() && !unloadPlaceFuture.getNow()) {
-            emit("retrieve_shulker_unload_failed", Map.of("reason", "place_rejected"));
-            finish(false, "shulker_place_rejected");
+            retryShulkerPlacement("place_rejected");
         }
+    }
+
+    private void retryShulkerPlacement(String reason) {
+        BARITONE.stop();
+        shulkerPlaceReplans++;
+        if (shulkerPlaceReplans > MAX_SHULKER_PLACE_REPLANS) {
+            emit("retrieve_shulker_unload_failed", Map.of(
+                "reason", reason,
+                "phase", unloadPhase,
+                "place_replans", shulkerPlaceReplans
+            ));
+            finish(false, "shulker_" + reason);
+            return;
+        }
+
+        emit("retrieve_shulker_place_replanned", Map.of(
+            "reason", reason,
+            "attempt", shulkerPlaceReplans,
+            "max_attempts", MAX_SHULKER_PLACE_REPLANS
+        ));
+        placedShulkerPos = null;
+        unloadPlaceFuture = null;
+        unloadPhase = 0;
+        unloadTicks = 0;
+        shulkerInventorySearchDelay = SHULKER_PLACE_RETRY_DELAY_TICKS;
     }
 
     private void tickUnloadOpen() {
@@ -985,8 +1096,12 @@ public final class StashRetriever {
         unloadShulkerItemData = null;
         unloadPlaceFuture = null;
         unloadBreakFuture = null;
+        unloadHotbarRequest = null;
+        unloadHotbarRawSlot = -1;
         shulkerInventorySearchDelay = 0;
         shulkerOpenRetries = 0;
+        shulkerPlaceReplans = 0;
+        shulkerHeldReselects = 0;
     }
 
     static int foodAccessBand(double playerX, double playerY, double playerZ,
@@ -1207,27 +1322,53 @@ public final class StashRetriever {
         return -1;
     }
 
+    private int findInventoryShulkerWithWantedContents() {
+        var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (playerContainer == null) return -1;
+
+        for (int slot = 36; slot <= 44; slot++) {
+            if (matchesWantedShulker(playerContainer.getItemStack(slot))) return slot;
+        }
+        for (int slot = 9; slot <= 35; slot++) {
+            if (matchesWantedShulker(playerContainer.getItemStack(slot))) return slot;
+        }
+        return matchesWantedShulker(playerContainer.getItemStack(45)) ? 45 : -1;
+    }
+
     private boolean matchesWantedShulker(ItemStack stack) {
         return stack != null && stack.getAmount() > 0 && containsWantedContents(stack);
     }
 
-    private void moveShulkerToHotbar(int slot) {
+    private boolean moveShulkerToHotbar(int slot) {
         try {
             var builder = InventoryActionRequest.builder()
                 .owner(this)
                 .priority(6000);
             if (slot >= 36 && slot <= 44) {
+                unloadHotbarRawSlot = slot;
                 builder.actions(new SetHeldItem(slot - 36));
             } else {
+                unloadHotbarRawSlot = 36 + SHULKER_HOTBAR_SLOT;
                 builder.actions(
                     new MoveToHotbarSlot(slot, MoveToHotbarAction.SLOT_7),
                     new SetHeldItem(SHULKER_HOTBAR_SLOT)
                 );
                 swapOwnedShulkerSlots(slot, 36 + SHULKER_HOTBAR_SLOT);
             }
-            INVENTORY.submit(builder.build());
+            unloadHotbarRequest = INVENTORY.submit(builder.build());
+            return !(unloadHotbarRequest.isCompleted() && !unloadHotbarRequest.getNow());
         } catch (Exception ignored) {
+            unloadHotbarRequest = null;
+            unloadHotbarRawSlot = -1;
+            return false;
         }
+    }
+
+    private boolean unloadShulkerReadyForPlacement() {
+        if (unloadHotbarRawSlot < 36 || unloadHotbarRawSlot > 44) return false;
+        int heldHotbarIndex = CACHE.getPlayerCache().getHeldItemSlot();
+        if (36 + heldHotbarIndex != unloadHotbarRawSlot) return false;
+        return matchesWantedShulker(getPlayerInventoryStack(unloadHotbarRawSlot));
     }
 
     private ItemStack getPlayerInventoryStack(int slot) {
@@ -1254,24 +1395,9 @@ public final class StashRetriever {
                     int z = baseZ + dz;
                     if (!World.isInWorldBounds(x, y, z)) continue;
 
-                    var targetBlock = World.getBlock(x, y, z);
-                    var aboveBlock = World.getBlock(x, y + 1, z);
-                    var belowBlock = World.getBlock(x, y - 1, z);
-                    // Reject spots where any placement face can open a container.
-                    var northBlock = World.getBlock(x, y, z - 1);
-                    var southBlock = World.getBlock(x, y, z + 1);
-                    var eastBlock = World.getBlock(x + 1, y, z);
-                    var westBlock = World.getBlock(x - 1, y, z);
-                    if (!BlockCompat.canReplace(targetBlock)
-                        || !BlockCompat.canReplace(aboveBlock)
-                        || BlockCompat.isAir(belowBlock)
-                        || BlockCompat.isInteractable(belowBlock)
-                        || BlockCompat.isInteractable(northBlock)
-                        || BlockCompat.isInteractable(southBlock)
-                        || BlockCompat.isInteractable(eastBlock)
-                        || BlockCompat.isInteractable(westBlock)
-                        || BlockCompat.isInteractable(aboveBlock)
-                        || !BlockCompat.isSolid(x, y - 1, z)) {
+                    int[] candidate = new int[]{x, y, z};
+                    if (!isSafeShulkerPlaceSpot(candidate)
+                            || !isWithinShulkerPlacementReach(candidate)) {
                         continue;
                     }
 
@@ -1285,6 +1411,38 @@ public final class StashRetriever {
         }
 
         return best;
+    }
+
+    private boolean isWithinShulkerPlacementReach(int[] pos) {
+        var player = CACHE.getPlayerCache();
+        return ContainerApproach.isWithinVanillaReach(
+            player.getX(), player.getY(), player.getZ(), pos[0], pos[1], pos[2]);
+    }
+
+    private boolean isSafeShulkerPlaceSpot(int[] pos) {
+        int x = pos[0];
+        int y = pos[1];
+        int z = pos[2];
+        if (!World.isInWorldBounds(x, y, z)) return false;
+
+        var targetBlock = World.getBlock(x, y, z);
+        var aboveBlock = World.getBlock(x, y + 1, z);
+        var belowBlock = World.getBlock(x, y - 1, z);
+        // Baritone may choose any adjacent support face. Keep all of them non-interactable.
+        var northBlock = World.getBlock(x, y, z - 1);
+        var southBlock = World.getBlock(x, y, z + 1);
+        var eastBlock = World.getBlock(x + 1, y, z);
+        var westBlock = World.getBlock(x - 1, y, z);
+        return BlockCompat.canReplace(targetBlock)
+            && BlockCompat.canReplace(aboveBlock)
+            && !BlockCompat.isAir(belowBlock)
+            && !BlockCompat.isInteractable(belowBlock)
+            && !BlockCompat.isInteractable(northBlock)
+            && !BlockCompat.isInteractable(southBlock)
+            && !BlockCompat.isInteractable(eastBlock)
+            && !BlockCompat.isInteractable(westBlock)
+            && !BlockCompat.isInteractable(aboveBlock)
+            && BlockCompat.isSolid(x, y - 1, z);
     }
 
     private boolean isShulkerBoxItem(String itemId) {
