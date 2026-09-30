@@ -19,9 +19,14 @@ import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.pathfinder.goals.GoalNear;
+import com.zenith.feature.pathfinder.movement.IMovement;
+import com.zenith.feature.pathfinder.movement.movements.MovementDiagonal;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
+import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
+import com.zenith.mc.block.BlockRegistry;
+import com.zenith.mc.block.properties.api.BlockStateProperties;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
@@ -62,6 +67,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -139,6 +145,7 @@ public class StashManagerModule extends Module {
     private boolean foodContingencyBlocked = false;
     private int foodContingencyVerificationTicks = 0;
     private int foodContingencyBlockedRecheckTicks = 0;
+    private int foodContingencyStartRetryTicks = 0;
     private boolean foodContingencyCleanupPending = false;
     private final FoodContingencyCloseGate foodContingencyCloseGate =
             new FoodContingencyCloseGate();
@@ -148,6 +155,7 @@ public class StashManagerModule extends Module {
     private volatile @Nullable String controllingPlayerName;
     private static final int SCAN_PREEMPTION_QUIET_TICKS = 40;
     private static final int LATE_OPEN_QUARANTINE_TICKS = 100;
+    private static final int FOOD_CONTINGENCY_START_RETRY_TICKS = 40;
 
     // Starting position — used for return-to-start
     private double startX, startY, startZ;
@@ -180,6 +188,11 @@ public class StashManagerModule extends Module {
     private static final int MAX_WALK_RETRIES = 3;
     private int walkingTickCount = 0;
     private static final int WALK_TIMEOUT_TICKS = 600; // 30 seconds at 20tps
+    private static final int DOOR_OPEN_TIMEOUT_TICKS = 60;
+    private final Set<BlockPos> attemptedScanDoors = new HashSet<>();
+    private @Nullable BlockPos scanDoorOpeningPos;
+    private boolean scanDoorInteractionDispatched = false;
+    private int scanDoorOpeningTicks = 0;
 
     // Statistics
     private int containersFound = 0;
@@ -1268,6 +1281,12 @@ public class StashManagerModule extends Module {
             return true;
         }
 
+        if (foodContingencyStartRetryTicks > 0) {
+            holdFoodContingencyGate();
+            foodContingencyStartRetryTicks--;
+            return true;
+        }
+
         if (foodContingencyBlocked) {
             holdFoodContingencyGate();
             if (++foodContingencyBlockedRecheckTicks >= 20) {
@@ -1336,6 +1355,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = "none";
@@ -1384,11 +1404,27 @@ public class StashManagerModule extends Module {
                 entries,
                 config.pos1,
                 config.pos2,
-                getReservedContainerKeys());
+                getReservedContainerKeys(),
+                true);
         if (!started && foodContingencyActive) {
             foodContingencyActive = false;
-            foodContingencyTerminalReason = "retrieval_start_rejected";
-            foodContingencyVerificationTicks = 10;
+            StashRetriever.StartFailureReason failure = retriever.getLastStartFailureReason();
+            foodContingencyTerminalReason = "retrieval_start_"
+                    + failure.name().toLowerCase();
+            if (failure.retryable()) {
+                // Connection and proxy-control transitions are temporary ownership failures,
+                // not evidence that the indexed stash lacks food. Keep the parent checkpoint
+                // yielded and rebuild the request from live inventory after a short backoff.
+                foodContingencyRequested = true;
+                foodContingencyStartRetryTicks = FOOD_CONTINGENCY_START_RETRY_TICKS;
+                debugRecorder.record("food_contingency_start_deferred",
+                        "job=" + foodContingencyJob.name().toLowerCase()
+                                + ", reason=" + failure.name().toLowerCase()
+                                + ", retry_ticks=" + foodContingencyStartRetryTicks
+                                + ", disposition=retry_from_live_inventory");
+            } else {
+                foodContingencyVerificationTicks = 10;
+            }
         }
         holdFoodContingencyGate();
         return true;
@@ -1500,6 +1536,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = "none";
@@ -1513,6 +1550,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = true;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = reason;
@@ -1554,6 +1592,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
         foodContingencyTrigger = "none";
@@ -1696,6 +1735,11 @@ public class StashManagerModule extends Module {
             return;
         }
 
+        if (scanDoorOpeningPos != null) {
+            tickScanDoorOpening(target);
+            return;
+        }
+
         double dist = distanceToContainer(target);
 
         // Always check distance — may have arrived regardless of Baritone state
@@ -1711,6 +1755,9 @@ public class StashManagerModule extends Module {
             containerDataReceived = false;
             return;
         }
+
+        // Zenith's diagonal movement cannot click a closed door on its path.
+        if (beginScanDoorOpening()) return;
 
         // Timeout failsafe
         if (walkingTickCount >= WALK_TIMEOUT_TICKS) {
@@ -1742,6 +1789,111 @@ public class StashManagerModule extends Module {
                 advanceToNextContainer();
             }
         }
+    }
+
+    private boolean beginScanDoorOpening() {
+        if (ownedBaritoneProcess != OwnedBaritoneProcess.CUSTOM_GOAL
+                || ownedBaritoneRequest == null || ownedBaritoneRequest.isCompleted()) return false;
+
+        var executor = BARITONE.getPathingBehavior().getCurrent();
+        if (executor == null) return false;
+        int movementIndex = executor.getPosition();
+        var movements = executor.getPath().movements();
+        if (movementIndex < 0 || movementIndex >= movements.size()) return false;
+        IMovement movement = movements.get(movementIndex);
+        if (!(movement instanceof MovementDiagonal)) return false;
+
+        BlockPos src = movement.getSrc();
+        BlockPos dest = movement.getDest();
+        BlockPos cornerX = new BlockPos(dest.x(), src.y(), src.z());
+        BlockPos cornerZ = new BlockPos(src.x(), src.y(), dest.z());
+        BlockPos[] candidates = {
+            dest, cornerX, cornerZ, src,
+            dest.above(), cornerX.above(), cornerZ.above(), src.above()
+        };
+        BlockPos nearest = null;
+        double nearestDistanceSq = Double.POSITIVE_INFINITY;
+        var player = CACHE.getPlayerCache();
+        for (BlockPos candidate : candidates) {
+            if (attemptedScanDoors.contains(candidate)
+                    || !ContainerApproach.isAtAccessPosition(
+                            player.getX(), player.getY(), player.getZ(),
+                            candidate.x(), candidate.y(), candidate.z())
+                    || !isClosedManualDoor(candidate)) continue;
+            double dx = player.getX() - (candidate.x() + 0.5);
+            double dy = player.getY() + 1.62 - (candidate.y() + 0.5);
+            double dz = player.getZ() - (candidate.z() + 0.5);
+            double distanceSq = dx * dx + dy * dy + dz * dz;
+            if (distanceSq < nearestDistanceSq) {
+                nearest = candidate;
+                nearestDistanceSq = distanceSq;
+            }
+        }
+        if (nearest == null) return false;
+
+        attemptedScanDoors.add(nearest);
+        scanDoorOpeningPos = nearest;
+        scanDoorOpeningTicks = 0;
+        scanDoorInteractionDispatched = false;
+        containerOpenGate.reset();
+        stopOwnedBaritoneProcess();
+        debugRecorder.record("scan_door_open_attempt",
+            "door=" + nearest.x() + ", " + nearest.y() + ", " + nearest.z()
+                + ", container=" + currentContainerPos()
+                + ", movement=diagonal");
+        return true;
+    }
+
+    private void tickScanDoorOpening(ContainerLocation target) {
+        BlockPos door = scanDoorOpeningPos;
+        if (door == null) return;
+        if (!isClosedManualDoor(door)) {
+            boolean opened = isOpenManualDoor(door);
+            debugRecorder.record(opened ? "scan_door_opened" : "scan_door_changed",
+                "door=" + door.x() + ", " + door.y() + ", " + door.z()
+                    + ", container=" + currentContainerPos());
+            resumeWalkingAfterDoor(target);
+            return;
+        }
+
+        scanDoorOpeningTicks++;
+        if (!scanDoorInteractionDispatched && prepareStandingContainerInteraction()) {
+            ownInteraction(BARITONE.rightClickBlock(door.x(), door.y(), door.z()));
+            scanDoorInteractionDispatched = true;
+        }
+        boolean rejected = scanDoorInteractionDispatched
+            && ownedBaritoneRequest != null && ownedBaritoneRequest.isCompleted()
+            && !ownedBaritoneRequest.getNow();
+        if (rejected || scanDoorOpeningTicks >= DOOR_OPEN_TIMEOUT_TICKS) {
+            debugRecorder.record("scan_door_open_unconfirmed",
+                "door=" + door.x() + ", " + door.y() + ", " + door.z()
+                    + ", container=" + currentContainerPos()
+                    + ", reason=" + (rejected ? "interaction_rejected" : "timeout"));
+            resumeWalkingAfterDoor(target);
+        }
+    }
+
+    private void resumeWalkingAfterDoor(ContainerLocation target) {
+        stopOwnedBaritoneProcess();
+        scanDoorOpeningPos = null;
+        scanDoorOpeningTicks = 0;
+        scanDoorInteractionDispatched = false;
+        walkingTickCount = 0;
+        pathToContainer(target);
+    }
+
+    private boolean isClosedManualDoor(BlockPos pos) {
+        var state = World.getBlockState(pos);
+        return state.block().name().endsWith("_door")
+            && state.block() != BlockRegistry.IRON_DOOR
+            && Boolean.FALSE.equals(state.getProperty(BlockStateProperties.OPEN));
+    }
+
+    private boolean isOpenManualDoor(BlockPos pos) {
+        var state = World.getBlockState(pos);
+        return state.block().name().endsWith("_door")
+            && state.block() != BlockRegistry.IRON_DOOR
+            && Boolean.TRUE.equals(state.getProperty(BlockStateProperties.OPEN));
     }
 
     private void tickOpening() {
@@ -1987,6 +2139,9 @@ public class StashManagerModule extends Module {
         if (!organizer.resumeFromYield()) {
             debugRecorder.record("organize_resume_failed",
                     "interrupted_state=" + interruptedState
+                            + ", resume_state=" + organizer.getState().name()
+                            + ", failure_reason="
+                            + Objects.toString(organizer.getLastFailureReason(), "none")
                             + ", paused_seconds=" + pausedTicks / 20);
             return;
         }
@@ -2054,6 +2209,7 @@ public class StashManagerModule extends Module {
         // Stop only a scanner-owned process that has not already been replaced. Calling the
         // global BARITONE.stop() here would cancel the very task we are yielding to.
         stopOwnedBaritoneProcess();
+        resetScanDoorOpening();
         clearOwnedAutomation();
         releaseBaritoneBreakingForYield();
         scannerPreemptionGate.yield();
@@ -2122,6 +2278,7 @@ public class StashManagerModule extends Module {
         containerDataReceived = false;
         walkRetryCount = 0;
         walkingTickCount = 0;
+        resetScanDoorOpening();
         if (isAtContainerAccessPosition(target)) {
             containerOpenGate.reset();
             state = ScanState.OPENING;
@@ -2335,6 +2492,7 @@ public class StashManagerModule extends Module {
 
         // Stop any lingering Baritone process before starting new action
         stopOwnedBaritoneProcess();
+        resetScanDoorOpening();
 
         double dist = distanceToContainer(next);
         walkRetryCount = 0;
@@ -2695,11 +2853,19 @@ public class StashManagerModule extends Module {
         returnPathAttempts = 0;
         walkRetryCount = 0;
         walkingTickCount = 0;
+        resetScanDoorOpening();
         scannerPreemptionGate = newScannerPreemptionGate();
         clearOwnedAutomation();
         scanResumeMode = ScanResumeMode.RETRY_CURRENT;
         lateOpenQuarantineTicks = 0;
         scanPreemptionCount = 0;
+    }
+
+    private void resetScanDoorOpening() {
+        scanDoorOpeningPos = null;
+        scanDoorOpeningTicks = 0;
+        scanDoorInteractionDispatched = false;
+        attemptedScanDoors.clear();
     }
 
     private void refreshLatestScanTrust() {

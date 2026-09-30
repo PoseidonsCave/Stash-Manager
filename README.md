@@ -237,6 +237,10 @@ checks help the bot go straight to a chest with usable space, including compatib
 Those observations expire after five minutes and refresh whenever the organizer visits that chest.
 Known full chests are checked last, and still get a live recheck before a capacity stop. Routine
 capacity misses are grouped into console/debug summaries.
+Packed boxes keep an eight-inventory probe ceiling because they need a whole empty slot. Loose
+packing cargo can merge into partial stacks, so it checks up to 32 distinct imports before treating
+the scan-era capacity map as exhausted. This avoids a false stop when a long job filled only the
+nearest imports after the scan.
 
 Packing searches try matching partial boxes first, then known empty boxes. Within each group,
 recent observations come first, followed by nearer chests. Both halves of a known double chest count
@@ -283,13 +287,30 @@ newly packed cargo, or finishing a mixed box, the organizer stops and sends a fa
 Cargo and queued work stay saved. Look for `inventory_recovery_no_progress` in the status or logs;
 reconnecting alone does not reset this safeguard. Routine handoffs stay in console/debug output.
 
+Returning to reconciliation uses validated standing positions beside the fixed packing pad, not
+the exact block where the job started. The bot checks collision-height footing (including chest
+tops), clear headroom, interaction reach, and sight of the required placement face before packing. Standing
+on a chest does not permit placing a shulker on one. An existing temporary box stays at its saved
+worksite. If a path ends at an unusable off-center position, it tries another validated approach
+within the same trip budget. New jobs need a safe pad with an interaction position before taking cargo.
+
+Cleanup uses the same checked return path before recovering a placed shulker. Travel does not use
+up its mining timeout, and cleanup cannot mine surrounding blocks to reach the box. If access is
+lost, it stops mining and returns safely with bounded retries. Hitting the eight-import probe limit
+means checking stopped, not that every import chest is full; the bot recovers the box before replanning.
+Pickup recovery follows the live shulker item entity when the mined box bounces or falls onto a
+different staircase level instead of searching only across the original block height.
+Confirmed fill and collection receipts also own the resulting packed box when Minecraft reports
+stale pre-fill shulker metadata. Extra unprotected stacks packed from inventory do not invalidate
+that receipt, and restart recovery sends the box to its lane instead of searching for loose cargo.
+
 On the way back to the reconciliation station, ten seconds without meaningful movement triggers a
 short sideways or backward detour. The bot tries at most three, using only loaded, level ground
 with solid footing and clear headroom. It will not mine or bridge to make a detour work. The cargo,
 assigned lane, and starting-position worksite stay unchanged; reaching a detour is not task completion.
 Return trips can use up to four times `organizerWalkTimeoutTicks` (four minutes by default), but
 stalled recovery stops sooner. The budget survives pauses and restarts. If it runs out, the job saves
-its cargo and queue; you can bring the bot back to its starting position before resuming. Console/debug
+its cargo and queue; clear access to the worksite before resuming. Console/debug
 events named `organize_station_walk_*` show distance, idle time, attempts, and path-request status.
 
 Packing boxes are checked for actual stack space before pickup. A box that cannot accept the cargo
@@ -297,6 +318,20 @@ is skipped so the bot can use another matching box or an empty one. Completed bo
 their assigned lane, including a box that fills up while more loose cargo remains aboard. The bot
 tries other chests in that same lane if the intake is full, then uses imports if the entire lane is
 full. No extra lane or follow-up move task is created for a successful direct delivery.
+
+When a lane is being reassigned, stored-shulker deliveries wait for its queued clearance moves.
+This also applies when resuming an older saved job. Already-held cargo still gets handled first.
+Before picking up a stored bulk shulker, the bot checks for a real empty slot in its destination
+lane. Recent live checks can be reused for two minutes, with one slot reserved per pickup;
+scan estimates alone do not authorize a pickup. It checks lower chests if the intake is full.
+If the lane is full or unreachable, the box stays at its source while independent work continues.
+The bot does not repeat that same failed lane check for every queued box. A later live observation
+of free space, or an explicit resume, lets it check again.
+
+If no safe move remains, `lane_clearance_blocked` saves the queue instead of taking more cargo.
+This can happen when two occupied lanes need to swap contents, or clearance destinations are
+unavailable. Check the affected lanes and make room before using `stash organize resume`.
+Routine clearance and capacity-check events stay in console/debug output.
 
 After a packed box is collected, the destination inventory view gets a bounded chance to catch up
 before the organizer decides the box is missing. The player slots are rescanned during that wait.
