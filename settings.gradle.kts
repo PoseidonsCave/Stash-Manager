@@ -1,8 +1,12 @@
 pluginManagement {
     repositories {
         maven("https://maven.2b2t.vc/releases")
+        // Resolve ordinary plugin dependencies without routing them through the Stonecutter
+        // snapshots host. The snapshots repository is only needed for snapshot artifacts.
+        mavenCentral()
         maven("https://maven.kikugie.dev/snapshots") {
             name = "KikuGie Snapshots"
+            mavenContent { snapshotsOnly() }
         }
         gradlePluginPortal()
     }

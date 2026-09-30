@@ -151,6 +151,7 @@ public final class StashRetriever {
     private int shulkerOpenRetries;
     private int shulkerPlaceReplans;
     private int shulkerHeldReselects;
+    private final Set<Long> rejectedShulkerPlacePositions = new HashSet<>();
 
     private int lastTeleportQueueSize = -1;
     private int ticksSinceTeleportQueueChange;
@@ -592,6 +593,7 @@ public final class StashRetriever {
         shulkerOpenRetries = 0;
         shulkerPlaceReplans = 0;
         shulkerHeldReselects = 0;
+        rejectedShulkerPlacePositions.clear();
         state = State.UNLOADING_SHULKER;
         emit("retrieve_shulker_unload_started", Map.of(
             "source_container_slot", chestSlot,
@@ -785,6 +787,12 @@ public final class StashRetriever {
 
     private void retryShulkerPlacement(String reason) {
         BARITONE.stop();
+        if (placedShulkerPos != null) {
+            // A rejected cell will still look replaceable in the world snapshot. Remember it
+            // for this borrowed box so each replan actually tries a different local worksite.
+            rejectedShulkerPlacePositions.add(posKey(
+                    placedShulkerPos[0], placedShulkerPos[1], placedShulkerPos[2]));
+        }
         shulkerPlaceReplans++;
         if (shulkerPlaceReplans > MAX_SHULKER_PLACE_REPLANS) {
             emit("retrieve_shulker_unload_failed", Map.of(
@@ -1102,6 +1110,7 @@ public final class StashRetriever {
         shulkerOpenRetries = 0;
         shulkerPlaceReplans = 0;
         shulkerHeldReselects = 0;
+        rejectedShulkerPlacePositions.clear();
     }
 
     static int foodAccessBand(double playerX, double playerY, double playerZ,
@@ -1394,6 +1403,7 @@ public final class StashRetriever {
                     int y = baseY + dy;
                     int z = baseZ + dz;
                     if (!World.isInWorldBounds(x, y, z)) continue;
+                    if (rejectedShulkerPlacePositions.contains(posKey(x, y, z))) continue;
 
                     int[] candidate = new int[]{x, y, z};
                     if (!isSafeShulkerPlaceSpot(candidate)
@@ -1424,6 +1434,7 @@ public final class StashRetriever {
         int y = pos[1];
         int z = pos[2];
         if (!World.isInWorldBounds(x, y, z)) return false;
+        if (playerIntersectsBlock(x, y, z)) return false;
 
         var targetBlock = World.getBlock(x, y, z);
         var aboveBlock = World.getBlock(x, y + 1, z);
@@ -1443,6 +1454,19 @@ public final class StashRetriever {
             && !BlockCompat.isInteractable(westBlock)
             && !BlockCompat.isInteractable(aboveBlock)
             && BlockCompat.isSolid(x, y - 1, z);
+    }
+
+    private boolean playerIntersectsBlock(int x, int y, int z) {
+        var player = CACHE.getPlayerCache();
+        double playerX = player.getX();
+        double playerY = player.getY();
+        double playerZ = player.getZ();
+        // Minecraft players are 0.6 blocks wide and 1.8 blocks tall. A neighbouring block can
+        // overlap the bot when it is standing close to an edge even though it is not the same
+        // floored X/Z column, which makes Baritone reject every placement replan.
+        return playerX + 0.3 > x && playerX - 0.3 < x + 1
+                && playerY + 1.8 > y && playerY < y + 1
+                && playerZ + 0.3 > z && playerZ - 0.3 < z + 1;
     }
 
     private boolean isShulkerBoxItem(String itemId) {
