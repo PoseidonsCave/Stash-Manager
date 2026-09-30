@@ -6,6 +6,7 @@ import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.function.Predicate;
 
 /** Converts finite keep-list food rules into safe inventory refill requests. */
 public final class FoodContingencyPolicy {
@@ -36,6 +37,13 @@ public final class FoodContingencyPolicy {
     public static Plan plan(
             Map<String, Integer> keepItems,
             Map<String, Integer> inventoryItems) {
+        return plan(keepItems, inventoryItems, ignored -> true);
+    }
+
+    public static Plan plan(
+            Map<String, Integer> keepItems,
+            Map<String, Integer> inventoryItems,
+            Predicate<String> autoEatEligible) {
         Map<String, Integer> inventory = normalizeCounts(inventoryItems);
         Map<String, Integer> requested = new LinkedHashMap<>();
         int configuredTypes = 0;
@@ -46,7 +54,8 @@ public final class FoodContingencyPolicy {
         for (var entry : normalizedRules.entrySet()) {
             String itemId = entry.getKey();
             FoodData food = FoodRegistry.REGISTRY.get(itemId);
-            if (food == null || !food.isSafeFood()) continue;
+            if (food == null || !food.isSafeFood()
+                    || autoEatEligible == null || !autoEatEligible.test(itemId)) continue;
 
             configuredTypes++;
             int current = Math.max(0, inventory.getOrDefault(itemId, 0));

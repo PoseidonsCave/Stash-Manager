@@ -158,6 +158,9 @@ Use a finite count for at least one safe food, such as `stash keep add golden_ca
 When a scan or organization job starts, StashManager tops that supply up from the scanned stash.
 If Zenith's AutoEat reports that it has run out during the job, StashManager checkpoints the current
 work, retrieves the missing keep-list food, and resumes through the normal cooldown and quiet checks.
+Refill candidates also follow AutoEat's current all, whitelist, or blacklist mode. While recovery is
+active, StashManager suppresses repeated AutoEat warnings and sends one webhook after usable food is
+retrieved; the normal resume webhook follows when organization actually continues.
 An unlimited food rule protects existing food but does not define how much the bot may automatically
 take. If no safe finite food target or indexed stock is available, the job stays paused instead of
 continuing toward starvation.

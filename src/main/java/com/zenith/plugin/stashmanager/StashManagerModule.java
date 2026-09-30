@@ -147,6 +147,9 @@ public class StashManagerModule extends Module {
     private int foodContingencyBlockedRecheckTicks = 0;
     private int foodContingencyStartRetryTicks = 0;
     private boolean foodContingencyCleanupPending = false;
+    private boolean foodContingencyRetrievalStarted = false;
+    private boolean autoEatWarningMuted = false;
+    private boolean autoEatWarningBeforeMute = false;
     private final FoodContingencyCloseGate foodContingencyCloseGate =
             new FoodContingencyCloseGate();
     private volatile String foodContingencyTrigger = "none";
@@ -362,6 +365,7 @@ public class StashManagerModule extends Module {
         if (retriever.isActive()) {
             retriever.stop();
         }
+        restoreAutoEatWarning();
         tunnelNetworkSyncWorker.stop();
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             info("StashManager module disabled — aborting scan");
@@ -1233,6 +1237,9 @@ public class StashManagerModule extends Module {
     }
 
     private void onAutoEatOutOfFood(AutoEatOutOfFoodEvent event) {
+        // Outside a stash job, Zenith owns both the warning and the response.
+        if (activeResumableJob() == JobContinuanceManager.Job.NONE) return;
+        muteAutoEatWarning();
         requestFoodContingency("autoeat_out_of_food");
     }
 
@@ -1249,7 +1256,7 @@ public class StashManagerModule extends Module {
             foodContingencyJob = liveJob;
         }
         if (foodContingencyJob == JobContinuanceManager.Job.NONE) {
-            foodContingencyRequested = false;
+            resetFoodContingency();
             return false;
         }
         if (!isFoodContingencyJobActive()) {
@@ -1357,7 +1364,9 @@ public class StashManagerModule extends Module {
         foodContingencyBlockedRecheckTicks = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
+        foodContingencyRetrievalStarted = false;
         foodContingencyCloseGate.reset();
+        restoreAutoEatWarning();
         foodContingencyTerminalReason = "none";
         foodContingencyJob = JobContinuanceManager.Job.NONE;
     }
@@ -1391,6 +1400,8 @@ public class StashManagerModule extends Module {
 
         foodContingencyRequested = false;
         foodContingencyActive = true;
+        foodContingencyRetrievalStarted = true;
+        muteAutoEatWarning();
         foodContingencyTerminalReason = "retrieval_not_started";
         debugRecorder.record("food_contingency_started",
                 "job=" + foodContingencyJob.name().toLowerCase()
@@ -1433,7 +1444,8 @@ public class StashManagerModule extends Module {
     private FoodContingencyPolicy.Plan currentFoodContingencyPlan() {
         if (database == null || !database.isInitialized()) return null;
         try {
-            return FoodContingencyPolicy.plan(database.loadKeepItems(), playerInventoryCounts());
+            return FoodContingencyPolicy.plan(
+                    database.loadKeepItems(), playerInventoryCounts(), this::autoEatAccepts);
         } catch (Exception e) {
             debugRecorder.record("food_contingency_keep_load_failed",
                     "Could not load keep-list food targets", e);
@@ -1524,13 +1536,21 @@ public class StashManagerModule extends Module {
 
     private void completeFoodContingency(
             FoodContingencyPolicy.Plan plan, String reason) {
+        JobContinuanceManager.Job completedJob = foodContingencyJob;
+        boolean retrieved = foodContingencyRetrievalStarted;
         info("Food contingency satisfied with {} safe kept food item(s); resuming {} after cooldown",
-                plan.currentFoodUnits(), foodContingencyJob.name().toLowerCase());
+                plan.currentFoodUnits(), completedJob.name().toLowerCase());
         debugRecorder.record("food_contingency_completed",
-                "job=" + foodContingencyJob.name().toLowerCase()
+                "job=" + completedJob.name().toLowerCase()
                         + ", reason=" + reason
                         + ", food_units=" + plan.currentFoodUnits()
                         + ", remaining_refill=" + plan.requested());
+        if (retrieved && completedJob == JobContinuanceManager.Job.ORGANIZE
+                && !"manual_food_available".equals(reason)) {
+            notifications.sendFoodContingencyRecovered(
+                    "organize", plan.currentFoodUnits(),
+                    Math.max(1, config.scanPreemptionCooldownSeconds));
+        }
         foodContingencyRequested = false;
         foodContingencyActive = false;
         foodContingencyBlocked = false;
@@ -1538,9 +1558,11 @@ public class StashManagerModule extends Module {
         foodContingencyBlockedRecheckTicks = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
+        foodContingencyRetrievalStarted = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = "none";
         foodContingencyJob = JobContinuanceManager.Job.NONE;
+        restoreAutoEatWarning();
     }
 
     private void blockFoodContingency(String reason) {
@@ -1594,10 +1616,56 @@ public class StashManagerModule extends Module {
         foodContingencyBlockedRecheckTicks = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
+        foodContingencyRetrievalStarted = false;
         foodContingencyCloseGate.reset();
         foodContingencyTrigger = "none";
         foodContingencyTerminalReason = "none";
         foodContingencyJob = JobContinuanceManager.Job.NONE;
+        restoreAutoEatWarning();
+    }
+
+    private boolean autoEatAccepts(String itemId) {
+        if (itemId == null || itemId.isBlank()) return false;
+        Object autoEat = CONFIG.client.extra.autoEat;
+        try {
+            Object mode = autoEat.getClass().getField("mode").get(autoEat);
+            Object configuredFoods = autoEat.getClass().getField("foods").get(autoEat);
+            boolean listed = false;
+            if (configuredFoods instanceof Iterable<?> foods) {
+                for (Object configuredFood : foods) {
+                    if (itemId.equals(ItemIdentifier.baseItemId(
+                            String.valueOf(configuredFood)))) {
+                        listed = true;
+                        break;
+                    }
+                }
+            }
+            return switch (String.valueOf(mode)) {
+                case "BLACKLIST" -> !listed;
+                case "WHITELIST" -> listed;
+                default -> true;
+            };
+        } catch (ReflectiveOperationException | SecurityException ignored) {
+            // Older Zenith targets only expose the legacy all-food behavior.
+            return true;
+        }
+    }
+
+    private void muteAutoEatWarning() {
+        if (autoEatWarningMuted) return;
+        autoEatWarningBeforeMute = CONFIG.client.extra.autoEat.warning;
+        CONFIG.client.extra.autoEat.warning = false;
+        autoEatWarningMuted = true;
+        debugRecorder.record("food_contingency_autoeat_warning_muted",
+                "previous=" + autoEatWarningBeforeMute);
+    }
+
+    private void restoreAutoEatWarning() {
+        if (!autoEatWarningMuted) return;
+        CONFIG.client.extra.autoEat.warning = autoEatWarningBeforeMute;
+        autoEatWarningMuted = false;
+        debugRecorder.record("food_contingency_autoeat_warning_restored",
+                "restored=" + autoEatWarningBeforeMute);
     }
 
     private void onTick(ClientBotTick event) {
