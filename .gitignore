@@ -33,9 +33,11 @@ gradle-local.properties
 
 # Runtime and diagnostics
 *.log
+*.log.zip
 *.pid
 hs_err_pid*
 replay_pid*
+/versions/*/log/
 /plugins/config/stash-manager-organizer-plan.json
 /plugins/config/stash-manager-organizer-checkpoint.json
 
