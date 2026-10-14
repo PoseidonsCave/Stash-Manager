@@ -3,6 +3,7 @@ package com.zenith.plugin.stashmanager.orchestration;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -94,6 +95,14 @@ public final class LaneStorageCapacity {
                     boundedInt(compacted));
         }
 
+        /** An explicitly enabled profile owns a lane even before the first matching item arrives. */
+        public static Demand reserveEmptyProfile(String storageClass) {
+            ItemCapacity capacity = itemCapacityFor(storageClass);
+            return new Demand(storageClass, 0, 0, 0, 0,
+                    capacity.maxStackSize(), capacity.registryResolved(),
+                    capacity.itemsPerShulker(), 1, 1);
+        }
+
         public static Demand calculate(
                 String storageClass,
                 long looseItems,
@@ -138,7 +147,7 @@ public final class LaneStorageCapacity {
     }
 
     public static ItemCapacity itemCapacityFor(String storageClass) {
-        String baseId = ItemIdentifier.baseItemId(storageClass);
+        String baseId = ItemProfiles.baseItemId(storageClass);
         ItemData data = null;
         if (baseId != null && !baseId.isBlank()) {
             data = ItemRegistry.REGISTRY.get(baseId);

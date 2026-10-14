@@ -11,6 +11,7 @@ import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
 import com.zenith.plugin.stashmanager.orchestration.LaneConstructionPlan;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -78,6 +79,8 @@ public class ApiHandler {
         body.put("database_last_write_success", index.getDatabaseLastWriteSuccess());
         body.put("last_inventory_observation", index.getLastInventoryObservation());
         body.put("import_chest_blocks", index.getImportChestBlockCount());
+        body.put("blacklisted_chest_blocks", index.getBlacklistedChestBlockCount());
+        body.put("export_chest_blocks", index.getExportChestBlockCount());
 
         if (config.pos1 != null && config.pos2 != null) {
             body.put("region_pos1", Map.of("x", config.pos1[0], "y", config.pos1[1], "z", config.pos1[2]));
@@ -631,6 +634,71 @@ public class ApiHandler {
         }
         sendJson(exchange, 200, body);
     }
+
+    // GET /api/v1/chest-roles
+    public void handleChestRoles(HttpExchange exchange) throws IOException {
+        if (!checkMethod(exchange, "GET")) return;
+        if (!checkApiKey(exchange)) return;
+
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("import", roleMap(index.getImportChests()));
+        body.put("blacklist", roleMap(index.getBlacklistedChests()));
+        body.put("export", roleMap(index.getExportChests()));
+        sendJson(exchange, 200, body);
+    }
+
+    // GET /api/v1/kits
+    public void handleKits(HttpExchange exchange) throws IOException {
+        if (!checkMethod(exchange, "GET")) return;
+        if (!checkApiKey(exchange)) return;
+        if (database == null || !database.isInitialized()) {
+            sendError(exchange, 503, "Database not connected");
+            return;
+        }
+        try {
+            List<Map<String, Object>> kits = new ArrayList<>();
+            for (DatabaseManager.KitDefinition definition : database.listKitDefinitions()) {
+                Map<String, Object> kit = new LinkedHashMap<>();
+                kit.put("name", definition.name());
+                kit.put("status", definition.status().name().toLowerCase(Locale.ROOT));
+                kit.put("items", definition.items());
+                kit.put("unique_items", definition.items().size());
+                kit.put("shulker_slots", definition.requiredSlots());
+                if (definition.exportPosition() != null) {
+                    int[] pos = definition.exportPosition();
+                    kit.put("export", Map.of("x", pos[0], "y", pos[1], "z", pos[2]));
+                }
+                kits.add(kit);
+            }
+            sendJson(exchange, 200, Map.of("count", kits.size(), "kits", kits));
+        } catch (Exception e) {
+            sendError(exchange, 500, "Database query failed: " + e.getMessage());
+        }
+    }
+
+    // GET /api/v1/profiles
+    public void handleProfiles(HttpExchange exchange) throws IOException {
+        if (!checkMethod(exchange, "GET")) return;
+        if (!checkApiKey(exchange)) return;
+        List<Map<String, Object>> profiles = ItemProfiles.all().values().stream()
+                .sorted(Comparator.comparing(com.zenith.plugin.stashmanager.profile.ItemProfile::name))
+                .map(profile -> Map.<String, Object>of(
+                        "name", profile.name(),
+                        "item_id", profile.itemId(),
+                        "mode", profile.mode().name().toLowerCase(Locale.ROOT),
+                        "enchantments", profile.enchantments(),
+                        "lane_enabled", profile.laneEnabled(),
+                        "storage_class", profile.storageKey()))
+                .toList();
+        sendJson(exchange, 200, Map.of("count", profiles.size(), "profiles", profiles));
+    }
+
+    private Map<String, Object> roleMap(List<int[]> positions) {
+        return Map.of(
+                "block_count", positions.size(),
+                "positions", positions.stream().map(pos -> Map.of(
+                        "x", pos[0], "y", pos[1], "z", pos[2])).toList());
+    }
     // Response helpers
     private Map<String, Object> containerToMap(ContainerEntry entry) {
         Map<String, Object> map = new LinkedHashMap<>();
@@ -648,6 +716,10 @@ public class ApiHandler {
         }
         if (index.isImportChest(entry)) {
             map.put("role", "import");
+        } else if (index.isBlacklistedChest(entry)) {
+            map.put("role", "blacklist");
+        } else if (index.isExportChest(entry)) {
+            map.put("role", "export");
         }
 
         // Flatten item counts.

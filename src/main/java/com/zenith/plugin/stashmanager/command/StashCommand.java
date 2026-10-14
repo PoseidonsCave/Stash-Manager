@@ -14,6 +14,7 @@ import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockRegistry;
 import com.zenith.mc.block.properties.ChestType;
 import com.zenith.mc.block.properties.api.BlockStateProperties;
+import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.StashManagerModule;
 import com.zenith.plugin.stashmanager.api.ApiServer;
@@ -21,9 +22,13 @@ import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
+import com.zenith.plugin.stashmanager.kit.KitCapacity;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
+import com.zenith.plugin.stashmanager.orchestration.KeepReequipPlan;
 import com.zenith.plugin.stashmanager.orchestration.LaneConstructionPlan;
 import com.zenith.plugin.stashmanager.orchestration.LaneReportExporter;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
+import com.zenith.plugin.stashmanager.profile.ItemProfile;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
 import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
@@ -39,6 +44,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.TreeSet;
 import java.util.stream.Collectors;
 
 import static com.mojang.brigadier.arguments.IntegerArgumentType.integer;
@@ -52,6 +58,7 @@ import static com.zenith.Globals.DISCORD;
 public class StashCommand extends Command {
 
     private static final int PAGE_SIZE = 10;
+    private static final int KIT_CATALOG_PAGE_SIZE = 20;
     private static final String SPECTATOR_TESTING_TIP =
         "Use spectator mode for live observation: `/spectator on`, whitelist your test account, then `/spectator playerCamOnJoin on`.";
     private static final DateTimeFormatter UPDATE_TIME_FORMAT =
@@ -89,10 +96,16 @@ public class StashCommand extends Command {
                 "list [page] / export / clear / clearall",
                 "debug <recent [count]|clear|export>",
                 "keep <add|remove|list> [count]",
+                "reequip [preview] (refill kept gear and equip empty armor/offhand slots)",
                 "import [remove|list|purge [confirm]] (face a chest for add/remove)",
+                "blacklist [remove|list|purge [confirm]] (exclude a chest from organization)",
+                "exportchest [remove|list|purge [confirm]] (reserve a kit output chest)",
+                "crafting [add|remove|list|on|off] (face a crafting table to assign it)",
+                "crafting materials [add|remove|list] (face a chest with shells or chests)",
                 "label <x> <y> <z> <label> / labels",
                 "region <save|load|list|delete> [name]",
-                "kit <list|show|snap|delete|add|remove> <name>",
+                "profile <create|enchant|unenchant|mode|lane|list|show|delete> ...",
+                "kit <create|catalog|select|profile|output|finish|list|show|snap|delete|add|remove> <name>",
                 "get <item_id> [count] / kit <name> / status / stop",
                 "lanes [export] / organize [stop|status]",
                 "db status / db clear",
@@ -493,6 +506,12 @@ public class StashCommand extends Command {
                         return OK;
                     }))
             )
+            .then(literal("reequip")
+                .executes((com.mojang.brigadier.Command<CommandContext>)
+                    c -> runKeepReequip(c, false))
+                .then(literal("preview")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> runKeepReequip(c, true))))
             .then(literal("summary")
                 .executes(c -> {
                     c.getSource().getEmbed()
@@ -507,39 +526,80 @@ public class StashCommand extends Command {
             )
             .then(literal("import")
                 .executes((com.mojang.brigadier.Command<CommandContext>)
-                    c -> updateTargetedImportChest(c, true))
+                    c -> updateTargetedChestRole(c, ChestRole.IMPORT, true))
                 .then(literal("remove")
                     .executes((com.mojang.brigadier.Command<CommandContext>)
-                        c -> updateTargetedImportChest(c, false)))
+                        c -> updateTargetedChestRole(c, ChestRole.IMPORT, false)))
                 .then(literal("list")
-                    .executes(c -> {
-                        var positions = index.getImportChests();
-                        var embed = c.getSource().getEmbed()
-                            .title("Import Chests")
-                            .primaryColor();
-                        if (positions.isEmpty()) {
-                            embed.description("No import chests assigned. Face a chest and run `/stash import`.");
-                        } else {
-                            StringBuilder description = new StringBuilder();
-                            int shown = 0;
-                            for (int[] pos : positions) {
-                                if (shown++ >= 40) {
-                                    description.append("... and ").append(positions.size() - 40).append(" more block position(s)");
-                                    break;
-                                }
-                                description.append(pos[0]).append(", ").append(pos[1]).append(", ").append(pos[2]).append('\n');
-                            }
-                            embed.description(description.toString())
-                                .footer("Double chests are persisted as both block positions.", null);
-                        }
-                        return OK;
-                    }))
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> renderChestRoleList(c, ChestRole.IMPORT)))
                 .then(literal("purge")
                     .executes((com.mojang.brigadier.Command<CommandContext>)
-                        c -> purgeImportChests(c, false))
+                        c -> purgeChestRole(c, ChestRole.IMPORT, false))
                     .then(literal("confirm")
                         .executes((com.mojang.brigadier.Command<CommandContext>)
-                            c -> purgeImportChests(c, true))))
+                            c -> purgeChestRole(c, ChestRole.IMPORT, true))))
+            )
+            .then(literal("blacklist")
+                .executes((com.mojang.brigadier.Command<CommandContext>)
+                    c -> updateTargetedChestRole(c, ChestRole.BLACKLIST, true))
+                .then(literal("remove")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> updateTargetedChestRole(c, ChestRole.BLACKLIST, false)))
+                .then(literal("list")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> renderChestRoleList(c, ChestRole.BLACKLIST)))
+                .then(literal("purge")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> purgeChestRole(c, ChestRole.BLACKLIST, false))
+                    .then(literal("confirm")
+                        .executes((com.mojang.brigadier.Command<CommandContext>)
+                            c -> purgeChestRole(c, ChestRole.BLACKLIST, true))))
+            )
+            .then(literal("exportchest")
+                .executes((com.mojang.brigadier.Command<CommandContext>)
+                    c -> updateTargetedChestRole(c, ChestRole.EXPORT, true))
+                .then(literal("remove")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> updateTargetedChestRole(c, ChestRole.EXPORT, false)))
+                .then(literal("list")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> renderChestRoleList(c, ChestRole.EXPORT)))
+                .then(literal("purge")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> purgeChestRole(c, ChestRole.EXPORT, false))
+                    .then(literal("confirm")
+                        .executes((com.mojang.brigadier.Command<CommandContext>)
+                            c -> purgeChestRole(c, ChestRole.EXPORT, true))))
+            )
+            .then(literal("crafting")
+                .executes((com.mojang.brigadier.Command<CommandContext>)
+                    c -> updateTargetedCraftingTable(c, true))
+                .then(literal("add")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> updateTargetedCraftingTable(c, true)))
+                .then(literal("remove")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> updateTargetedCraftingTable(c, false)))
+                .then(literal("list")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        this::renderCraftingTables))
+                .then(literal("on")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> setShulkerCrafting(c, true)))
+                .then(literal("off")
+                    .executes((com.mojang.brigadier.Command<CommandContext>)
+                        c -> setShulkerCrafting(c, false)))
+                .then(literal("materials")
+                    .then(literal("add")
+                        .executes((com.mojang.brigadier.Command<CommandContext>)
+                            c -> updateTargetedCraftMaterialChest(c, true)))
+                    .then(literal("remove")
+                        .executes((com.mojang.brigadier.Command<CommandContext>)
+                            c -> updateTargetedCraftMaterialChest(c, false)))
+                    .then(literal("list")
+                        .executes((com.mojang.brigadier.Command<CommandContext>)
+                            this::renderCraftMaterialChests)))
             )
             .then(literal("label")
                 .then(argument("x", integer())
@@ -756,7 +816,85 @@ public class StashCommand extends Command {
                     )
                 )
             )
+            .then(literal("profile")
+                .then(literal("create")
+                    .then(argument("name", string())
+                        .then(argument("item_id", string())
+                            .then(argument("enchantment", string())
+                                .then(argument("level", integer(1, 255))
+                                    .executes((com.mojang.brigadier.Command<CommandContext>) c -> createItemProfile(c,
+                                            StringArgumentType.getString(c, "name"),
+                                            StringArgumentType.getString(c, "item_id"),
+                                            StringArgumentType.getString(c, "enchantment"),
+                                            IntegerArgumentType.getInteger(c, "level"))))))))
+                .then(literal("enchant")
+                    .then(argument("name", string())
+                        .then(argument("enchantment", string())
+                            .then(argument("level", integer(1, 255))
+                                .executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                        StringArgumentType.getString(c, "name"),
+                                        "enchant", StringArgumentType.getString(c, "enchantment"),
+                                        IntegerArgumentType.getInteger(c, "level")))))))
+                .then(literal("unenchant")
+                    .then(argument("name", string())
+                        .then(argument("enchantment", string())
+                            .executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                    StringArgumentType.getString(c, "name"), "unenchant",
+                                    StringArgumentType.getString(c, "enchantment"), 0)))))
+                .then(literal("mode")
+                    .then(argument("name", string())
+                        .then(literal("contains").executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                StringArgumentType.getString(c, "name"), "mode", "contains", 0)))
+                        .then(literal("exact").executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                StringArgumentType.getString(c, "name"), "mode", "exact", 0)))))
+                .then(literal("lane")
+                    .then(argument("name", string())
+                        .then(literal("on").executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                StringArgumentType.getString(c, "name"), "lane", "on", 0)))
+                        .then(literal("off").executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                StringArgumentType.getString(c, "name"), "lane", "off", 0)))))
+                .then(literal("list").executes((com.mojang.brigadier.Command<CommandContext>) c -> showItemProfiles(c, null)))
+                .then(literal("show")
+                    .then(argument("name", string()).executes((com.mojang.brigadier.Command<CommandContext>) c -> showItemProfiles(c,
+                            StringArgumentType.getString(c, "name")))))
+                .then(literal("delete")
+                    .then(argument("name", string()).executes((com.mojang.brigadier.Command<CommandContext>) c -> deleteItemProfile(c,
+                            StringArgumentType.getString(c, "name")))))
+            )
             .then(literal("kit")
+                .then(literal("create")
+                    .then(argument("name", string())
+                        .executes((com.mojang.brigadier.Command<CommandContext>) c -> createKitDraft(c,
+                                StringArgumentType.getString(c, "name")))))
+                .then(literal("catalog")
+                    .executes((com.mojang.brigadier.Command<CommandContext>) c -> renderKitCatalog(c, 1))
+                    .then(argument("page", integer(1))
+                        .executes((com.mojang.brigadier.Command<CommandContext>) c -> renderKitCatalog(c,
+                                IntegerArgumentType.getInteger(c, "page")))))
+                .then(literal("select")
+                    .then(argument("name", string())
+                        .then(argument("index", integer(1))
+                            .then(argument("count", integer(1, 100000))
+                                .executes((com.mojang.brigadier.Command<CommandContext>) c -> selectKitCatalogItem(c,
+                                        StringArgumentType.getString(c, "name"),
+                                        IntegerArgumentType.getInteger(c, "index"),
+                                        IntegerArgumentType.getInteger(c, "count")))))))
+                .then(literal("profile")
+                    .then(argument("name", string())
+                        .then(argument("profile_name", string())
+                            .then(argument("count", integer(1, 27))
+                                .executes((com.mojang.brigadier.Command<CommandContext>) c -> selectKitProfile(c,
+                                        StringArgumentType.getString(c, "name"),
+                                        StringArgumentType.getString(c, "profile_name"),
+                                        IntegerArgumentType.getInteger(c, "count")))))))
+                .then(literal("output")
+                    .then(argument("name", string())
+                        .executes((com.mojang.brigadier.Command<CommandContext>) c -> assignKitOutput(c,
+                                StringArgumentType.getString(c, "name")))))
+                .then(literal("finish")
+                    .then(argument("name", string())
+                        .executes((com.mojang.brigadier.Command<CommandContext>) c -> finishKitDraft(c,
+                                StringArgumentType.getString(c, "name")))))
                 .then(literal("list")
                     .executes(c -> {
                         var embed = c.getSource().getEmbed()
@@ -769,11 +907,15 @@ public class StashCommand extends Command {
                         }
 
                         try {
-                            var kits = database.listKits();
+                            var kits = database.listKitDefinitions();
                             if (kits.isEmpty()) {
-                                embed.description("No kits saved. Use `/stash kit snapshot <name>` to create one.");
+                                embed.description("No kits saved. Use `/stash kit create <name>` to start the Discord wizard.");
                             } else {
-                                embed.description(String.join("\n", kits));
+                                embed.description(kits.stream()
+                                        .map(kit -> "**" + kit.name() + "** · "
+                                                + kit.status().name().toLowerCase(Locale.ROOT)
+                                                + " · " + kit.requiredSlots() + "/" + KitCapacity.MAX_SLOTS + " slots")
+                                        .collect(Collectors.joining("\n")));
                             }
                         } catch (Exception e) {
                             embed.description("Error: " + e.getMessage()).errorColor();
@@ -795,10 +937,11 @@ public class StashCommand extends Command {
                             }
 
                             try {
-                                var items = database.loadKit(name);
-                                if (items.isEmpty()) {
+                                var definition = database.loadKitDefinition(name);
+                                if (definition == null) {
                                     embed.description("Kit is empty or does not exist.");
                                 } else {
+                                    var items = definition.items();
                                     StringBuilder sb = new StringBuilder();
                                     int shown = 0;
                                     for (var item : items.entrySet()) {
@@ -812,7 +955,9 @@ public class StashCommand extends Command {
                                         shown++;
                                     }
                                     embed.description(sb.toString())
-                                        .addField("Unique Items", String.valueOf(items.size()), true);
+                                        .addField("Status", definition.status().name().toLowerCase(Locale.ROOT), true)
+                                        .addField("Shulker Slots", definition.requiredSlots() + "/" + KitCapacity.MAX_SLOTS, true)
+                                        .addField("Output", definition.exportPosition() == null ? "Not assigned" : "Export chest assigned", true);
                                 }
                             } catch (Exception e) {
                                 embed.description("Error: " + e.getMessage()).errorColor();
@@ -850,7 +995,7 @@ public class StashCommand extends Command {
                             int totalBefore = snapshot.values().stream().mapToInt(Integer::intValue).sum();
                             var expectedPersisted = DatabaseManager.truncateKitItems(snapshot);
                             int persistedTotal = expectedPersisted.values().stream().mapToInt(Integer::intValue).sum();
-                            boolean truncated = uniqueBefore > expectedPersisted.size();
+                            boolean truncated = !snapshot.equals(expectedPersisted);
 
                             try {
                                 database.saveKit(name, snapshot);
@@ -884,8 +1029,8 @@ public class StashCommand extends Command {
                                 ));
 
                                 String description = truncated
-                                    ? "Saved **" + name + "** from current inventory. Truncated to the first **"
-                                        + DatabaseManager.KIT_MAX_SLOTS + "** unique items to match one shulker load."
+                                    ? "Saved **" + name + "** from current inventory. The tail was trimmed to fit **"
+                                        + DatabaseManager.KIT_MAX_SLOTS + "** physical shulker slots."
                                     : "Saved **" + name + "** from current inventory.";
                                 embed.title("Kit Snapshot Saved")
                                     .description(description)
@@ -941,7 +1086,7 @@ public class StashCommand extends Command {
                                                 "reason", "kit_slot_limit_reached"
                                             ));
                                             embed.title("Kit Update Rejected")
-                                                .description("Kit **" + name + "** is already at the **" + DatabaseManager.KIT_MAX_SLOTS + "** item slot limit.")
+                                                .description("That quantity would exceed the **" + DatabaseManager.KIT_MAX_SLOTS + "** physical shulker-slot limit.")
                                                 .errorColor();
                                         }
                                     } catch (Exception e) {
@@ -1076,14 +1221,20 @@ public class StashCommand extends Command {
                             }
 
                             try {
-                                var kitItems = database.loadKit(kitName);
-                                if (kitItems.isEmpty()) {
+                                var definition = database.loadKitDefinition(kitName);
+                                if (definition == null || definition.items().isEmpty()) {
                                     embed.title("Retrieve Failed")
                                         .description("Kit is empty or not found: **" + kitName + "**")
                                         .errorColor();
                                     return OK;
                                 }
-                                return startRetrieval(c, "kit:" + kitName, kitItems);
+                                if (definition.status() != DatabaseManager.KitStatus.READY) {
+                                    embed.title("Retrieve Failed")
+                                            .description("Kit **" + kitName + "** is still a draft. Finish the wizard first.")
+                                            .errorColor();
+                                    return OK;
+                                }
+                                return startRetrieval(c, "kit:" + kitName, definition.items());
                             } catch (Exception e) {
                                 embed.title("Retrieve Failed")
                                     .description("Error loading kit: " + e.getMessage())
@@ -1257,7 +1408,7 @@ public class StashCommand extends Command {
                     if (!report.storageClasses().isEmpty()) {
                         String classes = String.join(", ", report.storageClasses());
                         if (classes.length() > 1000) classes = classes.substring(0, 997) + "...";
-                        embed.addField("Bulk Items We Found", classes, false);
+                        embed.addField("Storage Classes Planned", classes, false);
                     }
                     if (!report.laneStorage().allocations().isEmpty()) {
                         String allocations = report.laneStorage().allocations().stream()
@@ -1312,6 +1463,12 @@ public class StashCommand extends Command {
                     embed.footer("Want the full breakdown? Use /stash lanes export", null);
                     return OK;
                 })
+                .then(literal("profile")
+                    .then(argument("name", string())
+                        .then(literal("on").executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                StringArgumentType.getString(c, "name"), "lane", "on", 0)))
+                        .then(literal("off").executes((com.mojang.brigadier.Command<CommandContext>) c -> changeItemProfile(c,
+                                StringArgumentType.getString(c, "name"), "lane", "off", 0)))))
                 .then(literal("export")
                     .executes(c -> {
                         LaneCapacityReport report = module.getLaneCapacityReport();
@@ -1384,7 +1541,7 @@ public class StashCommand extends Command {
                             embed.description("There is no restart checkpoint waiting to resume.")
                                 .primaryColor();
                         } else if (module.requestOrganizerCheckpointResume()) {
-                            embed.description("Resume is armed. The organizer will continue after the normal cooldown and quiet checks.")
+                            embed.description("Organizer resume is armed. It will continue after the cooldown and quiet checks; this does not start a new scan.")
                                 .addField("Progress",
                                     organizer.getCompletedTasks() + "/" + organizer.getTotalTasks(), true)
                                 .successColor();
@@ -2117,95 +2274,799 @@ public class StashCommand extends Command {
         }
     }
 
-    private int updateTargetedImportChest(
+    private String profileMutationBlocker() {
+        if (database == null || !database.isInitialized()) return "Database not connected.";
+        var organizer = module.getOrganizer();
+        if (organizer != null && (organizer.isActive() || organizer.hasDurableCheckpoint())) {
+            return "Finish the active organize run or discard its checkpoint before changing profiles.";
+        }
+        if (module.getRetriever() != null && module.getRetriever().isActive()) {
+            return "Finish the active retrieval before changing profiles.";
+        }
+        return null;
+    }
+
+    private int createItemProfile(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name, String rawItemId, String enchantment, int level) {
+        var embed = command.getSource().getEmbed();
+        String blocker = profileMutationBlocker();
+        if (blocker != null) {
+            embed.title("Profile Not Changed").description(blocker).errorColor();
+            return OK;
+        }
+        try {
+            if (database.loadItemProfiles().stream().anyMatch(profile -> profile.name().equals(name))) {
+                throw new IllegalArgumentException("That profile already exists.");
+            }
+            String base = ItemIdentifier.baseItemId(ItemResolver.resolve(rawItemId));
+            if (base == null || ItemRegistry.REGISTRY.get(base) == null
+                    && ItemRegistry.REGISTRY.get("minecraft:" + base) == null) {
+                throw new IllegalArgumentException("Unknown item ID: " + rawItemId);
+            }
+            ItemProfile profile = new ItemProfile(name, base, ItemProfile.Mode.CONTAINS,
+                    Map.of(enchantment, level), false);
+            database.saveItemProfile(profile);
+            embed.title("Profile Created")
+                    .description("**" + name + "** matches " + base + " with " + enchantment + " " + level + " or higher.")
+                    .addField("Next", "Add enchantments with `/stash profile enchant " + name
+                            + " <enchantment> <level>`, then use `/stash profile lane " + name + " on`.", false)
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Profile Not Created").description(e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int changeItemProfile(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name, String action, String value, int level) {
+        var embed = command.getSource().getEmbed();
+        String blocker = profileMutationBlocker();
+        if (blocker != null) {
+            embed.title("Profile Not Changed").description(blocker).errorColor();
+            return OK;
+        }
+        try {
+            ItemProfile old = ItemProfiles.get(name);
+            if (old == null) throw new IllegalArgumentException("No profile named " + name + ".");
+            Map<String, Integer> enchantments = new LinkedHashMap<>(old.enchantments());
+            ItemProfile.Mode mode = old.mode();
+            boolean lane = old.laneEnabled();
+            switch (action) {
+                case "enchant" -> enchantments.put(value, level);
+                case "unenchant" -> {
+                    if (enchantments.remove(ItemIdentifier.baseItemId(value)) == null) {
+                        throw new IllegalArgumentException("This profile does not require " + value + ".");
+                    }
+                }
+                case "mode" -> mode = ItemProfile.Mode.valueOf(value.toUpperCase(Locale.ROOT));
+                case "lane" -> lane = "on".equals(value);
+                default -> throw new IllegalArgumentException("Unknown profile action.");
+            }
+            ItemProfile updated = new ItemProfile(name, old.itemId(), mode, enchantments, lane);
+            database.saveItemProfile(updated);
+            embed.title("Profile Updated")
+                    .description("**" + name + "** · " + updated.itemId() + " · "
+                            + updated.mode().name().toLowerCase(Locale.ROOT) + " · lane "
+                            + (updated.laneEnabled() ? "on" : "off"))
+                    .addField("Enchantments", updated.enchantments().toString(), false)
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Profile Not Changed").description(e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int showItemProfiles(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name) {
+        var embed = command.getSource().getEmbed().title("Equipment Profiles").primaryColor();
+        if (database == null || !database.isInitialized()) {
+            embed.description("Database not connected.").errorColor();
+            return OK;
+        }
+        if (name != null) {
+            ItemProfile profile = ItemProfiles.get(name);
+            if (profile == null) embed.description("No profile named " + name + ".").errorColor();
+            else embed.description("**" + profile.name() + "** · " + profile.itemId())
+                    .addField("Match", profile.mode().name().toLowerCase(Locale.ROOT), true)
+                    .addField("Lane", profile.laneEnabled() ? "Enabled" : "Disabled", true)
+                    .addField("Enchantments", profile.enchantments().toString(), false);
+        } else {
+            embed.description(ItemProfiles.all().isEmpty() ? "No profiles yet."
+                    : ItemProfiles.all().values().stream().sorted(java.util.Comparator.comparing(ItemProfile::name))
+                            .map(profile -> "**" + profile.name() + "** · " + profile.itemId()
+                                    + " · " + profile.mode().name().toLowerCase(Locale.ROOT)
+                                    + " · lane " + (profile.laneEnabled() ? "on" : "off"))
+                            .collect(Collectors.joining("\n")));
+        }
+        return OK;
+    }
+
+    private int deleteItemProfile(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name) {
+        var embed = command.getSource().getEmbed();
+        String blocker = profileMutationBlocker();
+        if (blocker != null) {
+            embed.title("Profile Not Deleted").description(blocker).errorColor();
+            return OK;
+        }
+        try {
+            if (database.deleteItemProfile(name)) {
+                embed.title("Profile Deleted").description("Removed **" + name + "**.").successColor();
+            } else embed.title("Profile Not Found").description(name).errorColor();
+        } catch (Exception e) {
+            embed.title("Profile Not Deleted").description(e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int selectKitProfile(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String kitName, String profileName, int count) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Kit Selection Failed").description("Database not connected.").errorColor();
+            return OK;
+        }
+        try {
+            ItemProfile profile = ItemProfiles.get(profileName);
+            if (profile == null) throw new IllegalArgumentException("No profile named " + profileName + ".");
+            var kit = database.loadKitDefinition(kitName);
+            if (kit == null || kit.status() != DatabaseManager.KitStatus.DRAFT) {
+                throw new IllegalArgumentException("Start a draft with `/stash kit create " + kitName + "` first.");
+            }
+            if (!database.setKitItem(kitName, profile.storageKey(), count)) {
+                throw new IllegalArgumentException("This kit would exceed 27 shulker slots.");
+            }
+            embed.title("Kit Profile Selected")
+                    .description("Added " + count + "x **" + profileName + "** to **" + kitName + "**.")
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Kit Selection Failed").description(e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int createKitDraft(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Kit Wizard Failed").description("Database not connected.").errorColor();
+            return OK;
+        }
+        if (!name.matches("[A-Za-z0-9_-]{1,64}")) {
+            embed.title("Kit Name Invalid")
+                    .description("Use 1–64 letters, numbers, underscores, or hyphens.")
+                    .errorColor();
+            return OK;
+        }
+        try {
+            if (!database.createKitDraft(name)) {
+                embed.title("Kit Already Exists")
+                        .description("A kit named **" + name + "** already exists. Delete it first or choose another name.")
+                        .errorColor();
+                return OK;
+            }
+            module.fireWebhookEvent("kit_draft_created", Map.of("kit_name", name));
+            embed.title("Kit Wizard Started")
+                    .description("Draft **" + name + "** is ready. Build it from Discord with these steps:")
+                    .addField("1 · Browse", "`/stash kit catalog [page]`", false)
+                    .addField("2 · Add", "`/stash kit select " + name + " <index> <count>`", false)
+                    .addField("Profiled Gear", "`/stash profile list`, then `/stash kit profile " + name
+                            + " <profile_name> <count>`", false)
+                    .addField("3 · Choose Output", "Face a registered export chest, then run `/stash kit output " + name + "`", false)
+                    .addField("4 · Finish", "`/stash kit finish " + name + "`", false)
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Kit Wizard Failed").description("Database error: " + e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private List<String> kitCatalogItems() {
+        TreeSet<String> ids = new TreeSet<>();
+        for (ContainerEntry entry : index.getAll()) {
+            entry.items().keySet().stream()
+                    .map(ItemIdentifier::normalizeItemId)
+                    .filter(Objects::nonNull)
+                    .forEach(ids::add);
+            for (ContainerEntry.ShulkerDetail shulker : entry.shulkerDetails()) {
+                shulker.items().keySet().stream()
+                        .map(ItemIdentifier::normalizeItemId)
+                        .filter(Objects::nonNull)
+                        .forEach(ids::add);
+            }
+        }
+        ids.removeIf(id -> id == null || id.isBlank()
+                || ItemIdentifier.baseItemId(id).endsWith("shulker_box"));
+        return List.copyOf(ids);
+    }
+
+    private int renderKitCatalog(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            int requestedPage) {
+        List<String> catalog = kitCatalogItems();
+        var embed = command.getSource().getEmbed().title("Kit Item Catalog").primaryColor();
+        if (catalog.isEmpty()) {
+            embed.description("The scanned stash has no selectable items. Run `/stash scan` first.");
+            return OK;
+        }
+        int pages = Math.max(1, (catalog.size() + KIT_CATALOG_PAGE_SIZE - 1) / KIT_CATALOG_PAGE_SIZE);
+        int page = Math.min(requestedPage, pages);
+        int start = (page - 1) * KIT_CATALOG_PAGE_SIZE;
+        int end = Math.min(catalog.size(), start + KIT_CATALOG_PAGE_SIZE);
+        StringBuilder body = new StringBuilder();
+        for (int offset = start; offset < end; offset++) {
+            String id = catalog.get(offset);
+            body.append('`').append(offset + 1).append("` · ")
+                    .append(IndexExporter.toReadableName(id))
+                    .append(" (`").append(id).append("`)\n");
+        }
+        embed.description(body.toString())
+                .footer("Page " + page + "/" + pages + " · Indexes stay deterministic for the current scan.", null);
+        return OK;
+    }
+
+    private int selectKitCatalogItem(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name,
+            int catalogIndex,
+            int count) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Kit Selection Failed").description("Database not connected.").errorColor();
+            return OK;
+        }
+        List<String> catalog = kitCatalogItems();
+        if (catalogIndex > catalog.size()) {
+            embed.title("Kit Selection Failed")
+                    .description("Catalog index **" + catalogIndex + "** does not exist. Browse `/stash kit catalog` again.")
+                    .errorColor();
+            return OK;
+        }
+        try {
+            DatabaseManager.KitDefinition definition = database.loadKitDefinition(name);
+            if (definition == null || definition.status() != DatabaseManager.KitStatus.DRAFT) {
+                embed.title("Kit Selection Failed")
+                        .description("**" + name + "** is not an active draft. Start with `/stash kit create " + name + "`.")
+                        .errorColor();
+                return OK;
+            }
+            String itemId = catalog.get(catalogIndex - 1);
+            if (!database.setKitItem(name, itemId, count)) {
+                Map<String, Integer> proposed = new LinkedHashMap<>(definition.items());
+                proposed.put(itemId, count);
+                embed.title("Kit Is Too Large")
+                        .description("That selection would use **" + KitCapacity.requiredSlots(proposed)
+                                + "/" + KitCapacity.MAX_SLOTS + "** shulker slots. Reduce the count or remove another item.")
+                        .errorColor();
+                return OK;
+            }
+            DatabaseManager.KitDefinition updated = database.loadKitDefinition(name);
+            embed.title("Kit Item Selected")
+                    .description("Added **" + count + "x " + IndexExporter.toReadableName(itemId)
+                            + "** to **" + name + "**.")
+                    .addField("Shulker Slots", updated.requiredSlots() + "/" + KitCapacity.MAX_SLOTS, true)
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Kit Selection Failed").description("Database error: " + e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int assignKitOutput(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Kit Output Failed").description("Database not connected.").errorColor();
+            return OK;
+        }
+        ChestTarget target = targetedChest();
+        if (!target.valid()) {
+            embed.title("Kit Output Failed").description(target.failure()).errorColor();
+            return OK;
+        }
+        if (target.positions().stream().anyMatch(pos -> !index.isExportChest(pos[0], pos[1], pos[2]))) {
+            embed.title("Kit Output Failed")
+                    .description("That full inventory is not a registered export chest. Face it and run `/stash exportchest` first.")
+                    .errorColor();
+            return OK;
+        }
+        try {
+            DatabaseManager.KitDefinition definition = database.loadKitDefinition(name);
+            if (definition == null || definition.status() != DatabaseManager.KitStatus.DRAFT) {
+                embed.title("Kit Output Failed").description("**" + name + "** is not an active draft.").errorColor();
+                return OK;
+            }
+            int[] primary = target.positions().get(0);
+            if (!database.assignKitExport(name, primary)) {
+                embed.title("Kit Output Failed").description("The kit or export chest is no longer available.").errorColor();
+                return OK;
+            }
+            embed.title("Kit Output Assigned")
+                    .description("Completed **" + name + "** kits will be delivered to the selected export chest.")
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Kit Output Failed").description("Database error: " + e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int finishKitDraft(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Kit Finish Failed").description("Database not connected.").errorColor();
+            return OK;
+        }
+        try {
+            DatabaseManager.KitDefinition definition = database.loadKitDefinition(name);
+            if (definition == null || definition.status() != DatabaseManager.KitStatus.DRAFT) {
+                embed.title("Kit Finish Failed").description("**" + name + "** is not an active draft.").errorColor();
+                return OK;
+            }
+            if (definition.items().isEmpty()) {
+                embed.title("Kit Finish Failed").description("Select at least one item first.").errorColor();
+                return OK;
+            }
+            if (definition.exportPosition() == null) {
+                embed.title("Kit Finish Failed")
+                        .description("Choose an export chest with `/stash kit output " + name + "` first.")
+                        .errorColor();
+                return OK;
+            }
+            if (!database.markKitReady(name)) {
+                embed.title("Kit Finish Failed")
+                        .description("The kit no longer fits one shulker or its export chest is no longer registered.")
+                        .errorColor();
+                return OK;
+            }
+            module.fireWebhookEvent("kit_definition_ready", Map.of(
+                    "kit_name", name,
+                    "unique_items", definition.items().size(),
+                    "shulker_slots", definition.requiredSlots()));
+            embed.title("Kit Ready")
+                    .description("**" + name + "** is ready for fulfillment.")
+                    .addField("Items", String.valueOf(definition.items().size()), true)
+                    .addField("Shulker Slots", definition.requiredSlots() + "/" + KitCapacity.MAX_SLOTS, true)
+                    .successColor();
+        } catch (Exception e) {
+            embed.title("Kit Finish Failed").description("Database error: " + e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private enum ChestRole {
+        IMPORT("Import", "import", "intake during `/stash organize`"),
+        BLACKLIST("Blacklisted", "blacklist", "excluded from organization and retrieval"),
+        EXPORT("Export", "export", "reserved for completed kit output");
+
+        final String title;
+        final String id;
+        final String purpose;
+
+        ChestRole(String title, String id, String purpose) {
+            this.title = title;
+            this.id = id;
+            this.purpose = purpose;
+        }
+    }
+
+    private int updateTargetedCraftingTable(
             com.mojang.brigadier.context.CommandContext<CommandContext> command,
             boolean add) {
         var embed = command.getSource().getEmbed();
         if (database == null || !database.isInitialized()) {
-            embed.title("Import Chest Failed")
-                .description("Database is not connected; import assignments must be persistent.")
-                .errorColor();
+            embed.title("Crafting Table Failed")
+                    .description("Connect the database first so assignments survive a restart.")
+                    .errorColor();
             return OK;
         }
+        String blocker = craftingMutationBlocker();
+        if (blocker != null) {
+            embed.title("Crafting Table Failed")
+                    .description("Cannot change workstations while " + blocker + ".")
+                    .errorColor();
+            return OK;
+        }
+        if (add && (config.pos1 == null || config.pos2 == null)) {
+            embed.title("Crafting Table Failed")
+                    .description("Set stash pos1 and pos2 before assigning a table.")
+                    .errorColor();
+            return OK;
+        }
+        if (Proxy.getInstance().hasActivePlayer()) BOT.syncFromCache(true);
+        var ray = RaycastHelper.playerBlockRaycast(BOT.getBlockReachDistance(), false);
+        if (!ray.hit() || !BlockRegistry.CRAFTING_TABLE.equals(ray.block())) {
+            embed.title("Crafting Table Failed")
+                    .description("Face a crafting table within normal interaction range and try again.")
+                    .errorColor();
+            return OK;
+        }
+        int[] position = {ray.x(), ray.y(), ray.z()};
+        if (!World.isInWorldBounds(position[0], position[1], position[2])
+                || !BlockRegistry.CRAFTING_TABLE.equals(
+                    World.getBlock(position[0], position[1], position[2]))) {
+            embed.title("Crafting Table Failed")
+                    .description("The targeted block could not be verified as a crafting table.")
+                    .errorColor();
+            return OK;
+        }
+        if (add && !isInsideConfiguredRegion(position)) {
+            embed.title("Crafting Table Failed")
+                    .description("The table must be inside the selected stash region.")
+                    .errorColor();
+            return OK;
+        }
+        boolean assigned = index.isCraftingTable(position[0], position[1], position[2]);
+        if (assigned == add) {
+            embed.title(add ? "Crafting Table Already Assigned" : "Crafting Table Not Assigned")
+                    .description("No changes were made at " + formatPos(position) + ".")
+                    .primaryColor();
+            return OK;
+        }
+        try {
+            if (add) index.addCraftingTable(position);
+            else index.removeCraftingTable(position);
+        } catch (Exception e) {
+            embed.title("Crafting Table Failed")
+                    .description("Database error: " + e.getMessage()).errorColor();
+            return OK;
+        }
+        embed.title(add ? "Crafting Table Assigned" : "Crafting Table Removed")
+                .description("Table at " + formatPos(position)
+                        + (add ? " is available to this stash region." : " is no longer assigned."))
+                .successColor();
+        module.getDebugRecorder().record("crafting_table_" + (add ? "added" : "removed"),
+                "position=" + formatPos(position));
+        return OK;
+    }
 
-        String automationBlocker = importMutationBlocker();
+    private int renderCraftingTables(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command) {
+        var embed = command.getSource().getEmbed()
+                .title("Crafting Tables")
+                .addField("Automatic shulker crafting",
+                        config.craftShulkersEnabled ? "On" : "Off", true)
+                .primaryColor();
+        if (config.pos1 == null || config.pos2 == null) {
+            embed.description("Set pos1 and pos2 to select a stash region first.");
+            return OK;
+        }
+        List<int[]> assigned = index.getCraftingTables().stream()
+                .filter(this::isInsideConfiguredRegion).toList();
+        if (assigned.isEmpty()) {
+            embed.description("No table assigned in this region. Face one and run `/stash crafting add`.");
+            return OK;
+        }
+        String description = assigned.stream().limit(40)
+                .map(this::formatPos).collect(Collectors.joining("\n"));
+        if (assigned.size() > 40) description += "\n... and " + (assigned.size() - 40) + " more";
+        embed.description(description);
+        return OK;
+    }
+
+    private int setShulkerCrafting(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            boolean enabled) {
+        var embed = command.getSource().getEmbed();
+        String blocker = craftingMutationBlocker();
+        if (blocker != null) {
+            embed.title("Shulker Crafting Failed")
+                    .description("Cannot change this setting while " + blocker + ".")
+                    .errorColor();
+            return OK;
+        }
+        if (enabled && (database == null || !database.isInitialized()
+                || config.pos1 == null || config.pos2 == null
+                || index.getCraftingTables().stream().noneMatch(this::isInsideConfiguredRegion))) {
+            embed.title("Shulker Crafting Failed")
+                    .description("Connect the database and assign a crafting table inside this region first.")
+                    .errorColor();
+            return OK;
+        }
+        config.craftShulkersEnabled = enabled;
+        embed.title("Shulker Crafting")
+                .description("Automatic crafting is now " + (enabled ? "on" : "off") + ".")
+                .successColor();
+        return OK;
+    }
+
+    private int updateTargetedCraftMaterialChest(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            boolean add) {
+        var embed = command.getSource().getEmbed();
+        String blocker = craftingMutationBlocker();
+        if (blocker != null) {
+            embed.title("Crafting Materials Failed")
+                    .description("Cannot change material sources while " + blocker + ".")
+                    .errorColor();
+            return OK;
+        }
+        ChestTarget target = targetedChest();
+        if (!target.valid()) {
+            embed.title("Crafting Materials Failed").description(target.failure()).errorColor();
+            return OK;
+        }
+        List<int[]> positions = target.positions();
+        if (config.pos1 == null || config.pos2 == null
+                || positions.stream().anyMatch(pos -> !isInsideConfiguredRegion(pos))) {
+            embed.title("Crafting Materials Failed")
+                    .description("The chest must be inside the selected stash region.").errorColor();
+            return OK;
+        }
+        if (add && positions.stream().anyMatch(pos -> index.get(pos[0], pos[1], pos[2]) == null)) {
+            embed.title("Crafting Materials Failed")
+                    .description("Scan this chest before assigning it as a material source.").errorColor();
+            return OK;
+        }
+        if (add && positions.stream().anyMatch(pos ->
+                index.isBlacklistedChest(pos[0], pos[1], pos[2])
+                        || index.isExportChest(pos[0], pos[1], pos[2])
+                        || config.supplyChests != null && config.supplyChests.stream()
+                                .anyMatch(supply -> supply != null && samePosition(pos, supply)))) {
+            embed.title("Crafting Materials Failed")
+                    .description("Blacklisted, export, and bot supply chests cannot provide crafting materials.")
+                    .errorColor();
+            return OK;
+        }
+        if (config.craftMaterialChests == null) config.craftMaterialChests = new ArrayList<>();
+        long assigned = positions.stream().filter(pos -> config.craftMaterialChests.stream()
+                .anyMatch(saved -> saved != null && samePosition(pos, saved))).count();
+        if (add && assigned == positions.size()) {
+            embed.title("Crafting Materials Already Assigned")
+                    .description("No changes were made.").primaryColor();
+            return OK;
+        }
+        if (assigned > 0 && assigned < positions.size()) {
+            embed.title("Crafting Materials Failed")
+                    .description("Only part of this double chest is assigned. Remove it first.").errorColor();
+            return OK;
+        }
+        if (!add && assigned == 0) {
+            embed.title("Crafting Materials Not Assigned")
+                    .description("No changes were made.").primaryColor();
+            return OK;
+        }
+        if (add) positions.stream().map(pos -> new int[]{pos[0], pos[1], pos[2]})
+                .forEach(config.craftMaterialChests::add);
+        else config.craftMaterialChests.removeIf(saved -> positions.stream()
+                .anyMatch(pos -> saved != null && samePosition(pos, saved)));
+        embed.title(add ? "Crafting Materials Assigned" : "Crafting Materials Removed")
+                .description("The bot " + (add ? "may now take only shulker shells and chests from "
+                        : "will no longer use ") + "this inventory for shulker crafting.")
+                .successColor();
+        module.getDebugRecorder().record("crafting_material_chest_" + (add ? "added" : "removed"),
+                "position=" + formatPos(positions.getFirst()));
+        return OK;
+    }
+
+    private int renderCraftMaterialChests(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command) {
+        var embed = command.getSource().getEmbed().title("Crafting Material Chests")
+                .primaryColor();
+        if (config.craftMaterialChests == null || config.craftMaterialChests.isEmpty()) {
+            embed.description("None assigned. Face a scanned chest and run `/stash crafting materials add`.");
+            return OK;
+        }
+        embed.description(config.craftMaterialChests.stream().limit(40)
+                .map(this::formatPos).collect(Collectors.joining("\n")));
+        return OK;
+    }
+
+    private int updateTargetedChestRole(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            ChestRole role,
+            boolean add) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title(role.title + " Chest Failed")
+                    .description("Database is not connected; chest roles must be persistent.")
+                    .errorColor();
+            return OK;
+        }
+        String automationBlocker = chestRoleMutationBlocker();
         if (automationBlocker != null) {
-            embed.title("Import Chest Failed")
-                .description("Cannot change import assignments while " + automationBlocker + ".")
-                .errorColor();
+            embed.title(role.title + " Chest Failed")
+                    .description("Cannot change chest roles while " + automationBlocker + ".")
+                    .errorColor();
             return OK;
         }
 
         ChestTarget target = targetedChest();
         if (!target.valid()) {
-            embed.title("Import Chest Failed")
-                .description(target.failure())
-                .errorColor();
+            embed.title(role.title + " Chest Failed").description(target.failure()).errorColor();
             return OK;
         }
         List<int[]> positions = target.positions();
-
         if (add && (config.pos1 == null || config.pos2 == null)) {
-            embed.title("Import Chest Failed")
-                .description("Set stash pos1 and pos2 before assigning imports so the target region can be validated.")
-                .errorColor();
+            embed.title(role.title + " Chest Failed")
+                    .description("Set stash pos1 and pos2 before assigning chest roles.")
+                    .errorColor();
             return OK;
         }
         if (add && positions.stream().anyMatch(pos -> !isInsideConfiguredRegion(pos))) {
-            embed.title("Import Chest Failed")
-                .description("The targeted chest must be inside the configured stash region.")
-                .errorColor();
+            embed.title(role.title + " Chest Failed")
+                    .description("The targeted chest must be inside the configured stash region.")
+                    .errorColor();
             return OK;
         }
-        if (add && positions.stream().anyMatch(this::isIndexedLanePosition)) {
-            embed.title("Import Chest Conflict")
-                .description("The targeted chest belongs to a detected storage lane. A permanent lane cannot also be registered as an import.")
-                .errorColor();
+        if (add && role != ChestRole.BLACKLIST
+                && positions.stream().anyMatch(this::isIndexedLanePosition)) {
+            embed.title(role.title + " Chest Conflict")
+                    .description("The targeted chest belongs to a detected storage lane. Only blacklisted chests may overlap a lane.")
+                    .errorColor();
             return OK;
         }
 
-        long alreadyRegistered = positions.stream()
-                .filter(pos -> index.isImportChest(pos[0], pos[1], pos[2]))
-                .count();
-        if (add && alreadyRegistered == positions.size()) {
-            embed.title("Import Chest Already Assigned")
-                .description("This chest is already registered as an import source; no changes were made.")
-                .primaryColor();
+        if (add) {
+            ChestRole conflict = conflictingRole(role, positions);
+            if (conflict != null) {
+                embed.title(role.title + " Chest Conflict")
+                        .description("This inventory is already assigned as **" + conflict.id
+                                + "**. Remove that role before assigning **" + role.id + "**.")
+                        .errorColor();
+                return OK;
+            }
+        }
+
+        long assigned = positions.stream().filter(pos -> hasRole(role, pos)).count();
+        if (add && assigned == positions.size()) {
+            embed.title(role.title + " Chest Already Assigned")
+                    .description("This chest already has the **" + role.id + "** role; no changes were made.")
+                    .primaryColor();
             return OK;
         }
-        if (add && alreadyRegistered > 0) {
-            embed.title("Import Chest Conflict")
-                .description("Only part of this double chest is already registered. Run `/stash import remove` while facing it, then add it again.")
-                .errorColor();
+        if (add && assigned > 0) {
+            embed.title(role.title + " Chest Conflict")
+                    .description("Only part of this double chest has that role. Remove it, then add the full inventory again.")
+                    .errorColor();
             return OK;
         }
-        if (!add && alreadyRegistered == 0) {
-            embed.title("Import Chest Not Assigned")
-                .description("This chest is not registered as an import source; no changes were made.")
-                .primaryColor();
+        if (!add && assigned == 0) {
+            embed.title(role.title + " Chest Not Assigned")
+                    .description("This chest does not have the **" + role.id + "** role.")
+                    .primaryColor();
             return OK;
         }
 
         try {
-            if (add) index.addImportChests(positions);
-            else index.removeImportChests(positions);
+            mutateRole(role, positions, add);
         } catch (Exception e) {
-            embed.title("Import Chest Failed")
-                .description("Database error: " + e.getMessage())
-                .errorColor();
+            embed.title(role.title + " Chest Failed")
+                    .description("Database error: " + e.getMessage()).errorColor();
             return OK;
         }
 
         int[] primary = positions.get(0);
-        String inventoryType = positions.size() == 2 ? "Double chest" : "Chest";
-        embed.title(add ? "Import Chest Assigned" : "Import Chest Removed")
-            .description(inventoryType + " at " + formatPos(primary)
-                + (add
-                    ? " will be drained as intake during `/stash organize`."
-                    : " is no longer managed as intake."))
-            .successColor();
-        module.getDebugRecorder().record(add ? "import_chest_added" : "import_chest_removed",
-            "position=" + formatPos(primary) + ", block_positions=" + positions.size());
+        embed.title(role.title + (add ? " Chest Assigned" : " Chest Removed"))
+                .description((positions.size() == 2 ? "Double chest" : "Chest") + " at "
+                        + formatPos(primary) + (add ? " is now " + role.purpose + "." : " no longer has that role."))
+                .successColor();
+        module.getDebugRecorder().record(role.id + "_chest_" + (add ? "added" : "removed"),
+                "role=" + role.id + ", position=" + formatPos(primary)
+                        + ", block_positions=" + positions.size());
+        return OK;
+    }
+
+    private ChestRole conflictingRole(ChestRole requested, List<int[]> positions) {
+        for (ChestRole role : ChestRole.values()) {
+            if (role == requested) continue;
+            if (positions.stream().anyMatch(pos -> hasRole(role, pos))) return role;
+        }
+        return null;
+    }
+
+    private boolean hasRole(ChestRole role, int[] pos) {
+        return switch (role) {
+            case IMPORT -> index.isImportChest(pos[0], pos[1], pos[2]);
+            case BLACKLIST -> index.isBlacklistedChest(pos[0], pos[1], pos[2]);
+            case EXPORT -> index.isExportChest(pos[0], pos[1], pos[2]);
+        };
+    }
+
+    private List<int[]> rolePositions(ChestRole role) {
+        return switch (role) {
+            case IMPORT -> index.getImportChests();
+            case BLACKLIST -> index.getBlacklistedChests();
+            case EXPORT -> index.getExportChests();
+        };
+    }
+
+    private void mutateRole(ChestRole role, List<int[]> positions, boolean add) throws Exception {
+        switch (role) {
+            case IMPORT -> {
+                if (add) index.addImportChests(positions); else index.removeImportChests(positions);
+            }
+            case BLACKLIST -> {
+                if (add) index.addBlacklistedChests(positions); else index.removeBlacklistedChests(positions);
+            }
+            case EXPORT -> {
+                if (add) index.addExportChests(positions); else index.removeExportChests(positions);
+            }
+        }
+    }
+
+    private int renderChestRoleList(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            ChestRole role) {
+        List<int[]> positions = rolePositions(role);
+        var embed = command.getSource().getEmbed().title(role.title + " Chests").primaryColor();
+        if (positions.isEmpty()) {
+            embed.description("No " + role.id + " chests assigned. Face a chest and run `/stash "
+                    + (role == ChestRole.EXPORT ? "exportchest" : role.id) + "`.");
+            return OK;
+        }
+        StringBuilder description = new StringBuilder();
+        int shown = 0;
+        for (int[] pos : positions) {
+            if (shown++ >= 40) {
+                description.append("... and ").append(positions.size() - 40).append(" more block position(s)");
+                break;
+            }
+            description.append(formatPos(pos)).append('\n');
+        }
+        embed.description(description.toString())
+                .footer("Double chests are persisted as both block positions.", null);
+        return OK;
+    }
+
+    private int purgeChestRole(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            ChestRole role,
+            boolean confirmed) {
+        var embed = command.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title(role.title + " Purge Failed")
+                    .description("Database is not connected; persistent roles cannot be changed safely.")
+                    .errorColor();
+            return OK;
+        }
+        int count = rolePositions(role).size();
+        if (count == 0) {
+            embed.title("No " + role.title + " Chests")
+                    .description("There are no " + role.id + " chest assignments to purge.")
+                    .primaryColor();
+            return OK;
+        }
+        String commandName = role == ChestRole.EXPORT ? "exportchest" : role.id;
+        if (!confirmed) {
+            embed.title("Confirm " + role.title + " Chest Purge")
+                    .description("This removes **" + count + "** persisted block assignment(s). Run `/stash "
+                            + commandName + " purge confirm` to continue. Chest contents are untouched.")
+                    .errorColor();
+            return OK;
+        }
+        String blocker = chestRoleMutationBlocker();
+        if (blocker != null) {
+            embed.title(role.title + " Purge Failed")
+                    .description("Cannot purge chest roles while " + blocker + ".").errorColor();
+            return OK;
+        }
+        try {
+            int removed = switch (role) {
+                case IMPORT -> index.clearImportChests();
+                case BLACKLIST -> index.clearBlacklistedChests();
+                case EXPORT -> index.clearExportChests();
+            };
+            module.getDebugRecorder().record(role.id + "_chests_purged",
+                    "cached_blocks=" + count + ", persisted_blocks_removed=" + removed);
+            module.fireWebhookEvent(role.id + "_chests_purged", Map.of(
+                    "cached_blocks", count,
+                    "persisted_blocks_removed", removed));
+            embed.title(role.title + " Chests Purged")
+                    .description("Removed **" + removed + "** persisted block assignment(s). Chest contents were not changed.")
+                    .successColor();
+        } catch (Exception e) {
+            embed.title(role.title + " Purge Failed")
+                    .description("Database error: " + e.getMessage()).errorColor();
+        }
         return OK;
     }
 
@@ -2228,7 +3089,7 @@ public class StashCommand extends Command {
         var ray = RaycastHelper.playerBlockRaycast(BOT.getBlockReachDistance(), false);
         if (!ray.hit() || !(BlockRegistry.CHEST.equals(ray.block())
                 || BlockRegistry.TRAPPED_CHEST.equals(ray.block()))) {
-            module.getDebugRecorder().record("import_chest_target_failed",
+            module.getDebugRecorder().record("chest_role_target_failed",
                     "ray_hit=" + ray.hit()
                             + ", block=" + ray.block().name()
                             + ", reach=" + BOT.getBlockReachDistance()
@@ -2291,7 +3152,7 @@ public class StashCommand extends Command {
         return first[0] == second[0] && first[1] == second[1] && first[2] == second[2];
     }
 
-    private String importMutationBlocker() {
+    private String chestRoleMutationBlocker() {
         var scanState = module.getState();
         if (scanState != StashManagerModule.ScanState.IDLE
                 && scanState != StashManagerModule.ScanState.DONE) {
@@ -2306,55 +3167,20 @@ public class StashCommand extends Command {
         return null;
     }
 
-    private int purgeImportChests(
-            com.mojang.brigadier.context.CommandContext<CommandContext> command,
-            boolean confirmed) {
-        var embed = command.getSource().getEmbed();
-        if (database == null || !database.isInitialized()) {
-            embed.title("Import Purge Failed")
-                .description("Database is not connected; persistent assignments cannot be changed safely.")
-                .errorColor();
-            return OK;
+    private String craftingMutationBlocker() {
+        var scanState = module.getState();
+        if (scanState != StashManagerModule.ScanState.IDLE
+                && scanState != StashManagerModule.ScanState.DONE) {
+            return "a stash scan is active (state=" + scanState + ")";
         }
-
-        int count = index.getImportChestBlockCount();
-        if (count == 0) {
-            embed.title("No Import Chests")
-                .description("There are no import chest assignments to purge.")
-                .primaryColor();
-            return OK;
+        if (module.getOrganizer() != null && module.getOrganizer().isActive()
+                && !module.getOrganizer().isYielded()) {
+            return "the organizer is active";
         }
-        if (!confirmed) {
-            embed.title("Confirm Import Chest Purge")
-                .description("This will remove all **" + count + "** persisted import chest block assignment(s). Run `/stash import purge confirm` to continue. No chest contents will be deleted.")
-                .errorColor();
-            return OK;
+        if (module.getRetriever() != null && module.getRetriever().isActive()) {
+            return "a retrieval job is active";
         }
-
-        String blocker = importMutationBlocker();
-        if (blocker != null) {
-            embed.title("Import Purge Failed")
-                .description("Cannot purge import assignments while " + blocker + ".")
-                .errorColor();
-            return OK;
-        }
-
-        try {
-            int removed = index.clearImportChests();
-            module.getDebugRecorder().record("import_chests_purged",
-                    "cached_blocks=" + count + ", persisted_blocks_removed=" + removed);
-            module.fireWebhookEvent("import_chests_purged", Map.of(
-                    "cached_blocks", count,
-                    "persisted_blocks_removed", removed));
-            embed.title("Import Chests Purged")
-                .description("Removed all import assignments (**" + removed + "** persisted block row(s)). Chest contents were not changed.")
-                .successColor();
-        } catch (Exception e) {
-            embed.title("Import Purge Failed")
-                .description("Database error: " + e.getMessage())
-                .errorColor();
-        }
-        return OK;
+        return null;
     }
 
     private String formatUpdaterState(final PluginUpdateService.StatusSnapshot snapshot) {
@@ -2399,6 +3225,77 @@ public class StashCommand extends Command {
         return OK;
     }
 
+    private int runKeepReequip(
+            com.mojang.brigadier.context.CommandContext<CommandContext> c,
+            boolean preview) {
+        var embed = c.getSource().getEmbed();
+        if (database == null || !database.isInitialized()) {
+            embed.title("Re-equip Unavailable")
+                    .description("Connect the stash database first.").errorColor();
+            return OK;
+        }
+        try {
+            var kept = database.loadKeepItems();
+            if (kept.isEmpty()) {
+                embed.title("Nothing to Re-equip")
+                        .description("The keep list is empty. Add the gear and food you want the bot to carry with `/stash keep add`.")
+                        .primaryColor();
+                return OK;
+            }
+            var plan = KeepReequipPlan.from(kept, snapshotCarriedAndEquipped());
+            String summary = plan.requested().isEmpty()
+                    ? "Kept item counts are already met. Empty armor/offhand slots can still be equipped from inventory."
+                    : plan.requested().entrySet().stream()
+                            .limit(15)
+                            .map(e -> e.getValue() + "x " + e.getKey())
+                            .collect(Collectors.joining("\n"));
+            if (preview) {
+                embed.title("Re-equip Preview")
+                        .description(summary)
+                        .addField("Refill types", String.valueOf(plan.requested().size()), true)
+                        .addField("Wearable types", String.valueOf(plan.equipment().size()), true)
+                        .primaryColor();
+                if (!plan.skippedUnlimited().isEmpty()) {
+                    embed.addField("Skipped 'all' rules",
+                            String.join(", ", plan.skippedUnlimited())
+                                    + " — set a count to refill these", false);
+                }
+                return OK;
+            }
+            if (module.startKeepReequip(plan.requested(), plan.equipment())) {
+                embed.title("Re-equip Started")
+                        .description(summary)
+                        .addField("Plan", "Food first, then remaining kept items; only empty armor/offhand slots are equipped.", false)
+                        .successColor();
+            } else {
+                String reason = module.getLastReequipError();
+                embed.title("Re-equip Could Not Start")
+                        .description(withSpectatorTip(reason == null
+                                ? "No matching indexed stock or safe automation window was available."
+                                : reason))
+                        .errorColor();
+            }
+        } catch (Exception e) {
+            embed.title("Re-equip Failed")
+                    .description("Could not build the keep-list plan: " + e.getMessage())
+                    .errorColor();
+        }
+        return OK;
+    }
+
+    private Map<String, Integer> snapshotCarriedAndEquipped() {
+        var snapshot = new LinkedHashMap<String, Integer>();
+        var player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (player == null) return snapshot;
+        for (int slot = 5; slot <= 45; slot++) {
+            ItemStack stack = player.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0) continue;
+            String id = ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack));
+            if (id != null) snapshot.merge(id, stack.getAmount(), Integer::sum);
+        }
+        return snapshot;
+    }
+
     private Map<String, Integer> snapshotPlayerInventory() {
         var snapshot = new java.util.LinkedHashMap<String, Integer>();
         var invCache = CACHE.getPlayerCache().getInventoryCache();
@@ -2422,6 +3319,11 @@ public class StashCommand extends Command {
     }
 
     private String normalizeItemId(String input) {
-        return ItemResolver.resolve(input.toLowerCase());
+        if (input == null || input.isBlank()) return input;
+        String trimmed = input.trim();
+        int bracket = trimmed.indexOf('[');
+        String baseTerm = bracket < 0 ? trimmed : trimmed.substring(0, bracket);
+        String variant = bracket < 0 ? "" : trimmed.substring(bracket);
+        return ItemIdentifier.normalizeItemId(ItemResolver.resolve(baseTerm) + variant);
     }
 }

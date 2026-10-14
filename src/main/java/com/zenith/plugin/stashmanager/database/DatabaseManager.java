@@ -4,13 +4,19 @@ import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
+import com.zenith.plugin.stashmanager.kit.KitCapacity;
+import com.zenith.plugin.stashmanager.profile.ItemProfile;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
 import com.zenith.plugin.stashmanager.travel.tunnel.storage.TunnelRepository;
+import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 
 import java.sql.*;
 import java.util.*;
 
 // Persists stash data through a PostgreSQL connection pool.
 public class DatabaseManager implements AutoCloseable {
+
+    public static final int ITEM_IDENTITY_VERSION = 3;
 
     private HikariDataSource dataSource;
     private volatile boolean initialized = false;
@@ -34,6 +40,7 @@ public class DatabaseManager implements AutoCloseable {
             createSchema();
             migrateSchema();
             initialized = true;
+            ItemProfiles.install(loadItemProfiles());
             return true;
         } catch (Exception e) {
             initialized = false;
@@ -109,6 +116,7 @@ public class DatabaseManager implements AutoCloseable {
                     containers_indexed INTEGER NOT NULL DEFAULT 0,
                     containers_failed INTEGER NOT NULL DEFAULT 0,
                     completion_status VARCHAR(16) NOT NULL DEFAULT 'complete',
+                    identity_version INTEGER NOT NULL DEFAULT 1,
                     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP
                 )
@@ -162,6 +170,37 @@ public class DatabaseManager implements AutoCloseable {
                 )
                 """);
 
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS blacklisted_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS export_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+
+            // Workstations are configuration, not scan results; keep them across rescans.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS crafting_tables (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+
             // Keep-items set (items the organizer should not move)
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS keep_items (
@@ -187,6 +226,10 @@ public class DatabaseManager implements AutoCloseable {
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS kits (
                     name VARCHAR(128) PRIMARY KEY,
+                    status VARCHAR(16) NOT NULL DEFAULT 'ready',
+                    export_x INTEGER,
+                    export_y INTEGER,
+                    export_z INTEGER,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -202,6 +245,24 @@ public class DatabaseManager implements AutoCloseable {
                 """);
 
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_kit_items_kit ON kit_items(kit_name)");
+
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS item_profiles (
+                    name VARCHAR(64) PRIMARY KEY,
+                    item_id VARCHAR(128) NOT NULL,
+                    match_mode VARCHAR(16) NOT NULL,
+                    lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS item_profile_enchantments (
+                    profile_name VARCHAR(64) NOT NULL REFERENCES item_profiles(name) ON DELETE CASCADE,
+                    enchantment_id VARCHAR(128) NOT NULL,
+                    minimum_level INTEGER NOT NULL,
+                    PRIMARY KEY (profile_name, enchantment_id)
+                )
+                """);
 
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_items_item_id ON container_items(item_id)");
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_container_shulkers_container ON container_shulkers(container_id)");
@@ -241,6 +302,7 @@ public class DatabaseManager implements AutoCloseable {
             // Existing completed rows remain trusted. New scans explicitly transition through
             // running -> complete/aborted so partial snapshots survive restarts as unsafe.
             stmt.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS completion_status VARCHAR(16) NOT NULL DEFAULT 'complete'");
+            stmt.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS identity_version INTEGER NOT NULL DEFAULT 1");
 
             // Old organizer runs only upserted current assignments, leaving retired item
             // classes pointed at lanes that had since been reassigned. Keep the newest owner
@@ -266,6 +328,49 @@ public class DatabaseManager implements AutoCloseable {
                     z INTEGER NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (x, y, z)
+                )
+                """);
+
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS blacklisted_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS export_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+            stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'ready'");
+            stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS export_x INTEGER");
+            stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS export_y INTEGER");
+            stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS export_z INTEGER");
+            stmt.execute("ALTER TABLE container_items ALTER COLUMN item_id TYPE TEXT");
+            stmt.execute("ALTER TABLE kit_items ALTER COLUMN item_id TYPE TEXT");
+            stmt.execute("ALTER TABLE column_assignments ALTER COLUMN item_id TYPE TEXT");
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS item_profiles (
+                    name VARCHAR(64) PRIMARY KEY,
+                    item_id VARCHAR(128) NOT NULL,
+                    match_mode VARCHAR(16) NOT NULL,
+                    lane_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS item_profile_enchantments (
+                    profile_name VARCHAR(64) NOT NULL REFERENCES item_profiles(name) ON DELETE CASCADE,
+                    enchantment_id VARCHAR(128) NOT NULL,
+                    minimum_level INTEGER NOT NULL,
+                    PRIMARY KEY (profile_name, enchantment_id)
                 )
                 """);
 
@@ -783,6 +888,158 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
+    // Organizer exclusion Chests
+    public void addBlacklistedChests(Collection<int[]> positions) throws SQLException {
+        addChestPositions("blacklisted_chests", positions);
+    }
+
+    public void removeBlacklistedChests(Collection<int[]> positions) throws SQLException {
+        removeChestPositions("blacklisted_chests", positions);
+    }
+
+    public List<int[]> loadBlacklistedChests() throws SQLException {
+        return loadChestPositions("blacklisted_chests");
+    }
+
+    public int clearBlacklistedChests() throws SQLException {
+        return clearChestPositions("blacklisted_chests");
+    }
+
+    public void addCraftingTables(Collection<int[]> positions) throws SQLException {
+        addChestPositions("crafting_tables", positions);
+    }
+
+    public void removeCraftingTables(Collection<int[]> positions) throws SQLException {
+        removeChestPositions("crafting_tables", positions);
+    }
+
+    public List<int[]> loadCraftingTables() throws SQLException {
+        return loadChestPositions("crafting_tables");
+    }
+
+    // Kit output Chests
+    public void addExportChests(Collection<int[]> positions) throws SQLException {
+        addChestPositions("export_chests", positions);
+    }
+
+    public void removeExportChests(Collection<int[]> positions) throws SQLException {
+        if (!initialized || positions == null || positions.isEmpty()) return;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement delete = conn.prepareStatement(
+                        "DELETE FROM export_chests WHERE x = ? AND y = ? AND z = ?");
+                     PreparedStatement clear = conn.prepareStatement("""
+                             UPDATE kits SET export_x = NULL, export_y = NULL, export_z = NULL, status = 'draft'
+                             WHERE export_x = ? AND export_y = ? AND export_z = ?
+                             """)) {
+                    for (int[] pos : positions) {
+                        if (pos == null || pos.length < 3) continue;
+                        delete.setInt(1, pos[0]);
+                        delete.setInt(2, pos[1]);
+                        delete.setInt(3, pos[2]);
+                        delete.addBatch();
+                        clear.setInt(1, pos[0]);
+                        clear.setInt(2, pos[1]);
+                        clear.setInt(3, pos[2]);
+                        clear.addBatch();
+                    }
+                    delete.executeBatch();
+                    clear.executeBatch();
+                }
+                conn.commit();
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
+    public List<int[]> loadExportChests() throws SQLException {
+        return loadChestPositions("export_chests");
+    }
+
+    public int clearExportChests() throws SQLException {
+        if (!initialized) return 0;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                int removed;
+                try (PreparedStatement delete = conn.prepareStatement("DELETE FROM export_chests")) {
+                    removed = delete.executeUpdate();
+                }
+                try (PreparedStatement clear = conn.prepareStatement(
+                        "UPDATE kits SET export_x = NULL, export_y = NULL, export_z = NULL, status = 'draft' WHERE export_x IS NOT NULL")) {
+                    clear.executeUpdate();
+                }
+                conn.commit();
+                return removed;
+            } catch (SQLException e) {
+                conn.rollback();
+                throw e;
+            }
+        }
+    }
+
+    private void addChestPositions(String table, Collection<int[]> positions) throws SQLException {
+        if (!initialized || positions == null || positions.isEmpty()) return;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO " + table + " (x, y, z) VALUES (?, ?, ?) ON CONFLICT (x, y, z) DO NOTHING")) {
+                for (int[] pos : positions) {
+                    if (pos == null || pos.length < 3) continue;
+                    ps.setInt(1, pos[0]);
+                    ps.setInt(2, pos[1]);
+                    ps.setInt(3, pos[2]);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    private void removeChestPositions(String table, Collection<int[]> positions) throws SQLException {
+        if (!initialized || positions == null || positions.isEmpty()) return;
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM " + table + " WHERE x = ? AND y = ? AND z = ?")) {
+                for (int[] pos : positions) {
+                    if (pos == null || pos.length < 3) continue;
+                    ps.setInt(1, pos[0]);
+                    ps.setInt(2, pos[1]);
+                    ps.setInt(3, pos[2]);
+                    ps.addBatch();
+                }
+                ps.executeBatch();
+            }
+            conn.commit();
+        }
+    }
+
+    private List<int[]> loadChestPositions(String table) throws SQLException {
+        if (!initialized) return Collections.emptyList();
+        List<int[]> positions = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("SELECT x, y, z FROM " + table + " ORDER BY x, y, z")) {
+            while (rs.next()) {
+                positions.add(new int[]{rs.getInt("x"), rs.getInt("y"), rs.getInt("z")});
+            }
+        }
+        return positions;
+    }
+
+    private int clearChestPositions(String table) throws SQLException {
+        if (!initialized) return 0;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("DELETE FROM " + table)) {
+            return ps.executeUpdate();
+        }
+    }
+
     // Config Key-Value Store
     public void setConfig(String key, String value) throws SQLException {
         if (!initialized) return;
@@ -883,13 +1140,26 @@ public class DatabaseManager implements AutoCloseable {
     public void saveKeepItems(Map<String, Integer> itemQuantities) throws SQLException {
         if (!initialized) return;
 
+        Map<String, Integer> normalizedItems = new LinkedHashMap<>();
+        for (var entry : itemQuantities.entrySet()) {
+            String itemId = ItemIdentifier.baseItemId(entry.getKey());
+            if (itemId == null || itemId.isBlank()) continue;
+            Integer quantity = entry.getValue();
+            if (!normalizedItems.containsKey(itemId)) normalizedItems.put(itemId, quantity);
+            else {
+                Integer current = normalizedItems.get(itemId);
+                normalizedItems.put(itemId,
+                        current == null || quantity == null ? null : Math.max(current, quantity));
+            }
+        }
+
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
             try (Statement del = conn.createStatement()) {
                 del.executeUpdate("DELETE FROM keep_items");
             }
             try (PreparedStatement ps = conn.prepareStatement("INSERT INTO keep_items (item_id, keep_quantity) VALUES (?, ?)")) {
-                for (var entry : itemQuantities.entrySet()) {
+                for (var entry : normalizedItems.entrySet()) {
                     ps.setString(1, entry.getKey());
                     if (entry.getValue() == null) {
                         ps.setNull(2, Types.INTEGER);
@@ -914,7 +1184,14 @@ public class DatabaseManager implements AutoCloseable {
              ResultSet rs = stmt.executeQuery("SELECT item_id, keep_quantity FROM keep_items")) {
             while (rs.next()) {
                 int qty = rs.getInt("keep_quantity");
-                result.put(rs.getString("item_id"), rs.wasNull() ? null : qty);
+                String itemId = ItemIdentifier.baseItemId(rs.getString("item_id"));
+                Integer quantity = rs.wasNull() ? null : qty;
+                if (!result.containsKey(itemId)) result.put(itemId, quantity);
+                else {
+                    Integer current = result.get(itemId);
+                    result.put(itemId,
+                            current == null || quantity == null ? null : Math.max(current, quantity));
+                }
             }
         }
         return result;
@@ -928,6 +1205,9 @@ public class DatabaseManager implements AutoCloseable {
     // for that run (see README for how to configure persistent storage).
     public void saveColumnAssignments(Map<String, int[]> assignments) throws SQLException {
         if (!initialized) return;
+        Map<String, int[]> normalizedAssignments = new LinkedHashMap<>();
+        assignments.forEach((itemId, position) ->
+                normalizedAssignments.put(ItemIdentifier.normalizeItemId(itemId), position));
 
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
@@ -936,7 +1216,7 @@ public class DatabaseManager implements AutoCloseable {
             try (Statement clear = conn.createStatement()) {
                 clear.executeUpdate("DELETE FROM column_assignments");
             }
-            if (assignments.isEmpty()) {
+            if (normalizedAssignments.isEmpty()) {
                 conn.commit();
                 return;
             }
@@ -947,7 +1227,7 @@ public class DatabaseManager implements AutoCloseable {
                         col_x = EXCLUDED.col_x, col_y = EXCLUDED.col_y, col_z = EXCLUDED.col_z,
                         updated_at = EXCLUDED.updated_at
                     """)) {
-                for (var entry : assignments.entrySet()) {
+                for (var entry : normalizedAssignments.entrySet()) {
                     int[] pos = entry.getValue();
                     ps.setString(1, entry.getKey());
                     ps.setInt(2, pos[0]);
@@ -970,27 +1250,165 @@ public class DatabaseManager implements AutoCloseable {
              Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery("SELECT item_id, col_x, col_y, col_z FROM column_assignments")) {
             while (rs.next()) {
-                result.put(rs.getString("item_id"), new int[]{rs.getInt("col_x"), rs.getInt("col_y"), rs.getInt("col_z")});
+                result.put(ItemIdentifier.normalizeItemId(rs.getString("item_id")),
+                        new int[]{rs.getInt("col_x"), rs.getInt("col_y"), rs.getInt("col_z")});
             }
         }
         return result;
     }
 
     // Kits
-    public static final int KIT_MAX_SLOTS = 27;
+    public List<ItemProfile> loadItemProfiles() throws SQLException {
+        if (!initialized) return List.of();
+        try (Connection conn = dataSource.getConnection()) {
+            Map<String, Map<String, Integer>> enchantments = new LinkedHashMap<>();
+            try (Statement stmt = conn.createStatement(); ResultSet rs = stmt.executeQuery(
+                    "SELECT profile_name, enchantment_id, minimum_level FROM item_profile_enchantments")) {
+                while (rs.next()) {
+                    enchantments.computeIfAbsent(rs.getString(1), ignored -> new LinkedHashMap<>())
+                            .put(rs.getString(2), rs.getInt(3));
+                }
+            }
+            List<ItemProfile> profiles = new ArrayList<>();
+            try (Statement stmt = conn.createStatement(); ResultSet rs = stmt.executeQuery(
+                    "SELECT name, item_id, match_mode, lane_enabled FROM item_profiles ORDER BY name")) {
+                while (rs.next()) {
+                    profiles.add(new ItemProfile(rs.getString(1), rs.getString(2),
+                            ItemProfile.Mode.valueOf(rs.getString(3).toUpperCase(Locale.ROOT)),
+                            enchantments.getOrDefault(rs.getString(1), Map.of()), rs.getBoolean(4)));
+                }
+            }
+            return profiles;
+        }
+    }
+
+    public void saveItemProfile(ItemProfile profile) throws SQLException {
+        if (!initialized) throw new SQLException("Database not connected");
+        List<ItemProfile> proposed = new ArrayList<>(loadItemProfiles());
+        ItemProfile prior = proposed.stream()
+                .filter(existing -> existing.name().equals(profile.name()))
+                .findFirst().orElse(null);
+        if (prior != null && (!prior.itemId().equals(profile.itemId())
+                || prior.mode() != profile.mode()
+                || !prior.enchantments().equals(profile.enchantments()))) {
+            try (Connection conn = dataSource.getConnection();
+                 PreparedStatement ps = conn.prepareStatement(
+                         "SELECT 1 FROM kit_items WHERE item_id = ? LIMIT 1")) {
+                ps.setString(1, profile.storageKey());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) throw new IllegalArgumentException(
+                            "A saved kit uses this profile. Remove it from the kit before changing its matching rule.");
+                }
+            }
+        }
+        proposed.removeIf(existing -> existing.name().equals(profile.name()));
+        proposed.add(profile);
+        ItemProfiles.validate(proposed);
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            try {
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        INSERT INTO item_profiles (name, item_id, match_mode, lane_enabled, updated_at)
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT (name) DO UPDATE SET item_id = EXCLUDED.item_id,
+                        match_mode = EXCLUDED.match_mode, lane_enabled = EXCLUDED.lane_enabled,
+                        updated_at = CURRENT_TIMESTAMP
+                        """)) {
+                    ps.setString(1, profile.name());
+                    ps.setString(2, profile.itemId());
+                    ps.setString(3, profile.mode().name().toLowerCase(Locale.ROOT));
+                    ps.setBoolean(4, profile.laneEnabled());
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "DELETE FROM item_profile_enchantments WHERE profile_name = ?")) {
+                    ps.setString(1, profile.name());
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        INSERT INTO item_profile_enchantments
+                        (profile_name, enchantment_id, minimum_level) VALUES (?, ?, ?)
+                        """)) {
+                    for (var entry : profile.enchantments().entrySet()) {
+                        ps.setString(1, profile.name());
+                        ps.setString(2, entry.getKey());
+                        ps.setInt(3, entry.getValue());
+                        ps.addBatch();
+                    }
+                    ps.executeBatch();
+                }
+                conn.commit();
+            } catch (Exception e) {
+                conn.rollback();
+                if (e instanceof SQLException sql) throw sql;
+                throw new IllegalStateException("Could not save item profile", e);
+            }
+        }
+        ItemProfiles.install(proposed);
+    }
+
+    public boolean deleteItemProfile(String name) throws SQLException {
+        if (!initialized) return false;
+        boolean deleted;
+        try (Connection conn = dataSource.getConnection()) {
+            try (PreparedStatement referenced = conn.prepareStatement(
+                    "SELECT 1 FROM kit_items WHERE item_id = ? LIMIT 1")) {
+                referenced.setString(1, "profile:" + name);
+                try (ResultSet rs = referenced.executeQuery()) {
+                    if (rs.next()) throw new IllegalArgumentException(
+                            "A saved kit uses this profile. Remove it from that kit first.");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("DELETE FROM item_profiles WHERE name = ?")) {
+                ps.setString(1, name);
+                deleted = ps.executeUpdate() > 0;
+            }
+        }
+        if (deleted) ItemProfiles.install(loadItemProfiles());
+        return deleted;
+    }
+
+    public static final int KIT_MAX_SLOTS = KitCapacity.MAX_SLOTS;
+
+    public enum KitStatus {
+        DRAFT,
+        READY;
+
+        static KitStatus fromDatabase(String value) {
+            return "draft".equalsIgnoreCase(value) ? DRAFT : READY;
+        }
+    }
+
+    public record KitDefinition(
+            String name,
+            KitStatus status,
+            Map<String, Integer> items,
+            int[] exportPosition) {
+        public KitDefinition {
+            items = items == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(items));
+            exportPosition = exportPosition == null ? null : exportPosition.clone();
+        }
+
+        @Override
+        public int[] exportPosition() {
+            return exportPosition == null ? null : exportPosition.clone();
+        }
+
+        public int requiredSlots() {
+            return KitCapacity.requiredSlots(items);
+        }
+    }
 
     public static Map<String, Integer> truncateKitItems(Map<String, Integer> items) {
-        if (items == null || items.isEmpty()) return Collections.emptyMap();
-
-        Map<String, Integer> truncated = new LinkedHashMap<>();
-        int slots = 0;
-        for (var entry : items.entrySet()) {
-            if (entry.getValue() == null || entry.getValue() <= 0) continue;
-            if (slots >= KIT_MAX_SLOTS) break;
-            truncated.put(entry.getKey(), entry.getValue());
-            slots++;
+        Map<String, Integer> normalized = new LinkedHashMap<>();
+        if (items != null) {
+            for (var entry : items.entrySet()) {
+                String itemId = ItemIdentifier.normalizeItemId(entry.getKey());
+                if (itemId == null || itemId.isBlank() || entry.getValue() == null || entry.getValue() <= 0) continue;
+                normalized.merge(itemId, entry.getValue(), Integer::sum);
+            }
         }
-        return truncated;
+        return KitCapacity.fitOneShulker(normalized);
     }
 
     public void saveKit(String name, Map<String, Integer> items) throws SQLException {
@@ -1002,8 +1420,8 @@ public class DatabaseManager implements AutoCloseable {
             conn.setAutoCommit(false);
             try {
                 try (PreparedStatement ps = conn.prepareStatement(
-                        "INSERT INTO kits (name, updated_at) VALUES (?, CURRENT_TIMESTAMP) " +
-                            "ON CONFLICT (name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP")) {
+                        "INSERT INTO kits (name, status, updated_at) VALUES (?, 'ready', CURRENT_TIMESTAMP) " +
+                            "ON CONFLICT (name) DO UPDATE SET status = 'ready', updated_at = CURRENT_TIMESTAMP")) {
                     ps.setString(1, name);
                     ps.executeUpdate();
                 }
@@ -1041,30 +1459,112 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     private int countKitSlots(Connection conn, String name) throws SQLException {
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT COUNT(*) FROM kit_items WHERE kit_name = ?")) {
-            ps.setString(1, name);
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getInt(1) : 0;
-            }
-        }
+        return KitCapacity.requiredSlots(loadKit(conn, name));
     }
 
     public Map<String, Integer> loadKit(String name) throws SQLException {
         if (!initialized) return Collections.emptyMap();
+        try (Connection conn = dataSource.getConnection()) {
+            return loadKit(conn, name);
+        }
+    }
 
+    private Map<String, Integer> loadKit(Connection conn, String name) throws SQLException {
         Map<String, Integer> items = new LinkedHashMap<>();
-        try (Connection conn = dataSource.getConnection();
-             PreparedStatement ps = conn.prepareStatement(
-                 "SELECT item_id, quantity FROM kit_items WHERE kit_name = ? ORDER BY item_id")) {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT item_id, quantity FROM kit_items WHERE kit_name = ? ORDER BY item_id")) {
             ps.setString(1, name);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    items.put(rs.getString("item_id"), rs.getInt("quantity"));
+                    items.merge(ItemIdentifier.normalizeItemId(rs.getString("item_id")),
+                            rs.getInt("quantity"), Integer::sum);
                 }
             }
         }
         return items;
+    }
+
+    public boolean createKitDraft(String name) throws SQLException {
+        if (!initialized) return false;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "INSERT INTO kits (name, status) VALUES (?, 'draft') ON CONFLICT (name) DO NOTHING")) {
+            ps.setString(1, name);
+            return ps.executeUpdate() > 0;
+        }
+    }
+
+    public KitDefinition loadKitDefinition(String name) throws SQLException {
+        if (!initialized) return null;
+        try (Connection conn = dataSource.getConnection()) {
+            KitStatus status;
+            int[] export;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT status, export_x, export_y, export_z FROM kits WHERE name = ?")) {
+                ps.setString(1, name);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return null;
+                    status = KitStatus.fromDatabase(rs.getString("status"));
+                    export = rs.getObject("export_x") == null ? null : new int[]{
+                            rs.getInt("export_x"), rs.getInt("export_y"), rs.getInt("export_z")};
+                }
+            }
+            return new KitDefinition(name, status, loadKit(conn, name), export);
+        }
+    }
+
+    public List<KitDefinition> listKitDefinitions() throws SQLException {
+        if (!initialized) return Collections.emptyList();
+        List<String> names = listKits();
+        List<KitDefinition> definitions = new ArrayList<>(names.size());
+        for (String name : names) {
+            KitDefinition definition = loadKitDefinition(name);
+            if (definition != null) definitions.add(definition);
+        }
+        return definitions;
+    }
+
+    public boolean assignKitExport(String name, int[] position) throws SQLException {
+        if (!initialized || position == null || position.length < 3) return false;
+        try (Connection conn = dataSource.getConnection()) {
+            boolean registered;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT 1 FROM export_chests WHERE x = ? AND y = ? AND z = ?")) {
+                ps.setInt(1, position[0]);
+                ps.setInt(2, position[1]);
+                ps.setInt(3, position[2]);
+                try (ResultSet rs = ps.executeQuery()) {
+                    registered = rs.next();
+                }
+            }
+            if (!registered) return false;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "UPDATE kits SET export_x = ?, export_y = ?, export_z = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?")) {
+                ps.setInt(1, position[0]);
+                ps.setInt(2, position[1]);
+                ps.setInt(3, position[2]);
+                ps.setString(4, name);
+                return ps.executeUpdate() > 0;
+            }
+        }
+    }
+
+    public boolean markKitReady(String name) throws SQLException {
+        if (!initialized) return false;
+        try (Connection conn = dataSource.getConnection()) {
+            Map<String, Integer> items = loadKit(conn, name);
+            if (items.isEmpty() || !KitCapacity.fitsOneShulker(items)) return false;
+            try (PreparedStatement ps = conn.prepareStatement("""
+                    UPDATE kits k SET status = 'ready', updated_at = CURRENT_TIMESTAMP
+                    WHERE k.name = ?
+                      AND k.export_x IS NOT NULL
+                      AND EXISTS (SELECT 1 FROM export_chests e
+                                  WHERE e.x = k.export_x AND e.y = k.export_y AND e.z = k.export_z)
+                    """)) {
+                ps.setString(1, name);
+                return ps.executeUpdate() > 0;
+            }
+        }
     }
 
     public List<String> listKits() throws SQLException {
@@ -1093,6 +1593,12 @@ public class DatabaseManager implements AutoCloseable {
 
     public boolean setKitItem(String kitName, String itemId, int quantity) throws SQLException {
         if (!initialized) return false;
+        itemId = ItemIdentifier.normalizeItemId(itemId);
+        if (itemId == null || itemId.isBlank()) return false;
+        if (itemId.startsWith("profile:")
+                && ItemProfiles.get(itemId.substring("profile:".length())) == null) {
+            throw new IllegalArgumentException("No saved profile matches " + itemId + ".");
+        }
 
         try (Connection conn = dataSource.getConnection()) {
             conn.setAutoCommit(false);
@@ -1104,17 +1610,10 @@ public class DatabaseManager implements AutoCloseable {
                     ps.executeUpdate();
                 }
 
-                boolean exists;
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT 1 FROM kit_items WHERE kit_name = ? AND item_id = ?")) {
-                    ps.setString(1, kitName);
-                    ps.setString(2, itemId);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        exists = rs.next();
-                    }
-                }
-
-                if (!exists && countKitSlots(conn, kitName) >= KIT_MAX_SLOTS) {
+                Map<String, Integer> proposed = loadKit(conn, kitName);
+                proposed.put(itemId, quantity);
+                validateKitSelectors(proposed);
+                if (!KitCapacity.fitsOneShulker(proposed)) {
                     conn.rollback();
                     return false;
                 }
@@ -1149,6 +1648,30 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
+    private static void validateKitSelectors(Map<String, Integer> items) {
+        List<String> keys = new ArrayList<>(items.keySet());
+        for (int i = 0; i < keys.size(); i++) {
+            String left = keys.get(i);
+            if (!left.startsWith("profile:")) continue;
+            ItemProfile profile = ItemProfiles.get(left.substring("profile:".length()));
+            if (profile == null) throw new IllegalArgumentException("Unknown kit profile: " + left);
+            for (int j = 0; j < keys.size(); j++) {
+                if (i == j) continue;
+                String right = keys.get(j);
+                boolean overlap;
+                if (right.startsWith("profile:")) {
+                    ItemProfile other = ItemProfiles.get(right.substring("profile:".length()));
+                    overlap = other != null && profile.overlaps(other);
+                } else {
+                    overlap = profile.matches(right)
+                            || profile.itemId().equals(ItemIdentifier.normalizeItemId(right));
+                }
+                if (overlap) throw new IllegalArgumentException(
+                        "Kit entries " + left + " and " + right + " can select the same item.");
+            }
+        }
+    }
+
     // Scan History
     public long recordScanStart(int[] pos1, int[] pos2) throws SQLException {
         if (!initialized) return -1;
@@ -1157,9 +1680,9 @@ public class DatabaseManager implements AutoCloseable {
             INSERT INTO scan_history (
                 region_pos1_x, region_pos1_y, region_pos1_z,
                 region_pos2_x, region_pos2_y, region_pos2_z,
-                completion_status
+                completion_status, identity_version
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'running')
+            VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
             RETURNING id
             """;
 
@@ -1171,6 +1694,7 @@ public class DatabaseManager implements AutoCloseable {
             ps.setInt(4, pos2[0]);
             ps.setInt(5, pos2[1]);
             ps.setInt(6, pos2[2]);
+            ps.setInt(7, ITEM_IDENTITY_VERSION);
 
             try (ResultSet rs = ps.executeQuery()) {
                 rs.next();
@@ -1185,6 +1709,34 @@ public class DatabaseManager implements AutoCloseable {
 
     public void recordScanAborted(long scanId, int found, int indexed, int failed) throws SQLException {
         recordScanFinished(scanId, found, indexed, failed, "aborted");
+    }
+
+    /** Old scans lack full equipment components and cannot safely drive profile tasks. */
+    public boolean latestScanHasFullItemIdentity(int[] pos1, int[] pos2) throws SQLException {
+        if (!initialized || pos1 == null || pos2 == null) return false;
+        String sql = """
+            SELECT identity_version, completion_status FROM scan_history
+            WHERE LEAST(region_pos1_x, region_pos2_x) = ?
+              AND LEAST(region_pos1_y, region_pos2_y) = ?
+              AND LEAST(region_pos1_z, region_pos2_z) = ?
+              AND GREATEST(region_pos1_x, region_pos2_x) = ?
+              AND GREATEST(region_pos1_y, region_pos2_y) = ?
+              AND GREATEST(region_pos1_z, region_pos2_z) = ?
+            ORDER BY id DESC LIMIT 1
+            """;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setInt(1, Math.min(pos1[0], pos2[0]));
+            ps.setInt(2, Math.min(pos1[1], pos2[1]));
+            ps.setInt(3, Math.min(pos1[2], pos2[2]));
+            ps.setInt(4, Math.max(pos1[0], pos2[0]));
+            ps.setInt(5, Math.max(pos1[1], pos2[1]));
+            ps.setInt(6, Math.max(pos1[2], pos2[2]));
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() && rs.getInt(1) >= ITEM_IDENTITY_VERSION
+                        && "complete".equalsIgnoreCase(rs.getString(2));
+            }
+        }
     }
 
     private void recordScanFinished(
@@ -1328,7 +1880,7 @@ public class DatabaseManager implements AutoCloseable {
 
             try (ResultSet itemRs = itemPs.executeQuery()) {
                 while (itemRs.next()) {
-                    String itemId = itemRs.getString("item_id");
+                    String itemId = ItemIdentifier.normalizeItemId(itemRs.getString("item_id"));
                     int quantity = itemRs.getInt("quantity");
                     boolean inShulker = itemRs.getBoolean("in_shulker");
                     String shulkerColor = itemRs.getString("shulker_color");
@@ -1383,5 +1935,6 @@ public class DatabaseManager implements AutoCloseable {
             dataSource.close();
         }
         initialized = false;
+        ItemProfiles.install(List.of());
     }
 }

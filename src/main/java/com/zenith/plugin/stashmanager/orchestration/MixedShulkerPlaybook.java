@@ -7,7 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** Pure planning rules for decomposing mixed/kit shulkers into exact-item bulk storage. */
+/** Pure planning rules for decomposing mixed/kit shulkers into routed bulk storage. */
 public final class MixedShulkerPlaybook {
     private static final int MAX_TRANSFER_BATCH_SLOTS = 4;
     private static final int RESERVED_HEADROOM_SLOTS = 1;
@@ -39,7 +39,7 @@ public final class MixedShulkerPlaybook {
         for (Map<String, Integer> contents : mixedContents) {
             if (contents == null) continue;
             contents.forEach((rawItemId, rawQuantity) -> {
-                String storageClass = StorageClassPolicy.exact(rawItemId);
+                String storageClass = StorageClassPolicy.route(rawItemId);
                 int quantity = rawQuantity == null ? 0 : Math.max(0, rawQuantity);
                 if (storageClass != null && quantity > 0) {
                     demand.merge(storageClass, (long) quantity, MixedShulkerPlaybook::saturatingAdd);

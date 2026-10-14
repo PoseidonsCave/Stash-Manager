@@ -9,6 +9,7 @@ import com.zenith.feature.inventory.actions.MoveToHotbarSlot;
 import com.zenith.feature.inventory.actions.SetHeldItem;
 import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
+import com.zenith.feature.pathfinder.goals.GoalBlock;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
@@ -24,6 +25,7 @@ import com.zenith.plugin.stashmanager.organizer.lane.LaneDetector;
 import com.zenith.plugin.stashmanager.util.BaritoneCompat;
 import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
 import com.zenith.plugin.stashmanager.util.PathfinderCompat;
 import com.zenith.util.RequestFuture;
 import org.geysermc.mcprotocollib.network.Session;
@@ -48,6 +50,7 @@ import java.util.function.BiConsumer;
 import static com.zenith.Globals.BARITONE;
 import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.BOT;
+import static com.zenith.Globals.CONFIG;
 import static com.zenith.Globals.INPUTS;
 import static com.zenith.Globals.INVENTORY;
 
@@ -93,8 +96,10 @@ public final class StashRetriever {
     // Nested retrieval has to place, open, empty, break, and recover a borrowed box. A
     // ten-second budget was shorter than a single difficult Baritone approach in large stashes.
     private static final int SHULKER_TOTAL_TIMEOUT_TICKS = 2400;
+    private static final int SHULKER_WORKSITE_WALK_TIMEOUT_TICKS = 2400;
     private static final int SHULKER_PLACE_TIMEOUT_TICKS = 400;
     private static final int SHULKER_OPEN_TIMEOUT_TICKS = 200;
+    private static final int SHULKER_CONTAINER_SLOTS = 27;
     private static final int SHULKER_BREAK_TIMEOUT_TICKS = 300;
     private static final int MAX_SHULKER_PLACE_REPLANS = 4;
     private static final int SHULKER_PICKUP_WAIT_TICKS = 16;
@@ -139,6 +144,7 @@ public final class StashRetriever {
     private int unloadTotalTicks;
     private int unloadShulkerSlot = -1;
     private int unloadChestSlot = -1;
+    private int unloadSourceContainerId = -1;
     private int[] placedShulkerPos;
     private boolean savedPlaceBlockSneak = false;
     private boolean placeSneakGuardActive = false;
@@ -151,6 +157,12 @@ public final class StashRetriever {
     private int shulkerOpenRetries;
     private int shulkerPlaceReplans;
     private int shulkerHeldReselects;
+    private int[] fallbackWorksiteStation;
+    private int[] fallbackWorksitePlacePos;
+    private boolean worksiteFallbackAttempted;
+    private boolean worksiteNavigationGuardActive;
+    private boolean savedWorksiteAllowBreak;
+    private boolean savedWorksiteAllowPlace;
     private final Set<Long> rejectedShulkerPlacePositions = new HashSet<>();
 
     private int lastTeleportQueueSize = -1;
@@ -235,6 +247,19 @@ public final class StashRetriever {
                             int[] regionPos2,
                             Set<Long> excludedPositions,
                             boolean preferNearbyFoodTargets) {
+        return startKit(requestName, kitItems, candidates, regionPos1, regionPos2,
+                excludedPositions, preferNearbyFoodTargets, null, null);
+    }
+
+    public boolean startKit(String requestName,
+                            Map<String, Integer> kitItems,
+                            List<ContainerEntry> candidates,
+                            int[] regionPos1,
+                            int[] regionPos2,
+                            Set<Long> excludedPositions,
+                            boolean preferNearbyFoodTargets,
+                            int[] fallbackWorksiteStation,
+                            int[] fallbackWorksitePlacePos) {
         lastStartFailureReason = StartFailureReason.NONE;
         if (kitItems == null || kitItems.isEmpty()) {
             lastStartFailureReason = StartFailureReason.EMPTY_REQUEST;
@@ -258,6 +283,10 @@ public final class StashRetriever {
         resetState();
         activeRequestName = requestName;
         this.preferNearbyFoodTargets = preferNearbyFoodTargets;
+        this.fallbackWorksiteStation = fallbackWorksiteStation == null
+                ? null : fallbackWorksiteStation.clone();
+        this.fallbackWorksitePlacePos = fallbackWorksitePlacePos == null
+                ? null : fallbackWorksitePlacePos.clone();
         setTargetPolicy(regionPos1, regionPos2, excludedPositions);
         kitItems.forEach((k, v) -> {
             if (v != null && v > 0) remaining.put(k, v);
@@ -330,7 +359,7 @@ public final class StashRetriever {
                 "inventory_slot", inventoryShulkerSlot,
                 "reason", "wanted_contents_already_in_inventory"
             ));
-            beginShulkerUnload(-1, inventoryShulker);
+            beginShulkerUnload(-1, inventoryShulker, -1);
             return true;
         }
         advanceToNextTarget(null);
@@ -346,6 +375,7 @@ public final class StashRetriever {
             ));
         }
         BARITONE.stop();
+        restoreWorksiteNavigation();
         closeCurrentContainer();
         state = State.IDLE;
         targetQueue.clear();
@@ -354,6 +384,7 @@ public final class StashRetriever {
     }
 
     public void onContainerData(Session session, ClientboundContainerSetContentPacket packet) {
+        if (packet.getContainerId() <= 0) return;
         this.serverSession = session;
         this.openContainerId = packet.getContainerId();
         this.containerSlots = packet.getItems();
@@ -542,11 +573,12 @@ public final class StashRetriever {
                         beginTrackingOwnedShulker(stack, chestSlots);
                         
                         int[] revisitTarget = currentTarget == null ? null : currentTarget.clone();
+                        int sourceContainerId = openContainerId;
                         closeCurrentContainer();
                         if (revisitTarget != null) {
                             targetQueue.addFirst(revisitTarget);
                         }
-                        beginShulkerUnload(actionSlotIndex - 1, stack);
+                        beginShulkerUnload(actionSlotIndex - 1, stack, sourceContainerId);
                         return;
                     }
 
@@ -574,7 +606,8 @@ public final class StashRetriever {
         advanceToNextTarget("container_exhausted");
     }
 
-    private void beginShulkerUnload(int chestSlot, ItemStack shulkerStack) {
+    private void beginShulkerUnload(int chestSlot, ItemStack shulkerStack,
+                                   int sourceContainerId) {
         // The container approach may still own a path request when a within-reach open succeeds.
         // Do not let that request carry the bot away after we select a local placement cell.
         BARITONE.stop();
@@ -582,6 +615,7 @@ public final class StashRetriever {
         unloadTicks = 0;
         unloadTotalTicks = 0;
         unloadChestSlot = chestSlot;
+        unloadSourceContainerId = sourceContainerId;
         unloadShulkerSlot = -1;
         placedShulkerPos = null;
         unloadShulkerItemData = ItemRegistry.REGISTRY.get(shulkerStack.getId());
@@ -593,6 +627,7 @@ public final class StashRetriever {
         shulkerOpenRetries = 0;
         shulkerPlaceReplans = 0;
         shulkerHeldReselects = 0;
+        worksiteFallbackAttempted = false;
         rejectedShulkerPlacePositions.clear();
         state = State.UNLOADING_SHULKER;
         emit("retrieve_shulker_unload_started", Map.of(
@@ -605,7 +640,9 @@ public final class StashRetriever {
         unloadTicks++;
         unloadTotalTicks++;
 
-        if (unloadTotalTicks > SHULKER_TOTAL_TIMEOUT_TICKS) {
+        int totalTimeout = SHULKER_TOTAL_TIMEOUT_TICKS
+                + (worksiteFallbackAttempted ? SHULKER_WORKSITE_WALK_TIMEOUT_TICKS : 0);
+        if (unloadTotalTicks > totalTimeout) {
             emit("retrieve_shulker_unload_failed", Map.of(
                 "reason", "timeout",
                 "phase", unloadPhase,
@@ -626,6 +663,7 @@ public final class StashRetriever {
             case 3 -> tickUnloadTakeContents();
             case 4 -> tickUnloadBreak();
             case 5 -> tickUnloadResume();
+            case 6 -> tickUnloadWorksiteWalk();
             default -> {
                 emit("retrieve_shulker_unload_failed", Map.of("reason", "invalid_phase"));
                 finish(false, "invalid_shulker_phase");
@@ -647,11 +685,104 @@ public final class StashRetriever {
         placeSneakGuardActive = false;
     }
 
+    private int[] selectShulkerPlaceSpot() {
+        if (!worksiteFallbackAttempted) return findShulkerPlaceSpot();
+        if (fallbackWorksitePlacePos == null) return null;
+        int[] worksite = fallbackWorksitePlacePos;
+        if (rejectedShulkerPlacePositions.contains(posKey(
+                worksite[0], worksite[1], worksite[2]))
+                || !isSafeShulkerPlaceSpot(worksite)
+                || !isWithinShulkerPlacementReach(worksite)) return null;
+        return worksite.clone();
+    }
+
+    private void beginWorksiteFallback() {
+        if (fallbackWorksiteStation.length != 3 || fallbackWorksitePlacePos.length != 3
+                || !World.isInWorldBounds(fallbackWorksiteStation[0], fallbackWorksiteStation[1], fallbackWorksiteStation[2])
+                || !World.isInWorldBounds(fallbackWorksitePlacePos[0], fallbackWorksitePlacePos[1], fallbackWorksitePlacePos[2])) {
+            emit("retrieve_shulker_unload_failed", Map.of("reason", "invalid_worksite"));
+            finish(false, "shulker_invalid_worksite");
+            return;
+        }
+        worksiteFallbackAttempted = true;
+        unloadPhase = 6;
+        unloadTicks = 0;
+        BARITONE.stop();
+        guardWorksiteNavigation();
+        emit("retrieve_shulker_worksite_fallback", Map.of(
+                "reason", "no_local_place_spot",
+                "station", posString(fallbackWorksiteStation),
+                "worksite", posString(fallbackWorksitePlacePos)));
+    }
+
+    private void tickUnloadWorksiteWalk() {
+        if (atWorksiteStation()) {
+            BARITONE.stop();
+            restoreWorksiteNavigation();
+            placedShulkerPos = selectShulkerPlaceSpot();
+            if (placedShulkerPos == null) {
+                emit("retrieve_shulker_unload_failed", Map.of(
+                        "reason", "worksite_unavailable",
+                        "worksite", posString(fallbackWorksitePlacePos)));
+                finish(false, "shulker_worksite_unavailable");
+                return;
+            }
+            emit("retrieve_shulker_worksite_reached", Map.of(
+                    "station", posString(fallbackWorksiteStation),
+                    "worksite", posString(placedShulkerPos)));
+            unloadPhase = 0;
+            unloadTicks = 0;
+            return;
+        }
+        if (unloadTicks > SHULKER_WORKSITE_WALK_TIMEOUT_TICKS) {
+            emit("retrieve_shulker_unload_failed", Map.of(
+                    "reason", "worksite_walk_timeout",
+                    "station", posString(fallbackWorksiteStation)));
+            finish(false, "shulker_worksite_walk_timeout");
+            return;
+        }
+        if (unloadTicks == 1 || (unloadTicks % 40 == 0
+                && !BARITONE.getCustomGoalProcess().isActive())) {
+            BARITONE.pathTo(new GoalBlock(new BlockPos(
+                    fallbackWorksiteStation[0],
+                    fallbackWorksiteStation[1],
+                    fallbackWorksiteStation[2])));
+        }
+    }
+
+    private boolean atWorksiteStation() {
+        if (fallbackWorksiteStation == null) return false;
+        var player = CACHE.getPlayerCache();
+        return (int) Math.floor(player.getX()) == fallbackWorksiteStation[0]
+                && (int) Math.floor(player.getY()) == fallbackWorksiteStation[1]
+                && (int) Math.floor(player.getZ()) == fallbackWorksiteStation[2];
+    }
+
+    private void guardWorksiteNavigation() {
+        if (worksiteNavigationGuardActive) return;
+        savedWorksiteAllowBreak = CONFIG.client.extra.pathfinder.allowBreak;
+        savedWorksiteAllowPlace = CONFIG.client.extra.pathfinder.allowPlace;
+        worksiteNavigationGuardActive = true;
+        CONFIG.client.extra.pathfinder.allowBreak = false;
+        CONFIG.client.extra.pathfinder.allowPlace = false;
+    }
+
+    private void restoreWorksiteNavigation() {
+        if (!worksiteNavigationGuardActive) return;
+        CONFIG.client.extra.pathfinder.allowBreak = savedWorksiteAllowBreak;
+        CONFIG.client.extra.pathfinder.allowPlace = savedWorksiteAllowPlace;
+        worksiteNavigationGuardActive = false;
+    }
+
     private void tickUnloadLocateAndPrepare() {
         if (shulkerInventorySearchDelay > 0) {
             shulkerInventorySearchDelay--;
             return;
         }
+
+        // The source chest close follows the shift-click. Do not navigate or select a
+        // player-inventory hotbar slot until Zenith observes that close.
+        if (CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() > 0) return;
 
         resolvePendingOwnedShulker();
 
@@ -663,8 +794,20 @@ public final class StashRetriever {
         }
 
         if (placedShulkerPos == null) {
-            placedShulkerPos = findShulkerPlaceSpot();
+            placedShulkerPos = selectShulkerPlaceSpot();
             if (placedShulkerPos == null) {
+                if (!worksiteFallbackAttempted && fallbackWorksiteStation != null
+                        && fallbackWorksitePlacePos != null) {
+                    beginWorksiteFallback();
+                    return;
+                }
+                if (worksiteFallbackAttempted) {
+                    emit("retrieve_shulker_unload_failed", Map.of(
+                            "reason", "worksite_unavailable",
+                            "worksite", posString(fallbackWorksitePlacePos)));
+                    finish(false, "shulker_worksite_unavailable");
+                    return;
+                }
                 retryShulkerPlacement("no_place_spot");
                 return;
             }
@@ -683,6 +826,12 @@ public final class StashRetriever {
         if (unloadShulkerItemData == null) {
             emit("retrieve_shulker_unload_failed", Map.of("reason", "missing_shulker_item_data"));
             finish(false, "missing_shulker_item_data");
+            return;
+        }
+
+        // The source chest close is queued behind the shift-click. A held-item request
+        // targets inventory container 0 and will be skipped while that chest is open.
+        if (CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() > 0) {
             return;
         }
 
@@ -823,8 +972,17 @@ public final class StashRetriever {
             return;
         }
 
-        if (containerDataReceived && openContainerId >= 0) {
+        int liveContainerId = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+        if (shulkerOpenRetries > 0
+                && containerDataReceived
+                && openContainerId > 0
+                && openContainerId != unloadSourceContainerId
+                && openContainerId == liveContainerId
+                && getOpenContainerSlotCount() == SHULKER_CONTAINER_SLOTS
+                && World.getBlock(placedShulkerPos[0], placedShulkerPos[1], placedShulkerPos[2])
+                        .name().contains("shulker_box")) {
             emit("retrieve_shulker_opened", Map.of(
+                "container_id", openContainerId,
                 "placed_position", posString(placedShulkerPos)
             ));
             unloadPhase = 3;
@@ -1015,6 +1173,7 @@ public final class StashRetriever {
 
     private void finish(boolean completed, String reason) {
         BARITONE.stop();
+        restoreWorksiteNavigation();
         closeCurrentContainer();
         restorePlaceBlockSneak();
         state = State.DONE;
@@ -1034,6 +1193,7 @@ public final class StashRetriever {
     }
 
     private void resetState() {
+        restoreWorksiteNavigation();
         targetQueue.clear();
         currentTarget = null;
         remaining.clear();
@@ -1063,6 +1223,8 @@ public final class StashRetriever {
         activeRegionMin = null;
         activeRegionMax = null;
         excludedTargets.clear();
+        fallbackWorksiteStation = null;
+        fallbackWorksitePlacePos = null;
     }
 
     private void setTargetPolicy(int[] pos1, int[] pos2, Set<Long> excludedPositions) {
@@ -1095,11 +1257,13 @@ public final class StashRetriever {
     }
 
     private void resetUnloadState() {
+        restoreWorksiteNavigation();
         unloadPhase = 0;
         unloadTicks = 0;
         unloadTotalTicks = 0;
         unloadShulkerSlot = -1;
         unloadChestSlot = -1;
+        unloadSourceContainerId = -1;
         placedShulkerPos = null;
         unloadShulkerItemData = null;
         unloadPlaceFuture = null;
@@ -1110,6 +1274,7 @@ public final class StashRetriever {
         shulkerOpenRetries = 0;
         shulkerPlaceReplans = 0;
         shulkerHeldReselects = 0;
+        worksiteFallbackAttempted = false;
         rejectedShulkerPlacePositions.clear();
     }
 
@@ -1166,8 +1331,8 @@ public final class StashRetriever {
 
         for (var entry : ItemIdentifier.readShulkerContents(stack).entrySet()) {
             // Let suffixed tool variants satisfy base-item requests.
-            Integer needed = remaining.get(entry.getKey());
-            if (needed == null) needed = remaining.get(ItemIdentifier.baseItemId(entry.getKey()));
+            String requestKey = requestKeyForItem(remaining, entry.getKey());
+            Integer needed = requestKey == null ? null : remaining.get(requestKey);
             if (needed != null && needed > 0 && entry.getValue() > 0) {
                 return true;
             }
@@ -1184,6 +1349,12 @@ public final class StashRetriever {
         if (requests == null || observedItemId == null) return null;
         Integer exact = requests.get(observedItemId);
         if (exact != null && exact > 0) return observedItemId;
+        for (var entry : requests.entrySet()) {
+            if (entry.getValue() != null && entry.getValue() > 0
+                    && ItemProfiles.matchesRequest(entry.getKey(), observedItemId)) {
+                return entry.getKey();
+            }
+        }
         String base = ItemIdentifier.baseItemId(observedItemId);
         Integer baseNeed = requests.get(base);
         return baseNeed != null && baseNeed > 0 ? base : null;
@@ -1191,6 +1362,12 @@ public final class StashRetriever {
 
     static int amountMatchingRequest(Map<String, Integer> indexedItems, String requestItemId) {
         if (indexedItems == null || requestItemId == null) return 0;
+        if (requestItemId.startsWith("profile:")) {
+            return indexedItems.entrySet().stream()
+                    .filter(entry -> ItemProfiles.matchesRequest(requestItemId, entry.getKey()))
+                    .mapToInt(entry -> Math.max(0, entry.getValue() == null ? 0 : entry.getValue()))
+                    .sum();
+        }
         String requestBase = ItemIdentifier.baseItemId(requestItemId);
         if (!requestItemId.equals(requestBase)) {
             return Math.max(0, indexedItems.getOrDefault(requestItemId, 0));
@@ -1255,10 +1432,13 @@ public final class StashRetriever {
     }
 
     private void closeCurrentContainer() {
+        int containerId = openContainerId > 0
+            ? openContainerId
+            : CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
         try {
             INVENTORY.submit(InventoryActionRequest.builder()
                 .owner(this)
-                .actions(new CloseContainer())
+                .actions(new CloseContainer(containerId))
                 .priority(5000)
                 .build());
         } catch (Exception ignored) {
