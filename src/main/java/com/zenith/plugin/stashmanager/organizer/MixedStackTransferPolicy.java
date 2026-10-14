@@ -16,10 +16,19 @@ final class MixedStackTransferPolicy {
             boolean requestCompleted,
             boolean requestAccepted,
             boolean sourceOccupied,
-            boolean destinationOccupied) {
+            boolean destinationOccupied,
+            boolean cursorOccupied,
+            int verificationTicks,
+            int verificationTimeoutTicks) {
         if (!requestCompleted) return Result.WAIT;
-        if (destinationOccupied) return Result.CONFIRMED;
+        if (destinationOccupied && !cursorOccupied) return Result.CONFIRMED;
+        if (cursorOccupied) {
+            return verificationTicks < Math.max(1, verificationTimeoutTicks)
+                    ? Result.WAIT
+                    : Result.UNVERIFIED;
+        }
         if (!requestAccepted || sourceOccupied) return Result.RETRY;
+        if (verificationTicks < Math.max(1, verificationTimeoutTicks)) return Result.WAIT;
         return Result.UNVERIFIED;
     }
 }

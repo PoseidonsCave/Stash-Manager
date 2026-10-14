@@ -55,7 +55,8 @@ final class OrganizerJournalStore {
 
     record PackingSupply(PackingSupplySearch.Snapshot search, List<Integer> deferredTaskIds,
                          boolean stagingCargo, MixedStagingLedger.Snapshot stagingLedger,
-                         Map<String, Integer> stagesWithoutDelivery) {}
+                         Map<String, Integer> stagesWithoutDelivery,
+                         int craftingHeadroomStrategyVersion) {}
 
     record MixedShellVerification(int elapsedTicks, boolean collectionConfirmed,
                                   String pickupFingerprint, List<Integer> cargoTaskIds) {}

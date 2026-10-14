@@ -65,6 +65,20 @@ final class PlaceOneFromCursor implements InventoryAction {
 
     /** The protocol switched ItemStack predictions to HashedStack after 1.21.8. */
     private MinecraftPacket createPacket(ItemStack placed, ItemStack remaining) {
+        return exactClickPacket(containerId, slotId, ClickItemAction.RIGHT_CLICK, placed, remaining);
+    }
+
+    /** Builds a click with an exact prediction, including when the target was null. */
+    static MinecraftPacket exactClickPacket(int containerId, int slotId,
+                                            ClickItemAction action, ItemStack placed,
+                                            ItemStack remaining) {
+        return exactClickPacket(containerId, slotId, action, placed, remaining,
+                predictedStateId());
+    }
+
+    static MinecraftPacket exactClickPacket(int containerId, int slotId,
+                                            ClickItemAction action, ItemStack placed,
+                                            ItemStack remaining, int stateId) {
         try {
             Class<?> packetType = Class.forName(
                     "org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClickPacket");
@@ -77,14 +91,15 @@ final class PlaceOneFromCursor implements InventoryAction {
             changed.put(slotId, encodePrediction(placed, predictionType));
             return (MinecraftPacket) packetConstructor.newInstance(
                     containerId,
-                    predictedStateId(),
+                    stateId,
                     slotId,
                     ContainerActionType.CLICK_ITEM,
-                    ClickItemAction.RIGHT_CLICK,
+                    action,
                     predictedCursor,
                     changed);
         } catch (ReflectiveOperationException | RuntimeException e) {
-            CLIENT_LOG.warn("Could not build exact right-click inventory packet", e);
+            CLIENT_LOG.warn("Could not build exact inventory click packet for container {} slot {}",
+                    containerId, slotId, e);
             return null;
         }
     }
@@ -104,6 +119,7 @@ final class PlaceOneFromCursor implements InventoryAction {
 
     private static Object encodePrediction(ItemStack stack, Class<?> predictionType)
             throws ReflectiveOperationException {
+        if (stack == null) return null;
         if (predictionType.isInstance(stack)) return stack;
         Class<?> hasherType = Class.forName("com.zenith.mc.item.hashing.ItemStackHasher");
         Method hash = hasherType.getMethod("hash", ItemStack.class);

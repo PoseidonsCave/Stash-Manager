@@ -18,6 +18,9 @@ public class ContainerIndex {
 
     private final ConcurrentHashMap<Long, ContainerEntry> entries = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, int[]> importChests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, int[]> blacklistedChests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, int[]> exportChests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, int[]> craftingTables = new ConcurrentHashMap<>();
     private final AtomicLong databaseWriteFailures = new AtomicLong();
     private volatile long lastScanTimestamp = 0;
     private volatile boolean databaseWriteHealthy = true;
@@ -141,20 +144,134 @@ public class ContainerIndex {
         return removed;
     }
 
+    public boolean isBlacklistedChest(int x, int y, int z) {
+        return blacklistedChests.containsKey(positionKey(x, y, z));
+    }
+
+    public boolean isBlacklistedChest(ContainerEntry entry) {
+        return entry != null && isBlacklistedChest(entry.x(), entry.y(), entry.z());
+    }
+
+    public int getBlacklistedChestBlockCount() {
+        return blacklistedChests.size();
+    }
+
+    public List<int[]> getBlacklistedChests() {
+        return sortedPositions(blacklistedChests);
+    }
+
+    public void addBlacklistedChests(Collection<int[]> positions) throws Exception {
+        requireDatabase();
+        database.addBlacklistedChests(positions);
+        cachePositions(blacklistedChests, positions, true);
+    }
+
+    public void removeBlacklistedChests(Collection<int[]> positions) throws Exception {
+        requireDatabase();
+        database.removeBlacklistedChests(positions);
+        cachePositions(blacklistedChests, positions, false);
+    }
+
+    public int clearBlacklistedChests() throws Exception {
+        requireDatabase();
+        int removed = database.clearBlacklistedChests();
+        blacklistedChests.clear();
+        return removed;
+    }
+
+    public boolean isExportChest(int x, int y, int z) {
+        return exportChests.containsKey(positionKey(x, y, z));
+    }
+
+    public boolean isExportChest(ContainerEntry entry) {
+        return entry != null && isExportChest(entry.x(), entry.y(), entry.z());
+    }
+
+    public int getExportChestBlockCount() {
+        return exportChests.size();
+    }
+
+    public List<int[]> getExportChests() {
+        return sortedPositions(exportChests);
+    }
+
+    public void addExportChests(Collection<int[]> positions) throws Exception {
+        requireDatabase();
+        database.addExportChests(positions);
+        cachePositions(exportChests, positions, true);
+    }
+
+    public void removeExportChests(Collection<int[]> positions) throws Exception {
+        requireDatabase();
+        database.removeExportChests(positions);
+        cachePositions(exportChests, positions, false);
+    }
+
+    public int clearExportChests() throws Exception {
+        requireDatabase();
+        int removed = database.clearExportChests();
+        exportChests.clear();
+        return removed;
+    }
+
+    public boolean isCraftingTable(int x, int y, int z) {
+        return craftingTables.containsKey(positionKey(x, y, z));
+    }
+
+    public List<int[]> getCraftingTables() {
+        return sortedPositions(craftingTables);
+    }
+
+    public void addCraftingTable(int[] position) throws Exception {
+        requireDatabase();
+        database.addCraftingTables(List.of(position));
+        cachePositions(craftingTables, List.of(position), true);
+    }
+
+    public void removeCraftingTable(int[] position) throws Exception {
+        requireDatabase();
+        database.removeCraftingTables(List.of(position));
+        cachePositions(craftingTables, List.of(position), false);
+    }
+
+    public boolean isOrganizerExcluded(ContainerEntry entry) {
+        return entry != null && (isBlacklistedChest(entry) || isExportChest(entry));
+    }
+
+    public boolean hasAnyRole(int x, int y, int z) {
+        return isImportChest(x, y, z) || isBlacklistedChest(x, y, z) || isExportChest(x, y, z);
+    }
+
     private void requireDatabase() {
         if (database == null || !database.isInitialized()) {
-            throw new IllegalStateException("Database is not connected; import chest assignments require persistence.");
+            throw new IllegalStateException("Database is not connected; managed chest roles require persistence.");
         }
     }
 
     private void cacheImportChests(Collection<int[]> positions, boolean add) {
+        cachePositions(importChests, positions, add);
+    }
+
+    private static void cachePositions(
+            ConcurrentHashMap<Long, int[]> cache,
+            Collection<int[]> positions,
+            boolean add) {
         if (positions == null) return;
         for (int[] pos : positions) {
             if (pos == null || pos.length < 3) continue;
             long key = positionKey(pos[0], pos[1], pos[2]);
-            if (add) importChests.put(key, new int[]{pos[0], pos[1], pos[2]});
-            else importChests.remove(key);
+            if (add) cache.put(key, new int[]{pos[0], pos[1], pos[2]});
+            else cache.remove(key);
         }
+    }
+
+    private static List<int[]> sortedPositions(ConcurrentHashMap<Long, int[]> cache) {
+        return cache.values().stream()
+                .map(pos -> new int[]{pos[0], pos[1], pos[2]})
+                .sorted(Comparator.<int[]>comparingInt(pos -> pos[0])
+                        .thenComparingInt(pos -> pos[1])
+                        .thenComparingInt(pos -> pos[2]))
+                .toList();
     }
 
     public ContainerEntry get(int x, int y, int z) {
@@ -224,6 +341,12 @@ public class ContainerIndex {
             }
             importChests.clear();
             cacheImportChests(database.loadImportChests(), true);
+            blacklistedChests.clear();
+            cachePositions(blacklistedChests, database.loadBlacklistedChests(), true);
+            exportChests.clear();
+            cachePositions(exportChests, database.loadExportChests(), true);
+            craftingTables.clear();
+            cachePositions(craftingTables, database.loadCraftingTables(), true);
             return all.size();
         } catch (Exception e) {
             return 0;

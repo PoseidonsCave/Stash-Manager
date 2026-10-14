@@ -132,8 +132,18 @@ All commands work through **Discord**, the **terminal**, and **in game chat**.
 
 These commands use the indexed container data stored in PostgreSQL, so the database must be enabled and connected first.
 
+The guided flow is designed for Discord commands. Item indexes come from the latest stash scan and
+stay stable until that scan changes. A kit is limited by real shulker capacity: stackable items use
+one slot per stack, while tools, armor, and other non-stackable items use one slot each.
+
 | Command | Description |
 |---------|-------------|
+| `stash kit create <name>` | Start a draft kit and show the wizard steps |
+| `stash kit catalog [page]` | Browse scanned item types and their selection indexes |
+| `stash kit select <name> <index> <count>` | Add an indexed item to a draft |
+| `stash kit profile <name> <profile_name> <count>` | Ask for equipment matching a saved profile |
+| `stash kit output <name>` | Assign the faced registered export chest to a draft |
+| `stash kit finish <name>` | Validate capacity and mark a draft ready |
 | `stash kit list` | List all saved kits |
 | `stash kit show <name>` | Show the saved contents of a kit |
 | `stash kit snapshot <name>` | Save the player's current main inventory as a kit |
@@ -145,6 +155,77 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stash get status` | Show retrieval progress and remaining items |
 | `stash get stop` | Stop the active retrieval task |
 
+The wizard persists the recipe and intended output chest. The current retrieval command still
+collects items into the bot inventory; automatic shulker assembly and delivery will consume these
+ready definitions in the fulfillment runtime rather than silently pretending delivery happened.
+
+#### Equipment profiles
+
+Profiles let you name the enchantments that matter for an armor piece, weapon, or tool. Minecraft
+still identifies the item by its base ID; the scan records enchantment IDs and levels separately
+from its custom name and lore. A kit can request a profile even when it has no dedicated lane.
+
+| Command | Description |
+|---------|-------------|
+| `stash profile create <name> <item_id> <enchantment> <level>` | Start a profile with its first required enchantment |
+| `stash profile enchant <name> <enchantment> <level>` | Add or change a required enchantment |
+| `stash profile unenchant <name> <enchantment>` | Remove a required enchantment |
+| `stash profile mode <name> contains\|exact` | Allow extra enchantments or require the exact set |
+| `stash lanes profile <name> on\|off` | Give matching items a dedicated lane class |
+| `stash profile list` / `stash profile show <name>` | Review saved rules |
+| `stash profile delete <name>` | Remove a profile unused by kits |
+
+For example, create `fortune_picks` for `diamond_pickaxe` with `fortune 3`, then enable its
+lane. `contains` accepts a Fortune III pick with extra enchantments; `exact` accepts only the
+listed enchantments at the listed levels. The kit wizard can then use
+`stash kit profile travel fortune_picks 1`. Two lane profiles that could both match the same
+item are rejected, so one physical item cannot claim two lanes. Enabling a profile reserves one
+lane in the capacity plan even when no matching gear has been scanned yet. Finish or discard an organizer
+checkpoint before changing a profile. Run a full fresh scan after this upgrade so older abbreviated
+item keys are replaced by full enchantment data. Organization waits for a completed scan with the
+new item identity format.
+
+### 🚪 Managed chest roles
+
+Face either half of a chest within interaction range. Double chests are always assigned as one
+inventory, and one inventory cannot hold multiple roles.
+
+| Command | Description |
+|---------|-------------|
+| `stash import` | Register a chest as organizer intake and temporary staging |
+| `stash import remove` | Remove the faced import assignment |
+| `stash blacklist` | Protect the faced chest from organization and retrieval |
+| `stash blacklist remove` | Remove the faced protection assignment |
+| `stash exportchest` | Reserve the faced chest for completed kit output |
+| `stash exportchest remove` | Remove the faced export assignment |
+| `stash <role> list` | List persisted block positions for that role |
+| `stash <role> purge confirm` | Remove every assignment for that role without touching contents |
+
+#### Crafting tables for emergency packing
+
+Face a crafting table inside the selected stash region and run `stash crafting add`. Assign as many
+tables as you need; `stash crafting list` shows those in the currently selected region, and
+`stash crafting remove` removes the faced table. Assignments survive rescans and restarts. You
+can configure tables while an organizer checkpoint is paused, but not while the bot is actively
+moving items. Assigning a table does not require another scan, but the bot needs a current scan
+to locate shell and chest supplies in storage.
+
+Run `stash crafting on` to let organization make an empty shulker when its usable box search is
+exhausted. This is off by default. The bot takes exactly two loose shulker shells and one chest
+item from scanned chests inside the selected stash region or unprotected inventory, uses an
+assigned crafting table's 3×3 grid, verifies the resulting box, then resumes packing. The
+chest does not need an import or crafting-material assignment. It will not mine a placed storage
+chest for the recipe. `stash crafting materials add` is optional for a scanned non-chest source
+such as a barrel; use `stash crafting materials list` or `stash crafting materials remove` to
+review or undo that assignment. Only shells and chest items are taken. Bot supply chests,
+keep-list inventory slots, and blacklisted/export chests are excluded. If the
+materials or table cannot be verified, the normal import-staging fallback remains in charge.
+Use `stash crafting off` to disable the fallback without deleting table assignments.
+
+Blacklisted and export chests are removed before lane detection and task planning. A blacklisted
+chest may intentionally overlap an existing lane; that protected lane is then outside organizer
+ownership. Import and export chests cannot be assigned on top of detected lanes.
+
 ### 🍞 Bot supplies
 
 | Command | Description |
@@ -153,14 +234,27 @@ These commands use the indexed container data stored in PostgreSQL, so the datab
 | `stash keep add <item_id> <count>` | Protect and replenish up to this quantity during long stash jobs |
 | `stash keep remove <item_id>` | Remove an item from the keep list |
 | `stash keep list` | Show the current protected items and quantity targets |
+| `stash reequip preview` | Check what the bot would restock from the keep list |
+| `stash reequip` | Fetch missing kept items, then equip empty armor and offhand slots |
 
 Use a finite count for at least one safe food, such as `stash keep add golden_carrot 64`.
 When a scan or organization job starts, StashManager tops that supply up from the scanned stash.
-If Zenith's AutoEat reports that it has run out during the job, StashManager checkpoints the current
+If food runs out during the job, StashManager checks live hunger even when Zenith's AutoEat
+warning is disabled. It checkpoints the current
 work, retrieves the missing keep-list food, and resumes through the normal cooldown and quiet checks.
+Refill candidates also follow AutoEat's current all, whitelist, or blacklist mode. While recovery is
+active, StashManager suppresses repeated AutoEat warnings and sends one webhook after usable food is
+retrieved; the normal resume webhook follows when organization actually continues.
 An unlimited food rule protects existing food but does not define how much the bot may automatically
 take. If no safe finite food target or indexed stock is available, the job stays paused instead of
 continuing toward starvation.
+
+After a death, use `stash reequip preview` before `stash reequip`. Re-equip counts gear already
+carried or worn, retrieves food first, and only fills empty armor or offhand slots. A finite keep
+count is a refill target; an unlimited gear rule requests one replacement, while other unlimited
+rules are skipped. This does not resume an organizer checkpoint whose cargo was lost at death.
+If Zenith AutoArmor or AutoTotem is enabled, those modules retain control of their slots.
+The bot needs to be in the stash with no player controlling the proxy before it can run.
 
 ### 🧭 Organizer
 
@@ -173,6 +267,7 @@ continuing toward starvation.
 | `stash organize status` | Show organizer state and progress |
 | `stash lanes` | Show lane count, per item lane sizes, and required double chest construction |
 | `stash lanes export` | Download the styled, coordinate free lane planning workbook as XLSX |
+| `stash lanes profile <name> on\|off` | Enable or disable a saved equipment profile as a lane class |
 | `stash import` | Assign the chest currently being faced as an organizer intake chest |
 | `stash import remove` | Remove the intake role from the chest currently being faced |
 | `stash import list` | List persisted intake chest block positions |
@@ -184,7 +279,7 @@ continuing toward starvation.
 | Step | What happens |
 |:---:|--------------|
 | 1 | The scan identifies empty, bulk, mixed, and unknown shulkers. |
-| 2 | Every exact item gets its own storage class. Blocks, stairs, slabs, trapdoors, armor, tools, and weapons are never folded together. Fortune and Silk Touch tools remain separate. |
+| 2 | Item types stay separate: blocks, stairs, slabs, trapdoors, armor, tools, and weapons. Enchanted gear uses its base item lane unless a saved profile claims it. Fortune and Silk Touch picks remain separate by default. |
 | 3 | Mixed shulkers and returned kits are opened one at a time and their loose cargo is staged through registered import chests. The bot never guesses from a majority item. |
 | 4 | Staged cargo is packed into exact-item bulk shulkers, filling a matching partial box before using an empty one. |
 | 5 | Each completed bulk shulker goes to its assigned lane. When no suitable lane exists, it waits safely in an import chest instead. |
@@ -211,6 +306,17 @@ Lane planning also records how many physical stack slots each item type occupies
 stacks stay in the same item lane, but the capacity report no longer assumes they can merge into a
 single 64-item stack. The scan stores slot counts, not item names. Refresh older scans to get this
 more accurate estimate; old rows use a conservative upper bound until rescanned.
+
+Internal item keys are lowercase and omit the vanilla `minecraft:` prefix. Custom names and lore
+never create new lanes. Enchantments are read from Minecraft's structured item components and use
+stable semantic keys such as `diamond_sword[mending=1,sharpness=5]`; reports display that as
+`Diamond Sword · Mending I, Sharpness V`. A scanned pick retains every enchantment and level,
+such as `diamond_pickaxe[efficiency=5,fortune=3]`; its default lane is still
+`diamond_pickaxe[fortune]`. A lane enabled profile takes precedence over that default.
+Enchanted books are separated by their stored enchantments and levels. Each signed book is
+identified by its title, author, generation, and page content; only a SHA-256 fingerprint is
+stored in the item key, not the book's text. A fresh scan is required after upgrading to
+populate these identities.
 
 #### Import chests
 
@@ -597,7 +703,7 @@ This shows the connection state and how many containers/items are stored.
 | 🔍 | **Faster searches** | `stashsearch` queries stored data instead of scanning memory. |
 | 🕒 | **History** | `scan_history` records every run with timestamps and counts. |
 | 📄 | **Complete exports** | `stash export` can pull the full index from PostgreSQL. |
-| 🧭 | **Stable lane assignments** | Each exact bulk item keeps the same dedicated lane on future organization runs. |
+| 🧭 | **Stable lane assignments** | Each storage class, including enabled equipment profiles, keeps its lane on future organization runs. |
 
 <details>
 <summary><strong>Database tables created automatically</strong></summary>
@@ -615,6 +721,12 @@ The plugin owns and updates these tables. You do not need to create them by hand
 | `storage_chests` | Registered supply chest positions |
 | `keep_items` | Items the organizer should leave in place |
 | `column_assignments` | Item type -> assigned organize column (top chest position), kept stable across runs |
+| `import_chests` | Explicit organizer intake and temporary staging inventories |
+| `blacklisted_chests` | User-owned inventories excluded from organization and retrieval |
+| `export_chests` | Reserved completed-kit output inventories |
+| `kits` | Kit name, draft/ready status, and selected export chest |
+| `kit_items` | Item quantities selected for each kit |
+| `item_profiles` / `item_profile_enchantments` | Named enchantment rules and optional lane routing |
 
 
 </details>
@@ -634,6 +746,9 @@ When enabled, the API server exposes the following endpoints. All endpoints requ
 | `GET` | `/api/v1/metrics` | Prometheus metrics |
 | `GET` | `/api/v1/organizer` | Organizer state and task progress |
 | `GET` | `/api/v1/regions` | Saved region list |
+| `GET` | `/api/v1/chest-roles` | Import, blacklist, and export chest assignments |
+| `GET` | `/api/v1/kits` | Kit definitions, status, slot use, and output assignment |
+| `GET` | `/api/v1/profiles` | Saved equipment rules and lane status |
 | `POST` | `/api/v1/webhook/test` | Send a test webhook payload |
 
 An organizer that stops with a problem reports `state: "FAILED"` and `failed: true`,

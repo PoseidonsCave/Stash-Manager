@@ -7,7 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** Kit-safe classification of one physical shulker box. */
+/** Classifies one physical shulker while retaining exact contents for its fingerprint. */
 public record ShulkerClassification(
         Kind kind,
         String storageKey,
@@ -36,9 +36,9 @@ public record ShulkerClassification(
         if (contents.isEmpty()) {
             kind = Kind.EMPTY;
             storageKey = null;
-        } else if (contents.size() == 1) {
+        } else if (contents.keySet().stream().map(StorageClassPolicy::route).distinct().count() == 1) {
             kind = Kind.BULK;
-            storageKey = contents.keySet().iterator().next();
+            storageKey = StorageClassPolicy.route(contents.keySet().iterator().next());
         } else {
             kind = Kind.MIXED;
             storageKey = null;

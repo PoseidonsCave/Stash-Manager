@@ -6,6 +6,7 @@ import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.event.client.ClientConnectEvent;
 import com.zenith.event.client.ClientDisconnectEvent;
+import com.zenith.event.client.ClientDeathEvent;
 import com.zenith.event.client.ClientLoginFailedEvent;
 import com.zenith.event.client.ClientOnlineEvent;
 import com.zenith.event.client.ClientStartConnectEvent;
@@ -16,6 +17,7 @@ import com.zenith.event.module.HealthAutoDisconnectEvent;
 import com.zenith.event.player.PlayerLoginEvent;
 import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
+import com.zenith.feature.inventory.util.InventoryActionMacros;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.pathfinder.goals.GoalNear;
@@ -27,6 +29,7 @@ import com.zenith.feature.player.World;
 import com.zenith.mc.block.BlockPos;
 import com.zenith.mc.block.BlockRegistry;
 import com.zenith.mc.block.properties.api.BlockStateProperties;
+import com.zenith.mc.food.FoodRegistry;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
@@ -37,6 +40,8 @@ import com.zenith.plugin.stashmanager.orchestration.CooperativePreemptionGate;
 import com.zenith.plugin.stashmanager.orchestration.ConnectionRecoveryTracker;
 import com.zenith.plugin.stashmanager.orchestration.FoodContingencyCloseGate;
 import com.zenith.plugin.stashmanager.orchestration.FoodContingencyPolicy;
+import com.zenith.plugin.stashmanager.orchestration.FoodContingencyRetryPolicy;
+import com.zenith.plugin.stashmanager.orchestration.KeepReequipSelection;
 import com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
@@ -108,6 +113,24 @@ public class StashManagerModule extends Module {
     private final RegionScanner regionScanner;
     private ContainerReader containerReader;
     private final StashManagerNotifications notifications = new StashManagerNotifications();
+    private int foodSafetyProbeTicks;
+    private static final String KEEP_REEQUIP_REQUEST = "reequip:keep";
+    private static final String KEEP_REEQUIP_FOOD_REQUEST = "reequip:food";
+    private boolean reequipActive;
+    private boolean reequipRetrievalDone;
+    private boolean reequipFoodPhase;
+    private boolean reequipPartial;
+    private Map<String, Integer> reequipRemainingRequests = Map.of();
+    private String reequipRequestName = KEEP_REEQUIP_REQUEST;
+    private String lastReequipError;
+    private String reequipRetrievalResult = "none";
+    private Set<String> reequipEquipment = Set.of();
+    private RequestFuture reequipSwap;
+    private int reequipSwapTarget = -1;
+    private String reequipSwapItem;
+    private int reequipVerifyTicks;
+    private int reequipWaitTicks;
+    private int reequipEquipped;
 
     // Organizer integration
     private StashOrganizer organizer;
@@ -145,8 +168,13 @@ public class StashManagerModule extends Module {
     private boolean foodContingencyBlocked = false;
     private int foodContingencyVerificationTicks = 0;
     private int foodContingencyBlockedRecheckTicks = 0;
+    private int foodContingencyBlockedElapsedTicks = 0;
+    private int foodContingencyBlockedRetryCount = 0;
     private int foodContingencyStartRetryTicks = 0;
     private boolean foodContingencyCleanupPending = false;
+    private boolean foodContingencyRetrievalStarted = false;
+    private boolean autoEatWarningMuted = false;
+    private boolean autoEatWarningBeforeMute = false;
     private final FoodContingencyCloseGate foodContingencyCloseGate =
             new FoodContingencyCloseGate();
     private volatile String foodContingencyTrigger = "none";
@@ -267,6 +295,7 @@ public class StashManagerModule extends Module {
             of(PlayerLoginEvent.Post.class, this::onControllingPlayerLogin),
             of(HealthAutoDisconnectEvent.class, this::onHealthAutoDisconnect),
             of(ClientDisconnectEvent.class, this::onClientDisconnect),
+            of(ClientDeathEvent.class, this::onClientDeath),
             of(AutoReconnectEvent.class, this::onAutoReconnectScheduled),
             of(ClientStartConnectEvent.class, this::onClientStartConnect),
             of(ClientConnectEvent.class, this::onClientConnect),
@@ -352,6 +381,7 @@ public class StashManagerModule extends Module {
 
     @Override
     public void onDisable() {
+        resetKeepReequip();
         jobContinuanceManager.clear();
         connectionRecoveryTracker.reset();
         controllingPlayerName = null;
@@ -362,6 +392,7 @@ public class StashManagerModule extends Module {
         if (retriever.isActive()) {
             retriever.stop();
         }
+        restoreAutoEatWarning();
         tunnelNetworkSyncWorker.stop();
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             info("StashManager module disabled — aborting scan");
@@ -599,6 +630,16 @@ public class StashManagerModule extends Module {
 
     public @Nullable String getOrganizerCheckpointResumeBlocker() {
         if (!latestScanTrusted) return "latest_scan_incomplete_or_unhealthy";
+        if (foodContingencyJob == JobContinuanceManager.Job.ORGANIZE
+                && foodContingencyBlocked) {
+            if (foodContingencyBlockedRetryCount >= FoodContingencyRetryPolicy.MAX_RETRIES) {
+                return "food refill failed after " + foodContingencyBlockedRetryCount
+                        + " retries (" + foodContingencyTerminalReason
+                        + "); manual help is needed";
+            }
+            return "food refill is blocked (" + foodContingencyTerminalReason
+                    + "); it will retry when the bot is back near the stash";
+        }
         return organizer == null ? "organizer_unavailable" : organizer.getDurableResumeBlocker();
     }
 
@@ -616,6 +657,11 @@ public class StashManagerModule extends Module {
     }
 
     public boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems) {
+        return startKitRetrieval(requestName, kitItems, false);
+    }
+
+    private boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems,
+                                      boolean preferNearbyFoodTargets) {
         String blocker = getRetrieveBlocker();
         if (blocker != null) {
             warn("Cannot start retrieval: {}", blocker);
@@ -645,14 +691,248 @@ public class StashManagerModule extends Module {
             entries,
             config.pos1,
             config.pos2,
-            getReservedContainerKeys()
+            getReservedContainerKeys(),
+            preferNearbyFoodTargets,
+            null,
+            null
         );
+    }
+
+    /** Refill keep-list deficits, then equip only empty armor/offhand slots. */
+    public boolean startKeepReequip(Map<String, Integer> requested, Set<String> equipment) {
+        lastReequipError = getRetrieveBlocker();
+        if (reequipActive) lastReequipError = "re-equip is already active";
+        if (lastReequipError == null && (config.pos1 == null || config.pos2 == null)) {
+            lastReequipError = "stash region is not configured";
+        }
+        if (lastReequipError == null && isBotOutsideScanEnvelope()) {
+            lastReequipError = "bot is outside the configured stash area";
+        }
+        if (lastReequipError == null
+                && (!CACHE.getPlayerCache().getThePlayer().isAlive()
+                    || CACHE.getPlayerCache().getInventoryCache().getPlayerInventory() == null)) {
+            lastReequipError = "bot inventory is not available in the game world";
+        }
+        if (lastReequipError != null || requested == null || equipment == null) return false;
+        Map<String, Integer> food = new HashMap<>();
+        Map<String, Integer> other = new HashMap<>();
+        requested.forEach((id, count) -> {
+            var foodData = FoodRegistry.REGISTRY.get(id);
+            if (foodData != null && foodData.isSafeFood() && autoEatAccepts(id)) {
+                food.put(id, count);
+            } else {
+                other.put(id, count);
+            }
+        });
+        boolean carryingFood = playerInventoryCounts().keySet().stream().anyMatch(id -> {
+            var foodData = FoodRegistry.REGISTRY.get(id);
+            return foodData != null && foodData.isSafeFood() && autoEatAccepts(id);
+        });
+        if (!requested.isEmpty() && !CONFIG.client.extra.autoEat.enabled) {
+            lastReequipError = "Zenith AutoEat is disabled; enable it before an autonomous re-equip trip.";
+            return false;
+        }
+        if (!carryingFood && !requested.isEmpty()
+                && CACHE.getPlayerCache().getThePlayer().getFood() <= 14) {
+            lastReequipError = "Bot hunger is already low with no food aboard; feed it once before re-equip.";
+            return false;
+        }
+        if (food.isEmpty() && !other.isEmpty() && !carryingFood) {
+            lastReequipError = "No safe food is carried or requested by a finite keep rule; restock food first.";
+            return false;
+        }
+        reequipRetrievalDone = requested.isEmpty();
+        reequipFoodPhase = !food.isEmpty();
+        reequipPartial = false;
+        reequipRemainingRequests = Map.copyOf(other);
+        reequipRequestName = reequipFoodPhase ? KEEP_REEQUIP_FOOD_REQUEST : KEEP_REEQUIP_REQUEST;
+        reequipRetrievalResult = requested.isEmpty() ? "already_stocked" : "pending";
+        reequipEquipment = Set.copyOf(equipment);
+        reequipEquipped = 0;
+        reequipSwap = null;
+        reequipSwapTarget = -1;
+        reequipSwapItem = null;
+        Map<String, Integer> firstRequest = reequipFoodPhase ? food : other;
+        if (!requested.isEmpty() && !startKitRetrieval(
+                reequipRequestName, firstRequest, reequipFoodPhase)) {
+            lastReequipError = "No indexed stock matched the first re-equip request ("
+                    + retriever.getLastStartFailureReason() + ").";
+            resetKeepReequip();
+            return false;
+        }
+        // Target planning can block the terminal thread while client ticks continue. Do not
+        // start the re-equip timeout until retrieval has actually been initialized.
+        reequipWaitTicks = 0;
+        reequipActive = true;
+        debugRecorder.record("reequip_started",
+                "requested=" + requested + ", equipment_types=" + equipment.size());
+        return true;
+    }
+
+    private void resetKeepReequip() {
+        reequipActive = false;
+        reequipRetrievalDone = false;
+        reequipFoodPhase = false;
+        reequipPartial = false;
+        reequipRemainingRequests = Map.of();
+        reequipRequestName = KEEP_REEQUIP_REQUEST;
+        reequipRetrievalResult = "none";
+        reequipEquipment = Set.of();
+        reequipSwap = null;
+        reequipSwapTarget = -1;
+        reequipSwapItem = null;
+        reequipVerifyTicks = 0;
+        reequipWaitTicks = 0;
+    }
+
+    public @Nullable String getLastReequipError() { return lastReequipError; }
+
+    private void tickKeepReequip() {
+        if (!reequipRetrievalDone) {
+            if (++reequipWaitTicks > 200) finishKeepReequip(false, "retrieval_ended_without_result");
+            return;
+        }
+        if (Proxy.getInstance().hasActivePlayer()
+                || state != ScanState.IDLE && state != ScanState.DONE
+                || organizer != null && organizer.isActive()) {
+            finishKeepReequip(false, "automation_ownership_changed");
+            return;
+        }
+        var inventory = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (inventory == null) {
+            finishKeepReequip(false, "player_inventory_unavailable");
+            return;
+        }
+        if (reequipFoodPhase) {
+            boolean carryingFood = playerInventoryCounts().keySet().stream().anyMatch(id -> {
+                var foodData = FoodRegistry.REGISTRY.get(id);
+                return foodData != null && foodData.isSafeFood() && autoEatAccepts(id);
+            });
+            if (!carryingFood) {
+                finishKeepReequip(false, "food_not_retrieved");
+                return;
+            }
+            if (!reequipRemainingRequests.isEmpty()) {
+                if (CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() > 0
+                        || INVENTORY.hasActiveRequest()) {
+                    if (++reequipWaitTicks > 200) finishKeepReequip(false, "food_container_not_closed");
+                    return;
+                }
+                if (!startKitRetrieval(KEEP_REEQUIP_REQUEST,
+                        reequipRemainingRequests, false)) {
+                    finishKeepReequip(false, "gear_retrieval_start_failed");
+                    return;
+                }
+                reequipRequestName = KEEP_REEQUIP_REQUEST;
+                reequipRetrievalDone = false;
+                reequipWaitTicks = 0;
+                reequipFoodPhase = false;
+                return;
+            }
+            reequipFoodPhase = false;
+        }
+        if (reequipSwap != null) {
+            if (!reequipSwap.isCompleted()) {
+                if (++reequipVerifyTicks > 100) finishKeepReequip(false, "equip_action_timeout");
+                return;
+            }
+            if (!reequipSwap.getNow()) {
+                finishKeepReequip(false, "equip_action_rejected");
+                return;
+            }
+            ItemStack equipped = inventory.getItemStack(reequipSwapTarget);
+            String observed = equipped == null ? null
+                    : ItemIdentifier.baseItemId(ItemIdentifier.getItemId(equipped));
+            if (!Objects.equals(reequipSwapItem, observed)) {
+                if (++reequipVerifyTicks > 40) finishKeepReequip(false, "equip_inventory_sync_unverified");
+                return;
+            }
+            reequipEquipped++;
+            debugRecorder.record("reequip_slot_confirmed",
+                    "slot=" + reequipSwapTarget + ", item=" + reequipSwapItem);
+            reequipSwap = null;
+            reequipSwapTarget = -1;
+            reequipSwapItem = null;
+            reequipVerifyTicks = 0;
+        }
+
+        if (CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() > 0
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive()) {
+            if (++reequipWaitTicks > 200) finishKeepReequip(false, "shared_automation_busy");
+            return;
+        }
+        reequipWaitTicks = 0;
+        KeepReequipSelection.Swap candidate = nextReequipSwap(inventory);
+        if (candidate == null) {
+            List<Integer> ambiguous = KeepReequipSelection.ambiguousTargets(
+                    currentReequipSlots(inventory), reequipEquipment);
+            finishKeepReequip(!reequipPartial && ambiguous.isEmpty(),
+                    !ambiguous.isEmpty() ? "manual_equipment_choice_required_slots_" + ambiguous
+                        : reequipPartial ? "retrieval_incomplete" : "done");
+            return;
+        }
+        reequipSwapTarget = candidate.target();
+        reequipSwapItem = candidate.itemId();
+        reequipVerifyTicks = 0;
+        reequipSwap = INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(this)
+                .actions(InventoryActionMacros.swapSlots(candidate.source(), candidate.target()))
+                .priority(5000)
+                .build());
+        debugRecorder.record("reequip_slot_requested",
+                "source_slot=" + candidate.source() + ", target_slot=" + candidate.target()
+                        + ", item=" + candidate.itemId());
+    }
+
+    private KeepReequipSelection.@Nullable Swap nextReequipSwap(
+            com.zenith.cache.data.inventory.Container inventory) {
+        return KeepReequipSelection.next(currentReequipSlots(inventory), reequipEquipment);
+    }
+
+    private Map<Integer, String> currentReequipSlots(
+            com.zenith.cache.data.inventory.Container inventory) {
+        Map<Integer, String> slots = new HashMap<>();
+        for (int slot = 5; slot <= 45; slot++) {
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0) continue;
+            String id = ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack));
+            if (id != null) slots.put(slot, id);
+        }
+        // Zenith's own gear modules use higher-priority inventory actions. Never race them.
+        if (CONFIG.client.extra.autoArmor.enabled) {
+            for (int slot = 5; slot <= 8; slot++) slots.putIfAbsent(slot, "zenith:auto_armor");
+        }
+        if (CONFIG.client.extra.autoTotem.enabled) {
+            slots.putIfAbsent(45, "zenith:auto_totem");
+        }
+        return slots;
+    }
+
+    private void finishKeepReequip(boolean success, String reason) {
+        String retrieval = reequipRetrievalResult;
+        int equipped = reequipEquipped;
+        debugRecorder.record(success ? "reequip_completed" : "reequip_failed",
+                "reason=" + reason + ", retrieval=" + retrieval + ", equipped=" + equipped);
+        fireWebhookEvent(success ? "reequip_completed" : "reequip_failed", Map.of(
+                "reason", reason,
+                "retrieval_result", retrieval,
+                "equipped_slots", equipped));
+        resetKeepReequip();
     }
 
     private Set<Long> getReservedContainerKeys() {
         Set<Long> reserved = new HashSet<>();
         for (int[] pos : config.supplyChests) {
             if (pos != null && pos.length >= 3) reserved.add(posKey(pos[0], pos[1], pos[2]));
+        }
+
+        // Protected and output inventories are never retrieval sources. Export chests are
+        // terminal delivery ports; blacklisted chests remain entirely user-owned.
+        for (int[] pos : index.getBlacklistedChests()) {
+            reserved.add(posKey(pos[0], pos[1], pos[2]));
+        }
+        for (int[] pos : index.getExportChests()) {
+            reserved.add(posKey(pos[0], pos[1], pos[2]));
         }
 
         if (database != null && database.isInitialized()) {
@@ -1020,6 +1300,10 @@ public class StashManagerModule extends Module {
     }
 
     private void onTickStopped(ClientBotTick.Stopped event) {
+        if (reequipActive) {
+            debugRecorder.record("reequip_interrupted", "reason=bot_control_stopped");
+            resetKeepReequip();
+        }
         // Upstream disconnects stop bot ticks too. They are not proxy-control handoffs and must
         // remain recoverable until an explicit ClientOnlineEvent confirms a usable game session.
         if (!Proxy.getInstance().isConnected() || connectionRecoveryTracker.isPending()) {
@@ -1233,7 +1517,50 @@ public class StashManagerModule extends Module {
     }
 
     private void onAutoEatOutOfFood(AutoEatOutOfFoodEvent event) {
+        // Outside a stash job, Zenith owns both the warning and the response.
+        if (activeResumableJob() == JobContinuanceManager.Job.NONE) return;
+        muteAutoEatWarning();
         requestFoodContingency("autoeat_out_of_food");
+    }
+
+    private void onClientDeath(ClientDeathEvent event) {
+        if (reequipActive) {
+            debugRecorder.record("reequip_interrupted", "reason=player_died");
+            if (retriever.isActive()) retriever.stop();
+            resetKeepReequip();
+        }
+        stopAfterBotDeath();
+    }
+
+    private boolean stopAfterBotDeath() {
+        if (organizer == null || !organizer.isActive()) return false;
+        resetFoodContingency();
+        organizer.abortAfterPlayerDeath();
+        organizerPreemptionGate.reset();
+        organizerPickupRecoveryDeferred = false;
+        debugRecorder.record("organize_player_died",
+                "disposition=terminal_checkpoint_manual_reconciliation_required");
+        return true;
+    }
+
+    private void probeFoodSafety() {
+        if (++foodSafetyProbeTicks < 20) return;
+        foodSafetyProbeTicks = 0;
+        boolean active = activeResumableJob() != JobContinuanceManager.Job.NONE;
+        boolean alive = CACHE.getPlayerCache().getThePlayer().isAlive();
+        int hunger = CACHE.getPlayerCache().getThePlayer().getFood();
+        if (!shouldProbeFoodRefill(active, alive,
+                foodContingencyJob != JobContinuanceManager.Job.NONE,
+                hunger, CONFIG.client.extra.autoEat.hungerThreshold)) return;
+        FoodContingencyPolicy.Plan plan = currentFoodContingencyPlan();
+        if (plan != null && plan.hasFood()) return;
+        requestFoodContingency("live_food_empty");
+    }
+
+    static boolean shouldProbeFoodRefill(boolean jobActive, boolean alive,
+                                         boolean alreadyHandling, int hunger, int autoEatThreshold) {
+        return jobActive && alive && !alreadyHandling
+                && hunger <= Math.max(14, autoEatThreshold);
     }
 
     private void requestFoodContingency(String trigger) {
@@ -1249,7 +1576,7 @@ public class StashManagerModule extends Module {
             foodContingencyJob = liveJob;
         }
         if (foodContingencyJob == JobContinuanceManager.Job.NONE) {
-            foodContingencyRequested = false;
+            resetFoodContingency();
             return false;
         }
         if (!isFoodContingencyJobActive()) {
@@ -1289,6 +1616,9 @@ public class StashManagerModule extends Module {
 
         if (foodContingencyBlocked) {
             holdFoodContingencyGate();
+            if (foodContingencyBlockedElapsedTicks < Integer.MAX_VALUE) {
+                foodContingencyBlockedElapsedTicks++;
+            }
             if (++foodContingencyBlockedRecheckTicks >= 20) {
                 foodContingencyBlockedRecheckTicks = 0;
                 if ("retrieval_container_close_unverified".equals(
@@ -1297,9 +1627,30 @@ public class StashManagerModule extends Module {
                     return true;
                 }
                 FoodContingencyPolicy.Plan plan = currentFoodContingencyPlan();
-                if (plan != null && plan.hasFood()) completeFoodContingency(plan, "manual_food_available");
+                if (plan != null && plan.hasFood()) {
+                    completeFoodContingency(plan, "manual_food_available");
+                } else if (plan != null && plan.configured() && plan.needsRefill()
+                        && FoodContingencyRetryPolicy.shouldRetry(
+                                foodContingencyTerminalReason,
+                                foodContingencyBlockedElapsedTicks,
+                                foodContingencyBlockedRetryCount,
+                                !isBotOutsideScanEnvelope(),
+                                Proxy.getInstance().isConnected()
+                                        && !Proxy.getInstance().hasActivePlayer(),
+                                !isSharedAutomationBusy())) {
+                    foodContingencyBlocked = false;
+                    foodContingencyRequested = true;
+                    foodContingencyBlockedElapsedTicks = 0;
+                    foodContingencyBlockedRetryCount++;
+                    debugRecorder.record("food_contingency_retry_armed",
+                            "job=" + foodContingencyJob.name().toLowerCase()
+                                    + ", previous_reason=" + foodContingencyTerminalReason
+                                    + ", retry=" + foodContingencyBlockedRetryCount
+                                    + "/" + FoodContingencyRetryPolicy.MAX_RETRIES
+                                    + ", disposition=retry_from_live_inventory_near_stash");
+                }
             }
-            return foodContingencyBlocked;
+            return true;
         }
 
         if (!foodContingencyRequested) return false;
@@ -1342,7 +1693,8 @@ public class StashManagerModule extends Module {
     }
 
     private boolean foodContingencyMustBlock() {
-        return "autoeat_out_of_food".equals(foodContingencyTrigger);
+        return "autoeat_out_of_food".equals(foodContingencyTrigger)
+                || "live_food_empty".equals(foodContingencyTrigger);
     }
 
     private void skipFoodContingency(String reason) {
@@ -1355,9 +1707,13 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyBlockedElapsedTicks = 0;
+        foodContingencyBlockedRetryCount = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
+        foodContingencyRetrievalStarted = false;
         foodContingencyCloseGate.reset();
+        restoreAutoEatWarning();
         foodContingencyTerminalReason = "none";
         foodContingencyJob = JobContinuanceManager.Job.NONE;
     }
@@ -1375,6 +1731,10 @@ public class StashManagerModule extends Module {
     }
 
     private boolean startFoodContingencyRetrieval(FoodContingencyPolicy.Plan plan) {
+        if (isBotOutsideScanEnvelope()) {
+            blockFoodContingency("bot_outside_stash_region");
+            return true;
+        }
         if (database == null || !database.isInitialized()) {
             blockFoodContingency("database_unavailable");
             return true;
@@ -1391,6 +1751,8 @@ public class StashManagerModule extends Module {
 
         foodContingencyRequested = false;
         foodContingencyActive = true;
+        foodContingencyRetrievalStarted = true;
+        muteAutoEatWarning();
         foodContingencyTerminalReason = "retrieval_not_started";
         debugRecorder.record("food_contingency_started",
                 "job=" + foodContingencyJob.name().toLowerCase()
@@ -1405,7 +1767,11 @@ public class StashManagerModule extends Module {
                 config.pos1,
                 config.pos2,
                 getReservedContainerKeys(),
-                true);
+                true,
+                foodContingencyJob == JobContinuanceManager.Job.ORGANIZE && organizer != null
+                        ? organizer.getReconciliationStation() : null,
+                foodContingencyJob == JobContinuanceManager.Job.ORGANIZE && organizer != null
+                        ? organizer.getReconciliationWorksite() : null);
         if (!started && foodContingencyActive) {
             foodContingencyActive = false;
             StashRetriever.StartFailureReason failure = retriever.getLastStartFailureReason();
@@ -1433,7 +1799,8 @@ public class StashManagerModule extends Module {
     private FoodContingencyPolicy.Plan currentFoodContingencyPlan() {
         if (database == null || !database.isInitialized()) return null;
         try {
-            return FoodContingencyPolicy.plan(database.loadKeepItems(), playerInventoryCounts());
+            return FoodContingencyPolicy.plan(
+                    database.loadKeepItems(), playerInventoryCounts(), this::autoEatAccepts);
         } catch (Exception e) {
             debugRecorder.record("food_contingency_keep_load_failed",
                     "Could not load keep-list food targets", e);
@@ -1524,23 +1891,35 @@ public class StashManagerModule extends Module {
 
     private void completeFoodContingency(
             FoodContingencyPolicy.Plan plan, String reason) {
+        JobContinuanceManager.Job completedJob = foodContingencyJob;
+        boolean retrieved = foodContingencyRetrievalStarted;
         info("Food contingency satisfied with {} safe kept food item(s); resuming {} after cooldown",
-                plan.currentFoodUnits(), foodContingencyJob.name().toLowerCase());
+                plan.currentFoodUnits(), completedJob.name().toLowerCase());
         debugRecorder.record("food_contingency_completed",
-                "job=" + foodContingencyJob.name().toLowerCase()
+                "job=" + completedJob.name().toLowerCase()
                         + ", reason=" + reason
                         + ", food_units=" + plan.currentFoodUnits()
                         + ", remaining_refill=" + plan.requested());
+        if (retrieved && completedJob == JobContinuanceManager.Job.ORGANIZE
+                && !"manual_food_available".equals(reason)) {
+            notifications.sendFoodContingencyRecovered(
+                    "organize", plan.currentFoodUnits(),
+                    Math.max(1, config.scanPreemptionCooldownSeconds));
+        }
         foodContingencyRequested = false;
         foodContingencyActive = false;
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyBlockedElapsedTicks = 0;
+        foodContingencyBlockedRetryCount = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
+        foodContingencyRetrievalStarted = false;
         foodContingencyCloseGate.reset();
         foodContingencyTerminalReason = "none";
         foodContingencyJob = JobContinuanceManager.Job.NONE;
+        restoreAutoEatWarning();
     }
 
     private void blockFoodContingency(String reason) {
@@ -1550,6 +1929,7 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = true;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyBlockedElapsedTicks = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
         foodContingencyCloseGate.reset();
@@ -1592,18 +1972,88 @@ public class StashManagerModule extends Module {
         foodContingencyBlocked = false;
         foodContingencyVerificationTicks = 0;
         foodContingencyBlockedRecheckTicks = 0;
+        foodContingencyBlockedElapsedTicks = 0;
+        foodContingencyBlockedRetryCount = 0;
         foodContingencyStartRetryTicks = 0;
         foodContingencyCleanupPending = false;
+        foodContingencyRetrievalStarted = false;
         foodContingencyCloseGate.reset();
         foodContingencyTrigger = "none";
         foodContingencyTerminalReason = "none";
         foodContingencyJob = JobContinuanceManager.Job.NONE;
+        restoreAutoEatWarning();
+    }
+
+    private boolean autoEatAccepts(String itemId) {
+        if (itemId == null || itemId.isBlank()) return false;
+        Object autoEat = CONFIG.client.extra.autoEat;
+        try {
+            Object mode = autoEat.getClass().getField("mode").get(autoEat);
+            Object configuredFoods = autoEat.getClass().getField("foods").get(autoEat);
+            boolean listed = false;
+            if (configuredFoods instanceof Iterable<?> foods) {
+                for (Object configuredFood : foods) {
+                    if (itemId.equals(ItemIdentifier.baseItemId(
+                            String.valueOf(configuredFood)))) {
+                        listed = true;
+                        break;
+                    }
+                }
+            }
+            return switch (String.valueOf(mode)) {
+                case "BLACKLIST" -> !listed;
+                case "WHITELIST" -> listed;
+                default -> true;
+            };
+        } catch (ReflectiveOperationException | SecurityException ignored) {
+            // Older Zenith targets only expose the legacy all-food behavior.
+            return true;
+        }
+    }
+
+    private void muteAutoEatWarning() {
+        if (autoEatWarningMuted) return;
+        autoEatWarningBeforeMute = CONFIG.client.extra.autoEat.warning;
+        CONFIG.client.extra.autoEat.warning = false;
+        autoEatWarningMuted = true;
+        debugRecorder.record("food_contingency_autoeat_warning_muted",
+                "previous=" + autoEatWarningBeforeMute);
+    }
+
+    private void restoreAutoEatWarning() {
+        if (!autoEatWarningMuted) return;
+        CONFIG.client.extra.autoEat.warning = autoEatWarningBeforeMute;
+        autoEatWarningMuted = false;
+        debugRecorder.record("food_contingency_autoeat_warning_restored",
+                "restored=" + autoEatWarningBeforeMute);
     }
 
     private void onTick(ClientBotTick event) {
         // Tick TravelManager independently (it manages its own state)
         com.zenith.plugin.stashmanager.travel.TravelManager.get().tick();
         tunnelNetworkSyncWorker.tick();
+
+        if (!CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            if (reequipActive) {
+                if (retriever.isActive()) retriever.stop();
+                resetKeepReequip();
+            }
+            if (stopAfterBotDeath()) return;
+        }
+        if (reequipActive
+                && CACHE.getPlayerCache().getThePlayer().getFood()
+                    <= (reequipFoodPhase ? 6 : 14)
+                && playerInventoryCounts().keySet().stream().noneMatch(id -> {
+                    var foodData = FoodRegistry.REGISTRY.get(id);
+                    return foodData != null && foodData.isSafeFood() && autoEatAccepts(id);
+                })) {
+            // Retrieval has no durable checkpoint. Stop before hunger turns a restock into
+            // another death; the command can be retried from live inventory after food arrives.
+            finishKeepReequip(false, "food_exhausted_during_reequip");
+            if (retriever.isActive()) retriever.stop();
+            return;
+        }
+        probeFoodSafety();
 
         if (tickFoodContingency()) return;
 
@@ -1639,6 +2089,11 @@ public class StashManagerModule extends Module {
 
         if (retriever.isActive()) {
             retriever.tick();
+            return;
+        }
+
+        if (reequipActive) {
+            tickKeepReequip();
             return;
         }
 
@@ -2914,6 +3369,19 @@ public class StashManagerModule extends Module {
         // Keep successful transitions too. Long headless jobs need a usable baseline even when
         // nothing has failed yet, especially before a pause/resume handoff.
         debugRecorder.record(event, formatPayloadDetail(payload));
+        if (reequipActive && reequipRequestName.equals(stringValue(payload, "request_name"))) {
+            if ("retrieve_completed".equals(event) || "retrieve_incomplete".equals(event)) {
+                reequipRetrievalDone = true;
+                reequipPartial |= "retrieve_incomplete".equals(event);
+                reequipRetrievalResult = reequipFoodPhase
+                        ? "food:" + event
+                        : reequipRetrievalResult.startsWith("food:")
+                            ? reequipRetrievalResult + ",gear:" + event : event;
+                reequipWaitTicks = 0;
+            } else if ("retrieve_stopped".equals(event)) {
+                resetKeepReequip();
+            }
+        }
         if (foodContingencyEvent) {
             if ("retrieve_completed".equals(event)
                     || "retrieve_incomplete".equals(event)

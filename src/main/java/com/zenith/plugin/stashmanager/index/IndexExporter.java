@@ -1,5 +1,7 @@
 package com.zenith.plugin.stashmanager.index;
 
+import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+
 import java.io.ByteArrayOutputStream;
 import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
@@ -57,11 +59,36 @@ public class IndexExporter {
 
     // Convert a Minecraft item ID to a human-readable name (title case, no prefix).
     public static String toReadableName(String itemId) {
-        String base = itemId;
-        if (base.startsWith("minecraft:")) {
-            base = base.substring("minecraft:".length());
+        String normalized = ItemIdentifier.normalizeItemId(itemId);
+        if (normalized == null || normalized.isBlank()) return "Unknown Item";
+        if (normalized.startsWith("profile:")) {
+            return "Profile · " + titleCase(normalized.substring("profile:".length()));
         }
-        String[] words = base.split("_");
+        String base = ItemIdentifier.baseItemId(normalized);
+        String readable = titleCase(base);
+        int bracket = normalized.indexOf('[');
+        if (bracket < 0 || !normalized.endsWith("]")) return readable;
+
+        String variants = normalized.substring(bracket + 1, normalized.length() - 1);
+        String details = java.util.Arrays.stream(variants.split(","))
+                .map(IndexExporter::readableVariant)
+                .collect(java.util.stream.Collectors.joining(", "));
+        return details.isBlank() ? readable : readable + " · " + details;
+    }
+
+    private static String readableVariant(String variant) {
+        String[] parts = variant.split("=", 2);
+        String name = titleCase(parts[0]);
+        if (parts.length < 2) return name;
+        try {
+            return name + " " + romanNumeral(Integer.parseInt(parts[1]));
+        } catch (NumberFormatException ignored) {
+            return name + " " + parts[1];
+        }
+    }
+
+    private static String titleCase(String id) {
+        String[] words = id.split("_");
         StringBuilder sb = new StringBuilder();
         for (String word : words) {
             if (!word.isEmpty()) {
@@ -71,6 +98,22 @@ public class IndexExporter {
             }
         }
         return sb.toString();
+    }
+
+    private static String romanNumeral(int level) {
+        return switch (level) {
+            case 1 -> "I";
+            case 2 -> "II";
+            case 3 -> "III";
+            case 4 -> "IV";
+            case 5 -> "V";
+            case 6 -> "VI";
+            case 7 -> "VII";
+            case 8 -> "VIII";
+            case 9 -> "IX";
+            case 10 -> "X";
+            default -> Integer.toString(level);
+        };
     }
 
     private static String escapeCsv(String value) {

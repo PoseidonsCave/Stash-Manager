@@ -37,6 +37,21 @@ record InventoryTransferEvidence(int itemId, DataComponents components, int requ
                 evidence.receiverUnits(window), evidence.playerUnits(window), false);
     }
 
+    static InventoryTransferEvidence partialTake(
+            Container window,
+            int containerSlots,
+            int sourceSlot,
+            int requestedAmount) {
+        ItemStack source = window.getItemStack(sourceSlot);
+        var evidence = new InventoryTransferEvidence(
+                source.getId(), components(source).clone(), Math.max(0, requestedAmount),
+                containerSlots, containerSlots + 36, 0, 0, true);
+        return new InventoryTransferEvidence(
+                evidence.itemId, evidence.components, evidence.requestedAmount,
+                evidence.receiverStart, evidence.receiverEnd,
+                evidence.receiverUnits(window), evidence.playerUnits(window), true);
+    }
+
     boolean matches(ItemStack stack) {
         return stack != null && stack.getAmount() > 0 && stack.getId() == itemId
                 && components.equals(components(stack));

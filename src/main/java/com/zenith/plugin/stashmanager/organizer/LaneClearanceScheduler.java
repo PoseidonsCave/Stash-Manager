@@ -1,7 +1,7 @@
 package com.zenith.plugin.stashmanager.organizer;
 
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
-import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.orchestration.StorageClassPolicy;
 
 import java.util.Collection;
 import java.util.HashMap;
@@ -51,11 +51,12 @@ final class LaneClearanceScheduler {
         if (task.alreadyInInventory()) return false;
         String owner = owners.get(inventory(task.source()));
         return owner != null && (task.mixedDecomposition()
-                || !ItemIdentifier.contentItemIdsMatch(owner, storageClass(task)));
+                || !StorageClassPolicy.sameClass(owner, storageClass(task)));
     }
 
     private static String storageClass(StashOrganizer.MoveTask task) {
-        return task.shulkerContentFilter() == null ? task.itemId() : task.shulkerContentFilter();
+        return StorageClassPolicy.route(task.shulkerContentFilter() == null
+                ? task.itemId() : task.shulkerContentFilter());
     }
 
     private long inventory(int[] position) {

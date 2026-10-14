@@ -36,6 +36,11 @@ public class StashManagerConfig {
     public int organizerWalkTimeoutTicks = 1200;
     // Minimum loose item count to justify packing into a shulker box
     public int condenseMinItems = 1;
+    // Opt-in: craft an empty box only when no usable packing box is available.
+    public boolean craftShulkersEnabled = false;
+    // Only these extra, explicitly assigned chests may supply crafting ingredients outside
+    // the organizer's managed lanes/imports. They are not general import chests.
+    public List<int[]> craftMaterialChests = new ArrayList<>();
 
     // PostgreSQL database
     public boolean databaseEnabled = false;

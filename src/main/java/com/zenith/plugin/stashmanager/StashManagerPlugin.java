@@ -11,6 +11,7 @@ import com.zenith.plugin.stashmanager.command.StashTunnelCommand;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
 import com.zenith.plugin.stashmanager.update.PluginUpdateService;
 import net.kyori.adventure.text.logger.slf4j.ComponentLogger;
 
@@ -38,6 +39,7 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
         sharedConfig = pluginAPI.registerConfig(BuildConstants.PLUGIN_ID, StashManagerConfig.class);
         var config = sharedConfig;
         sharedUpdateService = new PluginUpdateService(config, sharedLogger);
+        ItemProfiles.install(java.util.List.of());
 
         // Database
         sharedDatabase = new DatabaseManager();

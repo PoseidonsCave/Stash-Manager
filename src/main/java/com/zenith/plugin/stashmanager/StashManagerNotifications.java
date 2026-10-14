@@ -129,6 +129,17 @@ public final class StashManagerNotifications {
         DISCORD.sendEmbedMessage(embed);
     }
 
+    public void sendFoodContingencyRecovered(String job, int foodUnits, int cooldownSeconds) {
+        var embed = Embed.builder()
+            .title("Food Restocked")
+            .description("The bot retrieved usable AutoEat food. The saved stash job will resume after its normal cooldown and quiet check.")
+            .addField("Job", job, true)
+            .addField("Food Available", foodUnits, true)
+            .addField("Resume Cooldown", duration(cooldownSeconds), true)
+            .successColor();
+        DISCORD.sendEmbedMessage(embed);
+    }
+
     public void sendProxyControlWarning(@Nullable String playerName, String job,
                                         int graceSeconds, int cooldownSeconds,
                                         boolean temporaryShulkerOutstanding) {
