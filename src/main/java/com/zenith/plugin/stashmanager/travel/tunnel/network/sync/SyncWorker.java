@@ -86,7 +86,7 @@ public final class SyncWorker {
         } catch (Exception e) {
             failureCount++;
             nextSyncAt = Instant.now().plus(backoff());
-            LOGGER.debug("Tunnel sync failed: {}", e.getMessage());
+            LOGGER.debug("Tunnel sync failed ({})", e.getClass().getSimpleName());
         } finally {
             activeSync = null;
         }
@@ -101,7 +101,7 @@ public final class SyncWorker {
             int downloaded = downloadRoutes(repository);
             return SyncResult.success(uploaded, downloaded);
         } catch (Exception e) {
-            return SyncResult.failure(e.getMessage());
+            return SyncResult.failure(e.getClass().getSimpleName());
         }
     }
 

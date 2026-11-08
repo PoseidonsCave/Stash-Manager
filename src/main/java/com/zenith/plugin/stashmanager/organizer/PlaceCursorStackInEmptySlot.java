@@ -35,7 +35,8 @@ final class PlaceCursorStackInEmptySlot implements InventoryAction {
     static boolean canPlace(int containerId, int slotId, Container open, ItemStack cursor) {
         return open != null && open.getContainerId() == containerId
                 && slotId >= 0 && slotId < open.getSize()
-                && open.getItemStack(slotId) == Container.EMPTY_STACK
+                && (open.getItemStack(slotId) == null
+                        || open.getItemStack(slotId).getAmount() <= 0)
                 && cursor != null && cursor.getAmount() > 0;
     }
 }

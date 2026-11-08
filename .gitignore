@@ -4,7 +4,6 @@ bin/
 out/
 *.class
 /test/
-/src/test/
 
 # Gradle
 .gradle/
@@ -40,6 +39,7 @@ replay_pid*
 /versions/*/log/
 /plugins/config/stash-manager-organizer-plan.json
 /plugins/config/stash-manager-organizer-checkpoint.json
+/plugins/config/stash-manager-kit-fulfillment-checkpoint.json
 
 # Temporary files
 *.bak

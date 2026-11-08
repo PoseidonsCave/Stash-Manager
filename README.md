@@ -85,7 +85,9 @@ uses a qualifying GitHub plan.
 
 ## 🎮 Commands
 
-All commands work through **Discord**, the **terminal**, and **in game chat**.
+Commands are available through **Discord**, the **terminal**, and **in game chat**. If your
+Minecraft client rejects a region command before sending it to the proxy, use the terminal
+instructions in Saved regions below.
 
 ### 🔎 Scanning
 
@@ -93,7 +95,9 @@ All commands work through **Discord**, the **terminal**, and **in game chat**.
 |---------|-------------|
 | `stash pos1 [x y z]` | Set scan region corner 1 (defaults to player position) |
 | `stash pos2 [x y z]` | Set scan region corner 2 (defaults to player position) |
-| `stash scan` | Start scanning containers in the defined region |
+| `stash scan` | Scan pos1/pos2 only when no named regions are saved |
+| `stash scan <name>` | Scan one saved region without changing pos1/pos2 |
+| `stash scan all` | Scan saved regions one at a time, in name order |
 | `stash stop` | Stop the active scan |
 | `stash update` | Check GitHub releases and stage the latest JAR for the next restart |
 | `stash update check` | Check whether a newer release exists without downloading it |
@@ -104,7 +108,7 @@ All commands work through **Discord**, the **terminal**, and **in game chat**.
 | Command | Description |
 |---------|-------------|
 | `stash list [page]` | Paginated list of indexed containers |
-| `stash export` | Export index to CSV (file attachment in Discord) |
+| `stash export` | Account-owner-only export of the full index to CSV (file attachment in Discord; contains coordinates and items) |
 | `stash clear` | Clear the memory index while keeping region positions |
 | `stash clearall` | Clear both memory index and database |
 | `stash summary` | Detailed index summary with item type breakdown |
@@ -126,7 +130,45 @@ All commands work through **Discord**, the **terminal**, and **in game chat**.
 | `stash region save <name>` | Save the current pos1/pos2 as a named region |
 | `stash region load <name>` | Load a saved region into pos1/pos2 |
 | `stash region list` | List all saved regions |
+| `stash region role <name> <default|storage|intake|scan-only>` | Set or clear a region's specialized role |
 | `stash region delete <name>` | Delete a saved region |
+
+If Minecraft shows `Incorrect argument` immediately after `/stash region`, use the
+ZenithProxy terminal for region setup and checks. Enter commands without the leading `/`,
+for example `stash region list` and `stash region role warehouse storage`. The saved regions
+live on the proxy, not in the Minecraft client; a client syntax error does not mean a saved
+region was deleted. The terminal path is verified. Discord may also work, but its region
+commands have not yet been verified with the affected client setup.
+
+When saved regions exist, choose one with `stash scan <name>` or run `stash scan all`.
+Each region gets its own scan result. A failed or partial scan stops an `all` run; it does not
+mark the remaining regions complete. The bot must start within 128 blocks of the first named
+region and each next region. Scanning indexes containers, including barrels; it does not
+assign farm or trading-hall storage to an organization lane. Use chest blacklists for
+inventories that should stay out of organization jobs.
+
+New regions have no specialized role and behave as all-purpose storage for single-region
+organization. Existing `scan-only` roles remain scan-only until explicitly changed;
+`stash region role <name> default` clears a role. Mark a dedicated destination area
+`storage`; mark source areas `intake` only if their registered import chests may feed storage.
+When one explicit storage region exists, lane reports and API capacity checks use it even
+if pos1/pos2 currently point to an intake region. Use `stash organize <name>` to select an
+all-purpose or storage region for the actual job; it stays selected for restart recovery.
+If any explicit storage region exists, unassigned regions cannot be used as organize
+destinations until given the storage role; their chests are not counted as spare lanes.
+Bare `stash organize` works only when no saved regions exist. Stacked chest banks may be
+recognized as vertical lanes, but a scan alone does not authorize an organize job: review
+the lane report, staging imports, and exclusions first.
+For cross-region routing, assign one destination region the `storage` role and each source
+region the `intake` role, then register the source chests with `stash import` while
+that intake region is selected. Run a complete scan of each participating region before
+`stash organize all <storage-region>`. The job reads registered import chests from **every**
+intake region that has them, plans destination lanes only in the named storage region,
+and pins those exact sources in its restart checkpoint. An intake region with no
+registered imports contributes nothing; unregistered chests, barrels, scan-only regions,
+and other saved regions are not drained. Both halves of an import double chest must be
+scanned and registered inside the same intake region. If you add another intake point
+later, scan it before starting a new job; an in-progress job does not silently expand.
 
 ### 🎒 Kits and retrieval
 
@@ -144,6 +186,19 @@ one slot per stack, while tools, armor, and other non-stackable items use one sl
 | `stash kit profile <name> <profile_name> <count>` | Ask for equipment matching a saved profile |
 | `stash kit output <name>` | Assign the faced registered export chest to a draft |
 | `stash kit finish <name>` | Validate capacity and mark a draft ready |
+| `stash kit crafting <name> [on|off]` | View or save the per-kit, off-by-default missing-stock crafting preference (planning only for now) |
+| `stash kit build <name> <count>` | Build and deliver boxes one at a time after a healthy scan and stock check |
+| `stash kit job` | Show build or recovery status |
+| `stash kit diagnose` | Owner-only, opt-in read-only checkpoint, live bot pose, shell identity, and exact indexed source/access report |
+| `stash kit diagnose <x> <y> <z>` | Owner-only, opt-in capture of one target's live block/reach geometry for `stash debug geometry export` |
+| `stash kit diagnosevariant <raw_slot>` | Owner-only, opt-in first-failed-guard and component-order comparison for a stopped variant exchange; does not audit or resume |
+| `stash kit stop` | Pause a build and check for a placed box before more work |
+| `stash kit recover` | Retry cleanup of a journaled shulker worksite |
+| `stash kit resume` | Schedule a safe paused build to continue after the configured cooldown |
+| `stash kit reconcileinventory preview` | Read-only route and shulker-content review for inventory that kit preflight would reject |
+| `stash kit reconcileinventory` | Start a checkpointed, inventory-only handoff of non-kept items before a new kit or at the reviewed old-kit no-cargo boundary |
+| `stash kit auditcargo <slot> <count>` | Recover a partial withdrawal only after confirming the exact loose stack and raw inventory slot |
+| `stash kit discard confirm` | Clear a checkpoint only after its world boxes are resolved and cargo is checked |
 | `stash kit list` | List all saved kits |
 | `stash kit show <name>` | Show the saved contents of a kit |
 | `stash kit snapshot <name>` | Save the player's current main inventory as a kit |
@@ -155,9 +210,43 @@ one slot per stack, while tools, armor, and other non-stackable items use one sl
 | `stash get status` | Show retrieval progress and remaining items |
 | `stash get stop` | Stop the active retrieval task |
 
-The wizard persists the recipe and intended output chest. The current retrieval command still
-collects items into the bot inventory; automatic shulker assembly and delivery will consume these
-ready definitions in the fulfillment runtime rather than silently pretending delivery happened.
+`stash get kit` still retrieves ingredients into the bot inventory. `stash kit build` is the
+experimental physical packing flow: it borrows an empty shulker, fetches one ingredient type at a
+time, verifies each transfer, and deposits the finished box in its reserved export chest. Keep
+AutoEat stocked and leave the proxy unattended during the build. After a restart or temporary
+interruption, a clean between-items checkpoint waits through the configured cooldown and a quiet
+window, then continues automatically. A submitted click, placed box, or uncertain export still
+pauses for recovery and cargo review; it never blindly replays an ingredient move. `stash kit stop`
+cancels automatic resumption. Use `stash kit resume` only after reviewing a safe paused checkpoint.
+
+Before a new kit build, use `stash kit reconcileinventory preview` if preflight reports
+unexpected inventory slots. The guarded inventory-only handoff leaves configured keep supplies
+untouched, verifies the live item and destination for each transfer, routes items with saved lane
+assignments to those lanes, and stages unassigned shulkers intact in registered import chests.
+Loose items without a lane must first be packed into single-item-type shulkers before import.
+The handoff writes its own organizer checkpoint and never plans source withdrawals from the stash
+scan. An existing kit checkpoint is accepted only at its reviewed borrowed-source no-cargo
+boundary, where its exact owned shell stays pinned. Do not start a new kit until the handoff is
+complete and a fresh inventory preview contains only kept supplies.
+
+Missing-stock kit crafting is off by default and separate from the organizer's shulker-crafting
+setting. The current opt-in records a per-kit preference and checks the explicitly supported
+respawn-anchor recipe (six crying obsidian and three glowstone), reserving direct kit demand before
+counting crafting ingredients. It does **not** yet move ingredients or operate a crafting table:
+`stash kit build` refuses a shortage even when ingredients and an assigned table are indexed. This
+fail-closed stage prevents the bot from starting a kit it cannot finish; physical crafting and
+restart recovery must be completed before using the option to build missing stock.
+
+Kit completion means the saved recipe was packed exactly; it does not imply that all 27 slots are
+occupied. Use `stash kit show <name>` to check the slot count before building. A combat-ready
+`cpvp` recipe can devote slots to enchanted armor, weapons, elytra, totems, crystals, rockets,
+enchanted golden apples, XP bottles, obsidian, and pearls; `replenishment` can devote its slots to
+consumables instead of duplicate gear. A separate `armor_regear` recipe can carry multiple gear
+sets. For full-use presets, verify **27/27 slots** and sufficient scanned stock for the requested
+number of boxes. Changing a saved recipe does not alter boxes already delivered, and stock moved
+after the last scan needs a fresh scan before a new build.
+If retrieval stops after moving only part of a stack, leave the inventory unchanged. An operator can
+use `stash kit auditcargo` to verify one exact stack before the bot packs it and fetches the rest.
 
 #### Equipment profiles
 
@@ -212,11 +301,16 @@ to locate shell and chest supplies in storage.
 
 Run `stash crafting on` to let organization make an empty shulker when its usable box search is
 exhausted. This is off by default. The bot takes exactly two loose shulker shells and one chest
-item from scanned chests inside the selected stash region or unprotected inventory, uses an
-assigned crafting table's 3×3 grid, verifies the resulting box, then resumes packing. The
-chest does not need an import or crafting-material assignment. It will not mine a placed storage
-chest for the recipe. `stash crafting materials add` is optional for a scanned non-chest source
-such as a barrel; use `stash crafting materials list` or `stash crafting materials remove` to
+item from scanned chests or placed shulkers inside the selected stash region, or unprotected
+inventory, uses an assigned crafting table's 3×3 grid, verifies the resulting box, then resumes
+packing. No source assignment is needed. The bot will not mine a placed storage chest or
+user-placed shulker for the recipe, and it will not use its temporary packing worksite as a
+direct supply source.
+If loose chest items run out, it can unpack one indexed chest-only shulker into registered import
+storage through the same verified reconciliation worksite, then use those loose chests for crafting.
+It checks import room before selecting the box and keeps the remaining chest shulkers boxed.
+`stash crafting materials add` is optional for another scanned source such as a barrel; use
+`stash crafting materials list` or `stash crafting materials remove` to
 review or undo that assignment. Only shells and chest items are taken. Bot supply chests,
 keep-list inventory slots, and blacklisted/export chests are excluded. If the
 materials or table cannot be verified, the normal import-staging fallback remains in charge.
@@ -261,6 +355,8 @@ The bot needs to be in the stash with no player controlling the proxy before it 
 | Command | Description |
 |---------|-------------|
 | `stash organize` | Start sorting items across containers by type |
+| `stash organize <region>` | Organize a single saved storage/all-purpose region |
+| `stash organize all <storage-region>` | Route registered imports from every intake region into one storage region |
 | `stash organize stop` | Stop the organizer during a run |
 | `stash organize resume` | Arm a saved restart checkpoint for its normal cooldown and resume checks |
 | `stash organize discard confirm` | Permanently discard a saved plan and queue without moving game items |
@@ -337,6 +433,16 @@ split across several chests. It no longer pairs every item type with every stagi
 connection drops during a deposit, only that attempted item/chest pair needs a cautious recheck.
 Older checkpoints remain usable; already queued work is retained, and an older mixed box in progress
 uses its conservative fallback until that box is finished.
+
+After ordinary sorting and loose-item packing, the organizer also checks for partially filled
+shulkers holding the **same exact item**. When the scanned stack slots of two boxes fit within
+one 27-slot box, it drains one donor through the same verified worksite and packs that cargo
+before picking another donor. It only selects boxes refreshed by the latest complete scan;
+failed scan targets and older snapshots are left untouched. Every source is checked against
+its live contents before pickup, and the donor attempt is kept in the restart checkpoint.
+This is a bounded pass, not permission to mix different item profiles or to empty a box merely
+because it looks sparse. A completion message reports unresolved scan targets and remaining
+partial-box candidates, so finishing the task queue is not presented as a verified clean stash.
 
 Import capacity is checked from the live container window for the exact cargo being moved. Recent
 checks help the bot go straight to a chest with usable space, including compatible partial stacks.
@@ -419,6 +525,39 @@ stalled recovery stops sooner. The budget survives pauses and restarts. If it ru
 its cargo and queue; clear access to the worksite before resuming. Console/debug
 events named `organize_station_walk_*` show distance, idle time, attempts, and path-request status.
 
+Ordinary organizer travel also disables Baritone block placement and breaking. Repeated no-path
+results, or an unexpected drop below the starting floor on an upward cargo trip, stop the job with
+its cargo checkpoint intact. A base with a known staircase/ladder approach may set the optional
+`organizerVerticalWaypoint` in `stash-manager.json` to a verified walkable `[x, y, z]` cell. Nearby
+upward cargo trips visit that cell before pathing to their destination; an unloaded or unsafe cell
+stops the job rather than falling back to the direct route. This is a site-specific route hint, not
+permission to mine or bridge.
+For multi-floor layouts, `organizerVerticalWaypoints` supersedes the single waypoint and visits
+ordered verified standing cells, such as a ladder foot, its upper-floor exit, and the next ladder.
+Set `organizerVerticalRouteDestination` to the exact `[x, y, z]` chest for this route; without
+that match the staged route is inactive, so one tower's ladder hints cannot affect other jobs.
+Each cell becomes a separate exact path goal; a resumed checkpoint skips stages below its current
+floor. The bot checks each stage's footing and headroom, forbids block placement, and stops with
+cargo preserved if a stage is unsafe or unreachable. Configure this only after observing the
+actual route in-world; no floor transition is inferred from a chest's height alone.
+For a bank of chests reached by the same stairs or ladders, use `organizerVerticalRoutes`
+instead of repeating an exact destination. Each rule has a required `dimension`, an inclusive `originYRange`
+`[minY,maxY]`, inclusive `targetBounds` `[minX,minY,minZ,maxX,maxY,maxZ]`, and ordered
+`waypoints` (`[[x,y,z], ...]`). A rule applies only to upward cargo trips starting in its
+Y range and ending inside its bounded chest bank. The first matching rule wins; an invalid
+matching route stops with cargo rather than using an unverified shortcut. A rule's final
+waypoint may be slightly above a chest so the bot can walk down to it, but the floor-drop
+guard still forbids a descent below the destination floor. Keep bounds narrow and verify
+every standing cell in-world. Like MOAR's queued waypoint navigation, this stages Baritone's
+goals; it does not automatically discover ladders or permit block placement.
+
+If a chest in an assigned storage lane cannot be reached or opened after bounded retries,
+the organizer keeps the acquired cargo in inventory and tries the next distinct chest in
+that same lane. It saves the changed destination before walking, so a restart cannot send
+the cargo back to the obstructed chest. It never treats another storage class or an
+unregistered chest as an equivalent destination. If all lane chests fail, it stops with
+the cargo and checkpoint preserved for inspection.
+
 Packing boxes are checked for actual stack space before pickup. A box that cannot accept the cargo
 is skipped so the bot can use another matching box or an empty one. Completed boxes go directly to
 their assigned lane, including a box that fills up while more loose cargo remains aboard. The bot
@@ -495,6 +634,28 @@ container moves already completed in the world are not rolled back.
 `connection_recovery_armed`, and the normal job resume event, including the saved state and task
 counts needed to trace a resume.
 
+Detailed diagnostic commands are disabled by default because exports can contain exact stash
+positions and inventory contents. The account owner can run `stash config diagnostics on`
+for a troubleshooting session, then `stash config diagnostics off` afterward. Kit source,
+variant, and open-GUI probes use this same gate. `stash kit cargo` remains available to the
+account owner for guarded recovery audits.
+
+For a stubborn container, run `stash debug pose on` before a scan or organization job. This opt-in
+trace samples the bot's exact position, yaw, and pitch twice a second while a job is active. It also
+records scan click attempts and timeouts with the target block, clicked half, and both the cached
+player look direction and Zenith's requested look direction. Use `stash debug pose recent [count]`
+or `stash debug pose export` to inspect it, then `stash debug pose off` when finished. The pose
+trace has its own bounded log, so it cannot crowd failures out of the normal `stash debug export`.
+`stash debug pose clear` clears only pose traces; tracing is off by default and resets on restart.
+
+When a scan cannot reach or open a container, or organization fails while walking or opening,
+`stash debug geometry export` downloads a separate,
+bounded failure log. Each snapshot includes the bot's position and look direction, the target and
+clicked chest half, nearby chest and hopper coordinates and facing, the six adjacent blocks, and
+whether the target is within reach and visible. Unloaded blocks are marked unknown, not air. Use
+`stash debug geometry recent [count]` for a quick look or `stash debug geometry clear` to reset it.
+The log is captured automatically on those failures; you do not need to turn on pose tracing.
+
 #### Keeping lane assignments stable
 
 Enable PostgreSQL if you want an item to keep the same lane across future runs. Without the
@@ -547,9 +708,11 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config api port <port>` | Set API listen port (1 to 65535) |
 | `stash config api bind <address>` | Set API bind address |
 | `stash config api key <key>` | Set Bearer token for API authentication |
+| `stash config api allowRemoteHttp <on\|off>` | Explicitly permit a non-loopback plain-HTTP bind on the next start |
 | `stash config api threads <count>` | Set HTTP thread pool size (1 to 16) |
 | `stash config api start` | Start the API server |
 | `stash config api stop` | Stop the API server |
+| `stash config diagnostics <on\|off>` | Account-owner-only toggle for detailed debug commands and exports |
 | **Webhook** | |
 | `stash config webhook <url>` | Set webhook URL (use `off` to clear) |
 | **Updates** | |
@@ -582,6 +745,10 @@ Saved automatically via ZenithProxy's plugin config system.
 | `organizerClickCooldownTicks` | `6` | Ticks between inventory slot clicks |
 | `organizerOpenTimeoutTicks` | `60` | Max wait ticks for container open |
 | `organizerWalkTimeoutTicks` | `1200` | Max walk time for dense storage layouts |
+| `organizerVerticalWaypoint` | `null` | Optional verified `[x, y, z]` stair/ladder approach for nearby upward cargo trips |
+| `organizerVerticalWaypoints` | `null` | Optional ordered `[[x,y,z], ...]` standing cells for a verified multi-floor route; supersedes the single waypoint for its exact destination |
+| `organizerVerticalRouteDestination` | `null` | Exact `[x,y,z]` destination chest allowed to use the staged route |
+| `organizerVerticalRoutes` | `[]` | Optional reusable floor-transition rules, each with `originYRange`, `targetBounds`, and ordered `waypoints`; scope bounds to a verified chest bank |
 | `condenseMinItems` | `1` | Minimum loose items to justify shulker packing |
 
 ### 💾 Database
@@ -599,10 +766,13 @@ Saved automatically via ZenithProxy's plugin config system.
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `apiEnabled` | `false` | Enable the embedded HTTP API |
-| `apiBindAddress` | `0.0.0.0` | Listen address |
+| `apiBindAddress` | `127.0.0.1` | Loopback listen address by default |
 | `apiPort` | `8585` | Listen port |
 | `apiThreads` | `2` | HTTP handler thread pool size |
-| `apiKey` | *(empty)* | Bearer token for authentication (empty = no auth) |
+| `apiKey` | *(empty)* | Bearer token; a nonblank key is required to start the API |
+| `apiAllowRemoteHttp` | `false` | Explicitly opt into non-loopback plain HTTP, only behind a trusted TLS proxy or isolated network |
+| `diagnosticCommandsEnabled` | `false` | Permit owner-only `stash debug` and kit probe commands and exports |
+| `webhookIncludeDetailedPayload` | `false` | Include coordinates, controller names, request names, and raw failure reasons in outbound notifications |
 
 ### 🔔 Webhook
 
@@ -716,7 +886,7 @@ The plugin owns and updates these tables. You do not need to create them by hand
 | `container_items` | Slot, item ID, display name, count per container |
 | `container_shulkers` | Physical shulker slot and color per container, including empty boxes |
 | `scan_history` | Start/end time, container count, status per scan run |
-| `regions` | Named scan regions with pos1/pos2 coordinates |
+| `regions` | Named scan regions, bounds, and optional specialized role |
 | `config` | Plugin configuration keys and values |
 | `storage_chests` | Registered supply chest positions |
 | `keep_items` | Items the organizer should leave in place |
@@ -724,7 +894,7 @@ The plugin owns and updates these tables. You do not need to create them by hand
 | `import_chests` | Explicit organizer intake and temporary staging inventories |
 | `blacklisted_chests` | User-owned inventories excluded from organization and retrieval |
 | `export_chests` | Reserved completed-kit output inventories |
-| `kits` | Kit name, draft/ready status, and selected export chest |
+| `kits` | Kit name, draft/ready status, selected export chest, and off-by-default crafting preference |
 | `kit_items` | Item quantities selected for each kit |
 | `item_profiles` / `item_profile_enchantments` | Named enchantment rules and optional lane routing |
 
@@ -733,7 +903,12 @@ The plugin owns and updates these tables. You do not need to create them by hand
 
 ## 🌐 REST API
 
-When enabled, the API server exposes the following endpoints. All endpoints require a `Authorization: Bearer <apiKey>` header if an API key is configured.
+When enabled, the API server exposes the following endpoints. Every endpoint requires an
+`Authorization: Bearer <apiKey>` header; the server will not start with a blank key. The
+embedded server uses plain HTTP and binds to loopback by default. Existing configurations
+that bind to a non-loopback address must explicitly set `apiAllowRemoteHttp=true` before the
+next restart, and should use a trusted TLS-terminating proxy or isolated network. The detailed
+world/NBT audit is not exposed through HTTP.
 
 ### Endpoints
 

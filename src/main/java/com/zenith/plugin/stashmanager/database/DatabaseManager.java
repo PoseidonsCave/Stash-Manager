@@ -132,6 +132,7 @@ public class DatabaseManager implements AutoCloseable {
                     pos2_x INTEGER NOT NULL,
                     pos2_y INTEGER NOT NULL,
                     pos2_z INTEGER NOT NULL,
+                    role VARCHAR(16),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """);
@@ -227,6 +228,7 @@ public class DatabaseManager implements AutoCloseable {
                 CREATE TABLE IF NOT EXISTS kits (
                     name VARCHAR(128) PRIMARY KEY,
                     status VARCHAR(16) NOT NULL DEFAULT 'ready',
+                    craft_missing BOOLEAN NOT NULL DEFAULT FALSE,
                     export_x INTEGER,
                     export_y INTEGER,
                     export_z INTEGER,
@@ -303,6 +305,11 @@ public class DatabaseManager implements AutoCloseable {
             // running -> complete/aborted so partial snapshots survive restarts as unsafe.
             stmt.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS completion_status VARCHAR(16) NOT NULL DEFAULT 'complete'");
             stmt.execute("ALTER TABLE scan_history ADD COLUMN IF NOT EXISTS identity_version INTEGER NOT NULL DEFAULT 1");
+            stmt.execute("ALTER TABLE regions ADD COLUMN IF NOT EXISTS role VARCHAR(16) NOT NULL DEFAULT 'scan_only'");
+            // An omitted role is all-purpose storage. Preserve legacy scan_only values:
+            // they may have been explicitly chosen, so silently reinterpreting them is unsafe.
+            stmt.execute("ALTER TABLE regions ALTER COLUMN role DROP DEFAULT");
+            stmt.execute("ALTER TABLE regions ALTER COLUMN role DROP NOT NULL");
 
             // Old organizer runs only upserted current assignments, leaving retired item
             // classes pointed at lanes that had since been reassigned. Keep the newest owner
@@ -350,6 +357,7 @@ public class DatabaseManager implements AutoCloseable {
                 )
                 """);
             stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'ready'");
+            stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS craft_missing BOOLEAN NOT NULL DEFAULT FALSE");
             stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS export_x INTEGER");
             stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS export_y INTEGER");
             stmt.execute("ALTER TABLE kits ADD COLUMN IF NOT EXISTS export_z INTEGER");
@@ -566,7 +574,12 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     public List<ContainerEntry> searchContainers(String itemSearch) throws SQLException {
+        return searchContainers(itemSearch, Integer.MAX_VALUE);
+    }
+
+    public List<ContainerEntry> searchContainers(String itemSearch, int limit) throws SQLException {
         if (!initialized) return Collections.emptyList();
+        if (limit < 1) throw new IllegalArgumentException("search limit must be positive");
 
         String sql = """
             SELECT DISTINCT c.id, c.x, c.y, c.z, c.block_type, c.is_double, c.shulker_count, c.scan_timestamp, c.label, c.hopper_facing,
@@ -576,12 +589,14 @@ public class DatabaseManager implements AutoCloseable {
             JOIN container_items ci ON c.id = ci.container_id
             WHERE LOWER(ci.item_id) LIKE ?
             ORDER BY c.scan_timestamp DESC
+            LIMIT ?
             """;
 
         List<ContainerEntry> results = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, "%" + itemSearch.toLowerCase() + "%");
+            ps.setInt(2, limit);
 
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
@@ -735,20 +750,58 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
-    public record SavedRegion(String name, int[] pos1, int[] pos2) {}
+    public enum RegionRole {
+        UNASSIGNED("all_purpose"), SCAN_ONLY("scan_only"), INTAKE("intake"), STORAGE("storage");
+
+        private final String databaseValue;
+
+        RegionRole(String databaseValue) { this.databaseValue = databaseValue; }
+
+        public String databaseValue() { return databaseValue; }
+
+        public boolean isStorageCapable() {
+            return this == UNASSIGNED || this == STORAGE;
+        }
+
+        public static RegionRole fromDatabase(String value) {
+            if (value == null) return UNASSIGNED;
+            for (RegionRole role : values()) {
+                if (role.databaseValue.equals(value)) return role;
+            }
+            return SCAN_ONLY;
+        }
+    }
+
+    public record SavedRegion(String name, int[] pos1, int[] pos2, RegionRole role) {
+        public SavedRegion(String name, int[] pos1, int[] pos2) {
+            this(name, pos1, pos2, RegionRole.UNASSIGNED);
+        }
+    }
+
+    public boolean setRegionRole(String name, RegionRole role) throws SQLException {
+        if (!initialized || role == null) return false;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement("UPDATE regions SET role = ? WHERE name = ?")) {
+            if (role == RegionRole.UNASSIGNED) ps.setNull(1, Types.VARCHAR);
+            else ps.setString(1, role.databaseValue());
+            ps.setString(2, name);
+            return ps.executeUpdate() > 0;
+        }
+    }
 
     public SavedRegion loadRegion(String name) throws SQLException {
         if (!initialized) return null;
 
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(
-                 "SELECT pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z FROM regions WHERE name = ?")) {
+                 "SELECT pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z, role FROM regions WHERE name = ?")) {
             ps.setString(1, name);
             try (ResultSet rs = ps.executeQuery()) {
                 if (!rs.next()) return null;
                 return new SavedRegion(name,
                     new int[]{rs.getInt("pos1_x"), rs.getInt("pos1_y"), rs.getInt("pos1_z")},
-                    new int[]{rs.getInt("pos2_x"), rs.getInt("pos2_y"), rs.getInt("pos2_z")});
+                    new int[]{rs.getInt("pos2_x"), rs.getInt("pos2_y"), rs.getInt("pos2_z")},
+                    RegionRole.fromDatabase(rs.getString("role")));
             }
         }
     }
@@ -759,11 +812,12 @@ public class DatabaseManager implements AutoCloseable {
         List<SavedRegion> regions = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              Statement stmt = conn.createStatement();
-             ResultSet rs = stmt.executeQuery("SELECT name, pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z FROM regions ORDER BY name")) {
+             ResultSet rs = stmt.executeQuery("SELECT name, pos1_x, pos1_y, pos1_z, pos2_x, pos2_y, pos2_z, role FROM regions ORDER BY name")) {
             while (rs.next()) {
                 regions.add(new SavedRegion(rs.getString("name"),
                     new int[]{rs.getInt("pos1_x"), rs.getInt("pos1_y"), rs.getInt("pos1_z")},
-                    new int[]{rs.getInt("pos2_x"), rs.getInt("pos2_y"), rs.getInt("pos2_z")}));
+                    new int[]{rs.getInt("pos2_x"), rs.getInt("pos2_y"), rs.getInt("pos2_z")},
+                    RegionRole.fromDatabase(rs.getString("role"))));
             }
         }
         return regions;
@@ -1383,7 +1437,8 @@ public class DatabaseManager implements AutoCloseable {
             String name,
             KitStatus status,
             Map<String, Integer> items,
-            int[] exportPosition) {
+            int[] exportPosition,
+            boolean craftMissing) {
         public KitDefinition {
             items = items == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(items));
             exportPosition = exportPosition == null ? null : exportPosition.clone();
@@ -1494,22 +1549,36 @@ public class DatabaseManager implements AutoCloseable {
         }
     }
 
+    /** Per-kit opt-in; a draft or missing kit cannot silently acquire this preference. */
+    public boolean setKitCraftMissing(String name, boolean enabled) throws SQLException {
+        if (!initialized) return false;
+        try (Connection conn = dataSource.getConnection();
+             PreparedStatement ps = conn.prepareStatement(
+                     "UPDATE kits SET craft_missing = ?, updated_at = CURRENT_TIMESTAMP WHERE name = ?")) {
+            ps.setBoolean(1, enabled);
+            ps.setString(2, name);
+            return ps.executeUpdate() == 1;
+        }
+    }
+
     public KitDefinition loadKitDefinition(String name) throws SQLException {
         if (!initialized) return null;
         try (Connection conn = dataSource.getConnection()) {
             KitStatus status;
+            boolean craftMissing;
             int[] export;
             try (PreparedStatement ps = conn.prepareStatement(
-                    "SELECT status, export_x, export_y, export_z FROM kits WHERE name = ?")) {
+                    "SELECT status, craft_missing, export_x, export_y, export_z FROM kits WHERE name = ?")) {
                 ps.setString(1, name);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) return null;
                     status = KitStatus.fromDatabase(rs.getString("status"));
+                    craftMissing = rs.getBoolean("craft_missing");
                     export = rs.getObject("export_x") == null ? null : new int[]{
                             rs.getInt("export_x"), rs.getInt("export_y"), rs.getInt("export_z")};
                 }
             }
-            return new KitDefinition(name, status, loadKit(conn, name), export);
+            return new KitDefinition(name, status, loadKit(conn, name), export, craftMissing);
         }
     }
 
@@ -1707,6 +1776,10 @@ public class DatabaseManager implements AutoCloseable {
         recordScanFinished(scanId, found, indexed, failed, "complete");
     }
 
+    public void recordScanPartial(long scanId, int found, int indexed, int failed) throws SQLException {
+        recordScanFinished(scanId, found, indexed, failed, "partial");
+    }
+
     public void recordScanAborted(long scanId, int found, int indexed, int failed) throws SQLException {
         recordScanFinished(scanId, found, indexed, failed, "aborted");
     }
@@ -1774,7 +1847,8 @@ public class DatabaseManager implements AutoCloseable {
         int maxY = Math.max(pos1[1], pos2[1]);
         int maxZ = Math.max(pos1[2], pos2[2]);
         String sql = """
-            SELECT containers_found, containers_indexed, containers_failed, completion_status
+            SELECT containers_found, containers_indexed, containers_failed, completion_status,
+                   (EXTRACT(EPOCH FROM started_at AT TIME ZONE 'UTC') * 1000)::bigint AS started_at_epoch_milli
             FROM scan_history
             WHERE LEAST(region_pos1_x, region_pos2_x) = ?
               AND LEAST(region_pos1_y, region_pos2_y) = ?
@@ -1800,12 +1874,14 @@ public class DatabaseManager implements AutoCloseable {
                         rs.getInt("containers_found"),
                         rs.getInt("containers_indexed"),
                         rs.getInt("containers_failed"),
-                        rs.getString("completion_status")));
+                        rs.getString("completion_status"),
+                        rs.getLong("started_at_epoch_milli")));
             }
         }
     }
 
-    public record ScanSummary(int found, int indexed, int failed, String completionStatus) {
+    public record ScanSummary(int found, int indexed, int failed, String completionStatus,
+                              long startedAtEpochMilli) {
         public boolean completed() {
             return "complete".equalsIgnoreCase(completionStatus);
         }

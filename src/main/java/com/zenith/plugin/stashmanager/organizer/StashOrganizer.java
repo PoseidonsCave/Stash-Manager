@@ -26,6 +26,8 @@ import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.StashManagerPlugin;
+import com.zenith.plugin.stashmanager.database.DatabaseManager;
+import com.zenith.plugin.stashmanager.debug.WorldGeometrySnapshot;
 import com.zenith.plugin.stashmanager.util.BaritoneCompat;
 import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
@@ -36,6 +38,9 @@ import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
+import com.zenith.plugin.stashmanager.orchestration.ContainerAccessPlanner;
+import com.zenith.plugin.stashmanager.orchestration.ContainerOpenReach;
+import com.zenith.plugin.stashmanager.orchestration.AlternateApproachProgress;
 import com.zenith.plugin.stashmanager.orchestration.BulkBatchPlanner;
 import com.zenith.plugin.stashmanager.orchestration.DedicatedLaneCapacity;
 import com.zenith.plugin.stashmanager.orchestration.ImportDestinationTracker;
@@ -45,6 +50,7 @@ import com.zenith.plugin.stashmanager.orchestration.LaneStorageCapacity;
 import com.zenith.plugin.stashmanager.orchestration.MixedInventoryRecoveryPlanner;
 import com.zenith.plugin.stashmanager.orchestration.MixedShulkerPlaybook;
 import com.zenith.plugin.stashmanager.orchestration.ProgressMilestones;
+import com.zenith.plugin.stashmanager.orchestration.ScanCompletionPolicy;
 import com.zenith.plugin.stashmanager.organizer.lane.IndexedStorageGeometry;
 import com.zenith.plugin.stashmanager.orchestration.OrganizerOwnershipPolicy;
 import com.zenith.plugin.stashmanager.orchestration.ShulkerWorksitePolicy;
@@ -356,8 +362,123 @@ public final class StashOrganizer {
     private final StashManagerConfig config;
     private final ContainerIndex index;
     private final OrganizerJournalStore journalStore;
+    /** Explicit intake bounds; only registered imports inside them enter a multi-region job. */
+    private List<IntakeRegion> crossRegionIntakes = List.of();
     private InfoCallback infoCallback;
     private BiConsumer<String, Map<String, Object>> eventCallback;
+
+    public record IntakeRegion(String name, int[] pos1, int[] pos2, List<int[]> importBlocks) {
+        public IntakeRegion {
+            if (name == null || name.isBlank() || pos1 == null || pos2 == null
+                    || pos1.length != 3 || pos2.length != 3
+                    || importBlocks == null || importBlocks.isEmpty()) {
+                throw new IllegalArgumentException("Invalid intake region");
+            }
+            pos1 = Arrays.copyOf(pos1, 3);
+            pos2 = Arrays.copyOf(pos2, 3);
+            final int[] boundary1 = pos1;
+            final int[] boundary2 = pos2;
+            importBlocks = importBlocks.stream().map(position -> {
+                if (position == null || position.length != 3
+                        || !contains(boundary1, boundary2, position)) {
+                    throw new IllegalArgumentException("Import block is outside its intake region");
+                }
+                return Arrays.copyOf(position, 3);
+            }).toList();
+        }
+    }
+
+    public boolean configureCrossRegionIntakes(List<IntakeRegion> intakes) {
+        if (isActive() || hasDurableCheckpoint() || intakes == null) return false;
+        crossRegionIntakes = intakes.stream().map(region -> new IntakeRegion(
+                region.name(), region.pos1(), region.pos2(), region.importBlocks())).toList();
+        return true;
+    }
+
+    public int scopedImportChestBlockCount() {
+        if (config.pos1 == null || config.pos2 == null) return 0;
+        return (int) index.getImportChests().stream().filter(pos ->
+                isInRegion(pos[0], pos[1], pos[2]) || isPinnedIntakeImport(pos)).count();
+    }
+
+    public boolean hasScopedImportStaging() {
+        return !scopedImportContainers().isEmpty();
+    }
+
+    public boolean isWithinPinnedIntakeEnvelope(double x, double y, double z,
+                                                double horizontalMargin, double verticalMargin) {
+        return crossRegionIntakes.stream().anyMatch(region ->
+                !com.zenith.plugin.stashmanager.orchestration.ScanNavigationPolicy
+                        .isOutsideRegionEnvelope(x, y, z, region.pos1(), region.pos2(),
+                                horizontalMargin, verticalMargin));
+    }
+
+    /** Safety checks may follow the corridor between pinned regions without admitting new cargo. */
+    public boolean isWithinPinnedRouteTransitEnvelope(double x, double y, double z,
+                                                      double horizontalMargin, double verticalMargin) {
+        if (crossRegionIntakes.isEmpty() || config.pos1 == null || config.pos2 == null) return false;
+        int[] low = new int[3];
+        int[] high = new int[3];
+        for (int axis = 0; axis < 3; axis++) {
+            low[axis] = Math.min(config.pos1[axis], config.pos2[axis]);
+            high[axis] = Math.max(config.pos1[axis], config.pos2[axis]);
+        }
+        for (IntakeRegion intake : crossRegionIntakes) {
+            for (int axis = 0; axis < 3; axis++) {
+                low[axis] = Math.min(low[axis], Math.min(intake.pos1()[axis], intake.pos2()[axis]));
+                high[axis] = Math.max(high[axis], Math.max(intake.pos1()[axis], intake.pos2()[axis]));
+            }
+        }
+        return !com.zenith.plugin.stashmanager.orchestration.ScanNavigationPolicy
+                .isOutsideRegionEnvelope(x, y, z, low, high,
+                        horizontalMargin, verticalMargin);
+    }
+
+    private boolean isPinnedIntakeImport(int[] pos) {
+        return crossRegionIntakes.stream().anyMatch(region -> region.importBlocks().stream()
+                .anyMatch(block -> Arrays.equals(block, pos)));
+    }
+
+    private List<ContainerEntry> scopedImportContainers() {
+        return scopedImportContainers(config.pos1, config.pos2);
+    }
+
+    private List<ContainerEntry> scopedImportContainers(int[] storagePos1, int[] storagePos2) {
+        Map<Long, ContainerEntry> imports = new LinkedHashMap<>();
+        if (storagePos1 != null && storagePos2 != null) {
+            index.getInRegion(storagePos1, storagePos2).stream()
+                    .filter(index::isImportChest)
+                    .forEach(entry -> imports.put(entry.posKey(), entry));
+        }
+        for (IntakeRegion region : crossRegionIntakes) {
+            index.getInRegion(region.pos1(), region.pos2()).stream()
+                    .filter(entry -> index.isImportChest(entry)
+                            && isPinnedIntakeImport(new int[]{entry.x(), entry.y(), entry.z()}))
+                    .forEach(entry -> imports.put(entry.posKey(), entry));
+        }
+        return List.copyOf(imports.values());
+    }
+
+    private List<ContainerEntry> scopedPlanningContainers() {
+        return scopedPlanningContainers(config.pos1, config.pos2);
+    }
+
+    private List<ContainerEntry> scopedPlanningContainers(int[] storagePos1, int[] storagePos2) {
+        Map<Long, ContainerEntry> scoped = new LinkedHashMap<>();
+        index.getInRegion(storagePos1, storagePos2)
+                .forEach(entry -> scoped.put(entry.posKey(), entry));
+        scopedImportContainers(storagePos1, storagePos2)
+                .forEach(entry -> scoped.put(entry.posKey(), entry));
+        return List.copyOf(scoped.values());
+    }
+
+    private static boolean contains(int[] pos1, int[] pos2, int[] pos) {
+        for (int axis = 0; axis < 3; axis++) {
+            if (pos[axis] < Math.min(pos1[axis], pos2[axis])
+                    || pos[axis] > Math.max(pos1[axis], pos2[axis])) return false;
+        }
+        return true;
+    }
 
     // Task Queue
     private final Deque<MoveTask> taskQueue = new ArrayDeque<>();
@@ -366,6 +487,11 @@ public final class StashOrganizer {
 
     private Map<String, Column> columnAssignment = new LinkedHashMap<>();
     private int depositColumnIndex;
+    // A kit checkpoint may own exact inventory slots while ordinary cargo is reconciled.
+    // This mode never plans moves from the scanned stash; it only empties unprotected player
+    // slots through the organizer's journaled deposit/packing pipeline.
+    private boolean inventoryRecoveryOnly;
+    private Set<Integer> pinnedInventorySlots = Set.of();
 
     // Timing
     private static final int OPEN_TIMEOUT_TICKS = 60;
@@ -382,7 +508,9 @@ public final class StashOrganizer {
     // dozens of imports whose scan-era free slots were filled earlier in the same job, so an
     // eight-chest sample is not sufficient evidence that no stack slot remains.
     private static final int MAX_LOOSE_IMPORT_CAPACITY_PROBES = 32;
-    private static final int MAX_MIXED_STAGING_CAPACITY_PROBES = 8;
+    // A small sample is not proof of exhaustion. Check every registered import up to the
+    // same bounded limit used for loose cargo before repacking a partially drained box.
+    private static final int MAX_MIXED_STAGING_CAPACITY_PROBES = 32;
     private static final int MAX_PACKED_SHULKER_INVENTORY_SYNC_RECOVERIES = 3;
     private static final int PLACEMENT_INVENTORY_SYNC_TIMEOUT_TICKS = 200;
     private static final int PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION = 6;
@@ -398,7 +526,10 @@ public final class StashOrganizer {
     private static final int MAX_TRANSFER_RETRIES = 3;
     private static final int MAX_SHULKER_HOTBAR_SELECTION_RETRIES = 3;
     private static final int INTERACTION_ATTEMPT_TIMEOUT_TICKS = 60;
+    private static final int WALK_PATH_RETRY_INTERVAL_TICKS = 80;
+    private static final int MAX_WALK_PATH_REQUESTS_WITHOUT_MOVEMENT = 4;
     private static final String EMPTY_SHULKER_STAGING_FILTER = "@empty";
+    private static final String INTACT_MIXED_IMPORT_FILTER = "@mixed:";
     private static final String EMPTY_SHULKER_FINGERPRINT =
             ShulkerClassification.classify(Map.of()).fingerprint();
     private static final String ORPHANED_WORKSITE_RECOVERY = "orphaned_reconciliation_worksite";
@@ -407,6 +538,14 @@ public final class StashOrganizer {
     private int[] walkTarget;
     private long trackedWalkTargetKey = Long.MIN_VALUE;
     private int walkingTicks;
+    private int walkSegmentStartY;
+    private int[] activeVerticalWaypoint;
+    private int[][] activeVerticalRoute;
+    private int activeVerticalRouteIndex;
+    private boolean activeVerticalRouteDiscovered;
+    private int lastWalkPathRequestTick = -WALK_PATH_RETRY_INTERVAL_TICKS;
+    private int walkPathRequestsWithoutMovement;
+    private double walkMotionAnchorX, walkMotionAnchorY, walkMotionAnchorZ;
     private final StationWalkRecovery stationWalkRecovery = new StationWalkRecovery();
     private StationWalkRecovery.Point stationPathTarget;
     private final Set<StationWalkRecovery.Point> rejectedStationAccessCells = new HashSet<>();
@@ -418,6 +557,12 @@ public final class StashOrganizer {
     private int containerCacheReadyTicks;
     private int openInteractionAttempts;
     private int lastOpenInteractionTick = -1;
+    private final Map<Long, Set<Long>> rejectedContainerStances = new HashMap<>();
+    private final Map<Long, Integer> alternateContainerAttempts = new HashMap<>();
+    private final Map<Long, BlockPos> successfulContainerStances = new HashMap<>();
+    private BlockPos alternateContainerAccessGoal;
+    private final AlternateApproachProgress alternateContainerProgress = new AlternateApproachProgress();
+    private static final int MAX_CONTAINER_ALTERNATE_STANCES = 3;
     private int actionSlotIndex;
     private int actionCooldown;
     private int shulkerFillMovedUnits;
@@ -439,6 +584,7 @@ public final class StashOrganizer {
     private final PackingSourceSelector packingSourceSelector = new PackingSourceSelector();
     private final Set<MoveTask> supplyDeferredTasks = Collections.newSetFromMap(new IdentityHashMap<>());
     private final Set<ShellSupplySource> shellSupplySourcesTried = new HashSet<>();
+    private final Set<ShellSupplySource> chestSupplySourcesTried = new HashSet<>();
     private record ShellSupplySource(long inventoryKey, int slot, String fingerprint) {}
     private record PackedShellSupplyCandidate(
             ContainerEntry container,
@@ -446,6 +592,7 @@ public final class StashOrganizer {
             ShulkerClassification classification) {}
     private static final int MAX_SUPPLY_STAGES_WITHOUT_DELIVERY = 3;
     private static final int MAX_PACKED_SHELL_SUPPLY_SOURCES = 8;
+    private static final int MAX_PACKED_CHEST_SUPPLY_SOURCES = 3;
     private static final int CRAFTING_HEADROOM_STRATEGY_VERSION = 1;
     private final Map<String, Integer> supplyStagesWithoutDelivery = new LinkedHashMap<>();
     private int craftingHeadroomStrategyVersion = CRAFTING_HEADROOM_STRATEGY_VERSION;
@@ -519,6 +666,8 @@ public final class StashOrganizer {
     private long durableCheckpointUpdatedAtEpochMilli;
 
     private boolean consolidationMode = false;
+    private static final int MAX_PARTIAL_SHULKER_DONORS_PER_JOB = 1024;
+    private long consolidationScanCutoff = -1;
     private boolean mixedBatchConsolidationMode;
     private boolean savedAllowBreak = true;
     private boolean baritoneBreakingGuardActive = false;
@@ -550,6 +699,9 @@ public final class StashOrganizer {
     private int compatibleShulkerCountBeforePlacement;
     private int selectedShulkerHotbarRawSlot = -1;
     private String selectedShulkerRoutingKey;
+    private int protectedHotbarExchangeSource = -1;
+    private int protectedHotbarExchangeTarget = -1;
+    private ItemStack protectedHotbarExchangeExpected;
     private int shulkerHotbarSelectionRetries;
     private int shulkerRecoveryBreakAttempts;
     private volatile boolean temporaryShulkerOutstanding;
@@ -560,8 +712,10 @@ public final class StashOrganizer {
     private volatile ItemStack temporaryShulkerPickupStack;
     private boolean stopAfterShulkerRecovery;
     private String shulkerRecoveryTrigger;
+    private int manualPackedBoxCount;
     private static final String PACKED_SHULKER_INVENTORY_SYNC_RECOVERY =
             "packed_shulker_inventory_sync";
+    private static final String MANUAL_PACKED_WINDOW_PROBE = "manual_packed_window_probe";
     private int shulkerPickupSweepAttempt;
     private int shulkerPickupLastPathTick = -1;
     private int[] shulkerPickupLastTarget;
@@ -652,6 +806,11 @@ public final class StashOrganizer {
     // Public API
     public State getState() { return state; }
     public boolean isActive() { return isActiveState(state); }
+    public boolean isInventoryRecoveryOnly() { return inventoryRecoveryOnly; }
+    /** A new-kit inventory handoff owns no shell; an old-kit handoff pins its shell. */
+    public Set<Integer> inventoryRecoveryPinnedSlots() {
+        return inventoryRecoveryOnly ? pinnedInventorySlots : Set.of();
+    }
     public boolean isFailed() { return state == State.FAILED; }
     public String getLastFailureReason() { return lastFailure == null ? null : lastFailure.reason(); }
     public String getLastFailureState() { return lastFailure == null ? null : lastFailure.state(); }
@@ -668,6 +827,26 @@ public final class StashOrganizer {
     public State getYieldedFromState() { return yieldedFromState; }
     public String getYieldReason() { return yieldReason; }
     public boolean hasTemporaryShulkerOutstanding() { return temporaryShulkerOutstanding; }
+    public boolean hasUnresolvedPackedHandoff() {
+        return MANUAL_PACKED_WINDOW_PROBE.equals(shulkerRecoveryTrigger);
+    }
+    /** The sole carried task box is read-only during a direct loose-food refill. */
+    public boolean canRefillFoodWithoutTouchingPackedHandoff() {
+        if (!hasUnresolvedPackedHandoff() || !isYielded()
+                || yieldedFromState != State.SHULKER_STORE_WALK
+                || temporaryShulkerOutstanding || manualPackedBoxCount <= 0
+                || packDestination == null) return false;
+        if (!loadAndSnapshotProtectedInventorySlots()) return false;
+        Container inventory = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        boolean verified = manualPackedWindowProbeLedgerValid(
+                    countCurrentTaskCargoUnitsInInventory(),
+                    isShulkerAtPosition(reconciliationWorksite))
+                && uniqueManualPackedShulkerSlot(inventory, -1, manualPackedBoxCount) >= 0;
+        // Retrieved food may share the task's item ID, so re-snapshot keep slots before
+        // resuming the handoff and never credit food as loose task cargo.
+        keepProtectionNeedsRefresh = true;
+        return verified;
+    }
     public boolean hasDurableCheckpoint() { return journalJobId != null || journalStore.exists(); }
     public boolean isDurableRecoveryLoaded() { return durableRecoveryLoaded; }
     public String getDurableRecoveryError() { return durableRecoveryError; }
@@ -679,6 +858,76 @@ public final class StashOrganizer {
 
     /** Give an explicit operator-requested resume one new bounded station trip. */
     public boolean prepareManualCheckpointResume() {
+        return prepareManualCheckpointResume(0);
+    }
+
+    /** A failed pickup requires the operator's observed count, not only the item class. */
+    public boolean prepareManualCheckpointResume(int expectedPackedBoxCount) {
+        boolean oldSyncFailure = yieldedFromState == State.SHULKER_PICKUP
+                && lastFailure != null
+                && "packed_shulker_inventory_sync_unresolved".equals(lastFailure.reason());
+        boolean failedPickup = yieldedFromState == State.SHULKER_RECOVERY_PICKUP
+                && lastFailure != null
+                && "temporary_shulker_pickup_recovery_failed".equals(lastFailure.reason())
+                && PACKED_SHULKER_INVENTORY_SYNC_RECOVERY.equals(shulkerRecoveryTrigger);
+        if (isYielded() && (oldSyncFailure || failedPickup)
+                && packedShulkerInventorySyncRecoveries > 0) {
+            if (failedPickup && expectedPackedBoxCount <= 0) return false;
+            // A paused job may have received additional food while waiting. Its saved slot
+            // protection is not authoritative; load the current keep list before counting
+            // loose task units, then refresh again after the resume cooldown.
+            if (!loadAndSnapshotProtectedInventorySlots()) return false;
+            try {
+                if (manualPackedWindowProbeLedgerValid(
+                        countCurrentTaskCargoUnitsInInventory(),
+                        isShulkerAtPosition(reconciliationWorksite))) {
+                    Container inventory = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+                    int candidate = uniqueManualPackedShulkerSlot(
+                            inventory, -1, expectedPackedBoxCount);
+                    if (candidate >= 0) {
+                        // The worksite is empty and exactly one carried box matches this
+                        // transaction's item and attested count. Unrelated carried boxes
+                        // cannot veto recovery, but another matching box remains ambiguous.
+                        // The destination's live player slots must independently confirm
+                        // the same unique candidate before any click.
+                        yieldedFromState = State.SHULKER_STORE_WALK;
+                        currentRole = TargetRole.DESTINATION;
+                        walkTarget = copyPos(packDestination);
+                        trackedWalkTargetKey = Long.MIN_VALUE;
+                        packStoreVerificationTicks = 0;
+                        String priorRecoveryTrigger = shulkerRecoveryTrigger;
+                        int priorPackedBoxCount = manualPackedBoxCount;
+                        boolean priorOutstanding = temporaryShulkerOutstanding;
+                        shulkerRecoveryTrigger = MANUAL_PACKED_WINDOW_PROBE;
+                        manualPackedBoxCount = expectedPackedBoxCount;
+                        // The loaded worksite is empty and the unique matching box is in inventory.
+                        // Keep the handoff marker, but do not re-enter world-drop recovery.
+                        temporaryShulkerOutstanding = false;
+                        if (!persistDurableCheckpoint(yieldedFromState)) {
+                            yieldedFromState = oldSyncFailure
+                                    ? State.SHULKER_PICKUP : State.SHULKER_RECOVERY_PICKUP;
+                            walkTarget = copyNullablePos(reconciliationWorksite);
+                            shulkerRecoveryTrigger = priorRecoveryTrigger;
+                            manualPackedBoxCount = priorPackedBoxCount;
+                            temporaryShulkerOutstanding = priorOutstanding;
+                            return false;
+                        }
+                        emit("organize_packed_shulker_window_probe_armed", Map.of(
+                                "reason", "explicit_checkpoint_resume_after_inventory_sync_failure",
+                                "candidate_slot", candidate,
+                                "expected_box_count", expectedPackedBoxCount,
+                                "fill_moved_units", shulkerFillMovedUnits,
+                                "candidate_contents", ItemIdentifier.readShulkerContents(
+                                        inventory.getItemStack(candidate)).toString(),
+                                "destination", posString(packDestination)));
+                        return true;
+                    }
+                }
+            } finally {
+                keepProtectionNeedsRefresh = true;
+            }
+            return false;
+        }
         if (!isYielded() || !isStationWalkState(yieldedFromState)) return true;
         StationWalkRecovery.Snapshot exhausted = stationWalkRecovery.snapshot();
         if (exhausted == null) return true;
@@ -731,8 +980,10 @@ public final class StashOrganizer {
             ));
             return DurableRestoreResult.INVALID;
         }
-        if (!Arrays.equals(config.pos1, plan.regionPos1())
-                || !Arrays.equals(config.pos2, plan.regionPos2())) {
+        List<IntakeRegion> savedIntakes = plan.intakeRegions() == null
+                ? List.of() : List.copyOf(plan.intakeRegions());
+        if (savedIntakes.isEmpty() && (!Arrays.equals(config.pos1, plan.regionPos1())
+                || !Arrays.equals(config.pos2, plan.regionPos2()))) {
             durableRecoveryError = "configured region no longer matches the saved organizer plan";
             info("Saved organizer checkpoint is blocked because the configured region changed.");
             emit("organize_checkpoint_invalid", Map.of(
@@ -740,6 +991,17 @@ public final class StashOrganizer {
                     "message", durableRecoveryError
             ));
             return DurableRestoreResult.INVALID;
+        }
+        String routeBlocker = restoredRouteBlocker(savedIntakes, plan, checkpoint);
+        if (routeBlocker != null) {
+            durableRecoveryError = routeBlocker;
+            emit("organize_checkpoint_invalid", Map.of(
+                    "reason", "intake_route_changed", "message", routeBlocker));
+            return DurableRestoreResult.INVALID;
+        }
+        if (!savedIntakes.isEmpty()) {
+            config.pos1 = copyPos(plan.regionPos1());
+            config.pos2 = copyPos(plan.regionPos2());
         }
         boolean roleConflict = plan.tasks().stream().anyMatch(task ->
                 isOrganizerExcludedPosition(task.source())
@@ -784,6 +1046,7 @@ public final class StashOrganizer {
         supplyDeferredTasks.clear();
         journalTaskIds.clear();
         shellSupplySourcesTried.clear();
+        chestSupplySourcesTried.clear();
         journalTasks.clear();
         int highestTaskId = 0;
         for (OrganizerJournalStore.TaskSnapshot task : plan.tasks()) {
@@ -824,8 +1087,12 @@ public final class StashOrganizer {
             List<int[]> chests = column.chests().stream().map(StashOrganizer::copyPos).toList();
             columnAssignment.put(entry.getKey(), new Column(column.id(), chests));
         }
+        inventoryRecoveryOnly = plan.inventoryRecoveryOnly();
+        pinnedInventorySlots = plan.pinnedInventorySlots() == null
+                ? Set.of() : Set.copyOf(plan.pinnedInventorySlots());
         managedSourceContainerKeys.clear();
         managedSourceContainerKeys.addAll(plan.managedSourceContainerKeys());
+        crossRegionIntakes = savedIntakes;
 
         journalJobId = plan.jobId();
         journalCreatedAtEpochMilli = plan.createdAtEpochMilli();
@@ -910,6 +1177,18 @@ public final class StashOrganizer {
         sourceTaskFailures.clear();
         var supply = checkpoint.packingSupply();
         packingSupplySearch.restore(supply == null ? null : supply.search());
+        if (supply != null && supply.shellSourcesTried() != null) {
+            supply.shellSourcesTried().stream().filter(Objects::nonNull)
+                    .map(source -> new ShellSupplySource(
+                            source.inventoryKey(), source.slot(), source.fingerprint()))
+                    .forEach(shellSupplySourcesTried::add);
+        }
+        if (supply != null && supply.chestSourcesTried() != null) {
+            supply.chestSourcesTried().stream().filter(Objects::nonNull)
+                    .map(source -> new ShellSupplySource(
+                            source.inventoryKey(), source.slot(), source.fingerprint()))
+                    .forEach(chestSupplySourcesTried::add);
+        }
         supplyStagesWithoutDelivery.clear();
         if (supply != null && supply.stagesWithoutDelivery() != null) {
             supplyStagesWithoutDelivery.putAll(supply.stagesWithoutDelivery());
@@ -948,6 +1227,8 @@ public final class StashOrganizer {
                 ? null : pickupEvidence.pickupStorageKey();
         temporaryShulkerPickupItemId = pickupEvidence == null
                 ? null : pickupEvidence.pickupItemId();
+        manualPackedBoxCount = pickupEvidence == null
+                ? 0 : pickupEvidence.manualPackedBoxCount();
         boolean packedShulkerRecoveryStrategyMigrated = pickupEvidence != null
                 && pickupEvidence.inventorySyncStrategyVersion()
                         < PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION
@@ -1023,6 +1304,108 @@ public final class StashOrganizer {
         return DurableRestoreResult.RESTORED;
     }
 
+    private String restoredRouteBlocker(List<IntakeRegion> intakes,
+                                        OrganizerJournalStore.Plan plan,
+                                        OrganizerJournalStore.Checkpoint checkpoint) {
+        if (intakes.isEmpty()) return null;
+        var db = StashManagerPlugin.getDatabase();
+        if (db == null || !db.isInitialized()) return "database unavailable for intake-route verification";
+        final List<DatabaseManager.SavedRegion> currentRegions;
+        try {
+            currentRegions = db.listRegions();
+        } catch (SQLException e) {
+            return "cannot verify saved intake regions: " + e.getMessage();
+        }
+        boolean storageStillDeclared = currentRegions.stream().anyMatch(region ->
+                region.role() == DatabaseManager.RegionRole.STORAGE
+                        && Arrays.equals(region.pos1(), plan.regionPos1())
+                        && Arrays.equals(region.pos2(), plan.regionPos2()));
+        if (!storageStillDeclared) return "saved storage region or its role changed";
+
+        Set<Long> pinned = new HashSet<>();
+        for (IntakeRegion intake : intakes) {
+            boolean stillDeclared = currentRegions.stream().anyMatch(region ->
+                    region.name().equals(intake.name())
+                            && region.role() == DatabaseManager.RegionRole.INTAKE
+                            && Arrays.equals(region.pos1(), intake.pos1())
+                            && Arrays.equals(region.pos2(), intake.pos2()));
+            if (!stillDeclared) return "intake region " + intake.name() + " or its role changed";
+            final DatabaseManager.ScanSummary scan;
+            try {
+                scan = db.getLatestScanSummary(intake.pos1(), intake.pos2()).orElse(null);
+            } catch (SQLException e) {
+                return "cannot verify intake scan for " + intake.name() + ": " + e.getMessage();
+            }
+            if (scan == null || !scan.completed()
+                    || !com.zenith.plugin.stashmanager.orchestration.ScanCompletionPolicy.trustedSnapshot(
+                            scan.found(), scan.indexed(), scan.failed())) {
+                return "intake " + intake.name() + " no longer has a trusted scan";
+            }
+            for (int[] position : intake.importBlocks()) {
+                ContainerEntry imported = position == null || position.length != 3 ? null
+                        : index.get(position[0], position[1], position[2]);
+                if (position == null || position.length != 3
+                        || !contains(intake.pos1(), intake.pos2(), position)
+                        || contains(plan.regionPos1(), plan.regionPos2(), position)
+                        || !index.isImportChest(position[0], position[1], position[2])
+                        || index.isBlacklistedChest(position[0], position[1], position[2])
+                        || index.isExportChest(position[0], position[1], position[2])
+                        || imported == null || !imported.inventoryFootprintKnown()
+                        || imported.timestamp() < scan.startedAtEpochMilli()
+                        || !pinned.add(posKey(position[0], position[1], position[2]))) {
+                    return "pinned import registration changed in " + intake.name();
+                }
+                if (imported.isDouble()) {
+                    List<ContainerEntry> halves = index.getAll().stream()
+                            .filter(other -> other.isDouble() && other.inventoryFootprintKnown()
+                                    && other.inventoryKey() == imported.inventoryKey()
+                                    && other.blockType().equals(imported.blockType()))
+                            .toList();
+                    if (halves.size() != 2 || halves.stream().anyMatch(other ->
+                            other.timestamp() < scan.startedAtEpochMilli()
+                                    || !index.isImportChest(other)
+                                    || intake.importBlocks().stream().noneMatch(block ->
+                                            Arrays.equals(block, new int[]{other.x(), other.y(), other.z()})))) {
+                        return "pinned double-chest import footprint changed in " + intake.name();
+                    }
+                }
+            }
+        }
+        for (OrganizerJournalStore.TaskSnapshot task : plan.tasks()) {
+            // Inventory-owned tasks record the player's position as a breadcrumb, not a
+            // container source. The player may be in the corridor between two regions.
+            if ((!task.alreadyInInventory()
+                    && !contains(plan.regionPos1(), plan.regionPos2(), task.source())
+                    && !pinned.contains(posKey(task.source()[0], task.source()[1], task.source()[2])))
+                    || (!contains(plan.regionPos1(), plan.regionPos2(), task.destination())
+                    && !pinned.contains(posKey(task.destination()[0], task.destination()[1], task.destination()[2])))) {
+                return "saved task leaves the selected storage and pinned intake scope";
+            }
+        }
+        for (int[] destination : checkpoint.stagingImportDestinations()) {
+            if (!contains(plan.regionPos1(), plan.regionPos2(), destination)
+                    && !pinned.contains(posKey(destination[0], destination[1], destination[2]))) {
+                return "saved staging destination leaves the pinned import scope";
+            }
+        }
+        if (checkpoint.mixedStagingUsedDestinations() != null) {
+            for (int[] destination : checkpoint.mixedStagingUsedDestinations()) {
+                if (!contains(plan.regionPos1(), plan.regionPos2(), destination)
+                        && !pinned.contains(posKey(destination[0], destination[1], destination[2]))) {
+                    return "saved mixed staging destination leaves the pinned import scope";
+                }
+            }
+        }
+        int[] packingDestination = checkpoint.packDestination();
+        if (packingDestination != null
+                && !contains(plan.regionPos1(), plan.regionPos2(), packingDestination)
+                && !pinned.contains(posKey(packingDestination[0], packingDestination[1],
+                        packingDestination[2]))) {
+            return "saved packing destination leaves the pinned import scope";
+        }
+        return null;
+    }
+
     /** Why a yielded checkpoint cannot resume in the current live session, if anything. */
     public String getDurableResumeBlocker() {
         if (!durableRecoveryLoaded && !isYielded()) return null;
@@ -1052,7 +1435,12 @@ public final class StashOrganizer {
 
     /** Explicitly abandon a saved transaction. This never moves or destroys game items. */
     public boolean discardDurableCheckpoint(String reason) {
-        if (isActive() && !isYielded()) return false;
+        String blocker = checkpointDiscardBlocker();
+        if (blocker != null) {
+            info("Cannot discard the organizer checkpoint: " + blocker);
+            emit("organize_checkpoint_discard_blocked", Map.of("reason", blocker));
+            return false;
+        }
         clearOwnedAutomation();
         restoreBaritoneBreaking();
         restorePlaceBlockSneak();
@@ -1063,8 +1451,7 @@ public final class StashOrganizer {
         mixedBatchConsolidationMode = false;
         // Discard abandons the transaction itself, not just its journal files. Leaving these
         // flags armed made the next fresh organize start fail with
-        // temporary_shulker_recovery_required until the proxy restarted. A physical box at
-        // the fixed worksite is still discovered and recovered by the next job.
+        // temporary_shulker_recovery_required until the proxy restarted.
         resetTemporaryShulkerState();
         clearMixedDecompositionState();
         yieldedFromState = null;
@@ -1073,11 +1460,33 @@ public final class StashOrganizer {
         durableRecoveryError = null;
         durableCheckpointUpdatedAtEpochMilli = 0L;
         state = State.IDLE;
+        inventoryRecoveryOnly = false;
+        pinnedInventorySlots = Set.of();
         boolean cleared = clearDurableJournal();
         emit("organize_checkpoint_discarded", Map.of(
                 "reason", Objects.toString(reason, "manual_discard")
         ));
         return cleared;
+    }
+
+    /** Require a loaded, cleared worksite before abandoning an outstanding physical box. */
+    public String checkpointDiscardBlocker() {
+        if (isActive() && !isYielded()) return "the organizer is still running";
+        int[] previousWorksite = shulkerPlacePos != null
+                ? shulkerPlacePos : reconciliationWorksite;
+        if (previousWorksite == null) {
+            return temporaryShulkerOutstanding ? "the temporary shulker position is unknown" : null;
+        }
+        boolean loaded = World.isChunkLoadedBlockPos(previousWorksite[0], previousWorksite[2])
+                && World.getChunkSection(previousWorksite[0], previousWorksite[1], previousWorksite[2]) != null;
+        if (!loaded && temporaryShulkerOutstanding) {
+            return "the temporary shulker worksite is not loaded at " + posString(previousWorksite);
+        }
+        if (loaded && isShulkerAtPosition(previousWorksite)) {
+            return "a shulker remains at " + posString(previousWorksite)
+                    + "; resume recovery or remove it first";
+        }
+        return null;
     }
 
     /** Returns true when another Zenith task replaced automation owned by this organizer. */
@@ -1247,15 +1656,20 @@ public final class StashOrganizer {
 
     /** Read-only capacity audit over the latest indexed scan. Safe to call while idle. */
     public LaneCapacityReport calculateLaneCapacity() {
-        if (config.pos1 == null || config.pos2 == null) {
+        return calculateLaneCapacity(config.pos1, config.pos2);
+    }
+
+    /** Audit an explicitly selected region without changing the organizer's active job scope. */
+    public LaneCapacityReport calculateLaneCapacity(int[] pos1, int[] pos2) {
+        if (pos1 == null || pos2 == null) {
             return LaneCapacityReport.unavailable(LaneCapacityReport.Status.REGION_NOT_DEFINED);
         }
 
-        List<ContainerEntry> regionContainers = index.getInRegion(config.pos1, config.pos2);
+        List<ContainerEntry> regionContainers = index.getInRegion(pos1, pos2);
         if (regionContainers.isEmpty()) {
             return LaneCapacityReport.unavailable(LaneCapacityReport.Status.NO_SCANNED_CONTAINERS);
         }
-        if (requiresFreshIdentityScan()) {
+        if (requiresFreshIdentityScan(pos1, pos2)) {
             return LaneCapacityReport.unavailable(LaneCapacityReport.Status.NEEDS_FRESH_SCAN);
         }
         if (regionContainers.stream().anyMatch(StashOrganizer::hasLegacyEnchantmentKeys)) {
@@ -1265,7 +1679,9 @@ public final class StashOrganizer {
         List<ContainerEntry> organizerContainers = regionContainers.stream()
                 .filter(container -> !index.isOrganizerExcluded(container))
                 .toList();
-        List<ContainerEntry> planningContainers = deduplicateDoubleChestInventories(organizerContainers);
+        List<ContainerEntry> planningContainers = deduplicateDoubleChestInventories(
+                scopedPlanningContainers(pos1, pos2).stream()
+                        .filter(container -> !index.isOrganizerExcluded(container)).toList());
         Map<Long, ContainerEntry> regionByPosition = organizerContainers.stream()
                 .collect(Collectors.toMap(ContainerEntry::posKey, entry -> entry,
                         (current, candidate) -> candidate.timestamp() > current.timestamp()
@@ -1421,9 +1837,23 @@ public final class StashOrganizer {
     }
 
     public boolean start() {
+        inventoryRecoveryOnly = false;
+        pinnedInventorySlots = Set.of();
+        return startInternal();
+    }
+
+    private boolean startInternal() {
         if (journalStore.exists()) {
             info("Cannot start a new organization job while a saved checkpoint exists. Resume or discard it first.");
             emit("organize_start_blocked", Map.of("reason", "saved_checkpoint_exists"));
+            return false;
+        }
+        if (reconciliationWorksite != null && isShulkerAtPosition(reconciliationWorksite)) {
+            info("Cannot start: a shulker remains at the previous reconciliation worksite "
+                    + posString(reconciliationWorksite) + ". Recover it before starting a new job.");
+            emit("organize_start_blocked", Map.of(
+                    "reason", "previous_reconciliation_worksite_occupied",
+                    "shulker_position", posString(reconciliationWorksite)));
             return false;
         }
         if (temporaryShulkerOutstanding) {
@@ -1461,12 +1891,15 @@ public final class StashOrganizer {
             emit("organize_start_blocked", Map.of("reason", "no_scanned_data"));
             return false;
         }
-        if (requiresFreshIdentityScan()) {
+        // Inventory-only reconciliation identifies its source stacks from the live player
+        // inventory and verifies each indexed destination again before transfer. It does
+        // not plan source moves from the stale full-stash scan.
+        if (!inventoryRecoveryOnly && requiresFreshIdentityScan()) {
             info("Cannot organize: the last complete scan predates full enchantment and signed-book IDs. Run a fresh scan first.");
             emit("organize_start_blocked", Map.of("reason", "item_identity_requires_fresh_scan"));
             return false;
         }
-        if (index.getInRegion(config.pos1, config.pos2).stream()
+        if (!inventoryRecoveryOnly && scopedPlanningContainers().stream()
                 .anyMatch(StashOrganizer::hasLegacyEnchantmentKeys)) {
             info("Cannot organize: the scan uses old abbreviated enchantment keys. Run a fresh scan first.");
             emit("organize_start_blocked", Map.of("reason", "enchantment_identity_requires_fresh_scan"));
@@ -1499,8 +1932,14 @@ public final class StashOrganizer {
         overflowItems.clear();
         destinationOpenFailures.clear();
         sourceTaskFailures.clear();
+        rejectedContainerStances.clear();
+        alternateContainerAttempts.clear();
+        successfulContainerStances.clear();
+        alternateContainerAccessGoal = null;
+        alternateContainerProgress.reset();
         managedSourceContainerKeys.clear();
         shellSupplySourcesTried.clear();
+        chestSupplySourcesTried.clear();
         stagingImportDestinations.clear();
         packStoreTriedDestinations.clear();
         emptyShulkerStagingTriedDestinations.clear();
@@ -1560,6 +1999,19 @@ public final class StashOrganizer {
         return true;
     }
 
+    /** Starts a bounded, inventory-only organizer transaction while another job owns slots. */
+    public boolean startInventoryReconciliation(Set<Integer> pinnedSlots) {
+        if (pinnedSlots == null || pinnedSlots.stream().anyMatch(
+                slot -> slot == null || slot < 9 || slot > 44)) return false;
+        if (isActive() || hasDurableCheckpoint()) return false;
+        inventoryRecoveryOnly = true;
+        pinnedInventorySlots = Set.copyOf(pinnedSlots);
+        if (startInternal()) return true;
+        inventoryRecoveryOnly = false;
+        pinnedInventorySlots = Set.of();
+        return false;
+    }
+
     public void stop() {
         if (isYielded()) {
             abortYielded("manual_stop_while_yielded");
@@ -1607,8 +2059,14 @@ public final class StashOrganizer {
         overflowItems.clear();
         destinationOpenFailures.clear();
         sourceTaskFailures.clear();
+        rejectedContainerStances.clear();
+        alternateContainerAttempts.clear();
+        successfulContainerStances.clear();
+        alternateContainerAccessGoal = null;
+        alternateContainerProgress.reset();
         managedSourceContainerKeys.clear();
         shellSupplySourcesTried.clear();
+        chestSupplySourcesTried.clear();
         stagingImportDestinations.clear();
         packStoreTriedDestinations.clear();
         emptyShulkerStagingTriedDestinations.clear();
@@ -1819,7 +2277,104 @@ public final class StashOrganizer {
     }
 
     // PLANNING
+    private void tickInventoryReconciliationPlanning() {
+        var db = StashManagerPlugin.getDatabase();
+        if (db == null || !db.isInitialized()) {
+            markFailed("inventory_reconciliation_database_unavailable", State.PLANNING);
+            restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
+            return;
+        }
+        List<ContainerEntry> imports = scopedImportContainers().stream()
+                .filter(ContainerEntry::inventoryFootprintKnown)
+                .filter(entry -> !index.isBlacklistedChest(entry) && !index.isExportChest(entry))
+                .toList();
+        if (imports.isEmpty()) {
+            markFailed("inventory_reconciliation_import_unavailable", State.PLANNING);
+            restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
+            return;
+        }
+        try {
+            columnAssignment = new LinkedHashMap<>();
+            int nextColumn = 0;
+            Set<String> cargoClasses = new HashSet<>();
+            for (int raw = 9; raw <= 44; raw++) {
+                if (isProtectedInventorySlot(raw)) continue;
+                ItemStack stack = getCurrentPlayerInventoryStack(raw);
+                if (stack == null || stack.getAmount() <= 0) continue;
+                String itemId = itemIdFromStack(stack);
+                if (isShulkerBoxItem(itemId)) {
+                    var classification = ShulkerClassification.classify(
+                            ItemIdentifier.readShulkerContents(stack));
+                    if (classification.kind() == ShulkerClassification.Kind.BULK) {
+                        cargoClasses.add(classification.storageKey());
+                    }
+                } else {
+                    cargoClasses.add(StorageClassPolicy.route(itemId));
+                }
+            }
+            for (var assigned : db.loadColumnAssignments().entrySet()) {
+                if (!cargoClasses.contains(assigned.getKey())) continue;
+                int[] position = assigned.getValue();
+                ContainerEntry destination = position == null || position.length != 3
+                        ? null : index.get(position[0], position[1], position[2]);
+                if (destination == null || !destination.inventoryFootprintKnown()
+                        || !isInRegion(position[0], position[1], position[2])
+                        || index.isOrganizerExcluded(destination)) {
+                    emit("organize_inventory_reconciliation_blocked", Map.of(
+                            "reason", "assigned_lane_unverified",
+                            "storage_class", assigned.getKey()));
+                    markFailed("inventory_reconciliation_assigned_lane_unverified", State.PLANNING);
+                    restoreBaritoneBreaking();
+                    restorePlaceBlockSneak();
+                    return;
+                }
+                columnAssignment.put(assigned.getKey(),
+                        new Column(nextColumn++, List.of(copyPos(position))));
+            }
+        } catch (SQLException | RuntimeException e) {
+            emit("organize_inventory_reconciliation_blocked", Map.of(
+                    "reason", "assigned_lane_lookup_failed"));
+            markFailed("inventory_reconciliation_lane_lookup_failed", State.PLANNING);
+            restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
+            return;
+        }
+        stagingImportDestinations.clear();
+        imports.stream().map(ImportStagingPolicy::from)
+                .filter(candidate -> candidate.estimatedFreeSlots() > 0)
+                .sorted(Comparator.comparingInt(ImportStagingPolicy.Candidate::estimatedFreeSlots)
+                        .reversed())
+                .map(ImportStagingPolicy.Candidate::position)
+                .forEach(stagingImportDestinations::add);
+        if (stagingImportDestinations.isEmpty()) {
+            markFailed("inventory_reconciliation_import_full", State.PLANNING);
+            restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
+            return;
+        }
+        managedSourceContainerKeys.clear();
+        imports.forEach(entry -> managedSourceContainerKeys.add(entry.posKey()));
+        queueInventoryDepositTasks(false);
+        totalTasks = taskQueue.size() + consolidationQueue.size();
+        emit("organize_inventory_reconciliation_planned", Map.of(
+                "tasks", totalTasks, "assigned_lanes", columnAssignment.size(),
+                "registered_imports", imports.size(), "pinned_slots", pinnedInventorySlots.size()));
+        if (!beginDurableJournal()) {
+            restoreBaritoneBreaking();
+            restorePlaceBlockSneak();
+            markFailed("organizer_checkpoint_write_failed", State.PLANNING);
+            return;
+        }
+        advanceToNextTask();
+    }
+
     private void tickPlanning() {
+        if (inventoryRecoveryOnly) {
+            tickInventoryReconciliationPlanning();
+            return;
+        }
         List<ContainerEntry> regionContainers = index.getInRegion(config.pos1, config.pos2);
 
         if (regionContainers.isEmpty()) {
@@ -1840,7 +2395,9 @@ public final class StashOrganizer {
         List<ContainerEntry> organizerContainers = regionContainers.stream()
                 .filter(container -> !index.isOrganizerExcluded(container))
                 .toList();
-        List<ContainerEntry> planningContainers = deduplicateDoubleChestInventories(organizerContainers);
+        List<ContainerEntry> planningContainers = deduplicateDoubleChestInventories(
+                scopedPlanningContainers().stream()
+                        .filter(container -> !index.isOrganizerExcluded(container)).toList());
         Map<Long, ContainerEntry> regionByPosition = organizerContainers.stream()
                 .collect(Collectors.toMap(ContainerEntry::posKey, entry -> entry,
                         (current, candidate) -> candidate.timestamp() > current.timestamp()
@@ -2267,6 +2824,17 @@ public final class StashOrganizer {
         nextProgressMilestone = ProgressMilestones.FIRST;
 
         if (taskQueue.isEmpty() && consolidationQueue.isEmpty()) {
+            if (!beginDurableJournal()) {
+                restoreBaritoneBreaking();
+                restorePlaceBlockSneak();
+                markFailed("organizer_checkpoint_write_failed", State.PLANNING);
+                return;
+            }
+            if (queuePartialShulkerConsolidation()) {
+                advanceToNextTask();
+                return;
+            }
+            clearDurableJournal();
             int belowThresholdClasses = (int) itemLocations.values().stream()
                     .filter(locations -> locations.stream().mapToLong(ItemLocation::quantity).sum()
                             < config.condenseMinItems)
@@ -2344,9 +2912,16 @@ public final class StashOrganizer {
     // configured quantity cap (null = keep all) — any excess beyond the cap still gets
     // deposited, guarding against loose duplicates piling up in inventory during
     // reconciliation. Everything else is routed to whatever column already matches its item
-    // type (or its shulker's primary content, for a filled shulker held in inventory). Items
-    // with no matching column yet are left in inventory rather than inventing a destination.
+    // type (or its shulker's primary content, for a filled shulker held in inventory). Loose
+    // items without an assigned lane must be packed as one-item-type shulkers before an
+    // import handoff; they must never be shift-clicked loose into the import chest.
     private boolean queueInventoryDepositTasks(boolean prioritize) {
+        // A kit-scoped inventory handoff is a closed transaction over the live slots
+        // admitted at PLANNING. Re-scanning while cargo or a packing shell is in flight
+        // can mistake a transient/stale window stack for newly owned inventory and
+        // create an unrelated task. If recovery needs more room, stop with the durable
+        // journal rather than expanding this plan behind the kit checkpoint's back.
+        if (inventoryRecoveryOnly && prioritize) return false;
         var playerContainer = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
         if (playerContainer == null) return false;
 
@@ -2395,6 +2970,21 @@ public final class StashOrganizer {
                 ShulkerClassification classification = ShulkerClassification.classify(
                         ItemIdentifier.readShulkerContents(stack));
                 if (classification.kind() == ShulkerClassification.Kind.MIXED) {
+                    if (inventoryRecoveryOnly) {
+                        int[] staging = findOverflowChest();
+                        if (staging == null) {
+                            skippedNoColumn++;
+                            continue;
+                        }
+                        MoveTask task = new MoveTask(currentPos, staging, itemId,
+                                INTACT_MIXED_IMPORT_FILTER + classification.fingerprint(), true);
+                        String key = inventoryTaskKey(task);
+                        if (!alreadyQueued.containsKey(key)
+                                && inventoryTasks.putIfAbsent(key, task) == null) {
+                            newlyQueued.add(key);
+                        }
+                        continue;
+                    }
                     for (int box = 0; box < stack.getAmount(); box++) {
                         mixedInventoryCargo.add(new MixedInventoryRecoveryPlanner.Cargo(
                                 itemId, classification.fingerprint(), classification.contents()));
@@ -2442,7 +3032,8 @@ public final class StashOrganizer {
                 stagingStorageClassesPlanned.add(columnKey);
                 permanentLaneGaps = Math.max(permanentLaneGaps, stagingStorageClassesPlanned.size());
                 if (stagingReason == null) stagingReason = "no_permanent_lane_for_inventory_cargo";
-                MoveTask task = new MoveTask(currentPos, overflow, itemId, contentFilter, true);
+                MoveTask task = inventoryRecoveryTask(currentPos, overflow, itemId,
+                        contentFilter, false);
                 String key = inventoryTaskKey(task);
                 MoveTask existing = alreadyQueued.get(key);
                 if (existing != null) {
@@ -2454,7 +3045,8 @@ public final class StashOrganizer {
                 }
                 continue;
             }
-            MoveTask task = new MoveTask(currentPos, col.top(), itemId, contentFilter, true);
+            MoveTask task = inventoryRecoveryTask(currentPos, col.top(), itemId,
+                    contentFilter, true);
             String key = inventoryTaskKey(task);
             MoveTask existing = alreadyQueued.get(key);
             if (existing != null) {
@@ -2522,6 +3114,17 @@ public final class StashOrganizer {
         }
         return !inventoryTasks.isEmpty() || !mixedRecoveryTasks.isEmpty()
                 || !existingMixedRecoveryTasks.isEmpty();
+    }
+
+    static MoveTask inventoryRecoveryTask(int[] source, int[] destination, String itemId,
+                                         String contentFilter, boolean permanentLaneAssigned) {
+        // A lane-less loose item has no direct-deposit destination. Keep this packing
+        // contract even when recovery promotes the task ahead of ordinary consolidation.
+        if (!permanentLaneAssigned && contentFilter == null
+                && !isShulkerBoxItem(itemId)) {
+            return MoveTask.mixedBatchInInventory(source, destination, itemId);
+        }
+        return new MoveTask(source, destination, itemId, contentFilter, true);
     }
 
     private MoveTask requireInventoryDeposit(MoveTask task) {
@@ -2594,10 +3197,7 @@ public final class StashOrganizer {
     }
 
     private int[] chooseMixedInventoryStaging(Map<String, Integer> contents) {
-        List<ImportStagingPolicy.Candidate> candidates = index
-                .getInRegion(config.pos1, config.pos2)
-                .stream()
-                .filter(index::isImportChest)
+        List<ImportStagingPolicy.Candidate> candidates = scopedImportContainers().stream()
                 .map(ImportStagingPolicy::from)
                 .toList();
         for (ImportStagingPolicy.Candidate candidate : candidates) {
@@ -3010,26 +3610,293 @@ public final class StashOrganizer {
             return;
         }
 
+        // Ordinary source/destination travel must not inherit Zenith's default permission
+        // to bridge gaps. A wrong route with cargo must stop without modifying the base.
+        guardStationWalkSettings();
         if (isStationWalkState()) {
             tickStationWalking();
             return;
         }
 
+        var player = CACHE.getPlayerCache();
+        int playerX = (int) Math.floor(player.getX());
+        int playerY = (int) Math.floor(player.getY());
+        int playerZ = (int) Math.floor(player.getZ());
         long targetKey = posKey(walkTarget[0], walkTarget[1], walkTarget[2]);
         if (targetKey != trackedWalkTargetKey) {
             trackedWalkTargetKey = targetKey;
             walkingTicks = 0;
+            walkSegmentStartY = playerY;
+            lastWalkPathRequestTick = -WALK_PATH_RETRY_INTERVAL_TICKS;
+            walkPathRequestsWithoutMovement = 0;
+            walkMotionAnchorX = player.getX();
+            walkMotionAnchorY = player.getY();
+            walkMotionAnchorZ = player.getZ();
+            activeVerticalRoute = currentRole == TargetRole.DESTINATION
+                    && taskCargo.hasAcquiredCargo()
+                    ? OrganizerVerticalRoute.select(config.organizerVerticalRoutes,
+                            config.organizerVerticalWaypoint,
+                            config.organizerVerticalWaypoints,
+                            config.organizerVerticalRouteDestination,
+                            currentDimensionName(),
+                            playerX, playerY, playerZ,
+                            walkTarget[0], walkTarget[1], walkTarget[2]) : null;
+            activeVerticalRouteDiscovered = false;
+            if (currentRole == TargetRole.DESTINATION && taskCargo.hasAcquiredCargo()
+                    && activeVerticalRoute == null
+                    && OrganizerVerticalRoute.matchesAnyRule(config.organizerVerticalRoutes,
+                            currentDimensionName(), playerY,
+                            walkTarget[0], walkTarget[1], walkTarget[2])) {
+                abortWithCargo("vertical_route_invalid_with_cargo",
+                        "A matching floor-transition rule has no valid next waypoint; cargo is preserved.");
+                return;
+            }
+            // A configured route for this destination may start on a lower floor than
+            // the bot's current, verified landing. That is not evidence that the
+            // remaining climb is unsafe: try bounded discovery below. A rule that
+            // actually matches this floor still fails closed above if invalid.
+            if (currentRole == TargetRole.DESTINATION && taskCargo.hasAcquiredCargo()
+                    && activeVerticalRoute == null && walkTarget[1] > playerY
+                    && OrganizerVerticalRoute.targetsAnyRule(config.organizerVerticalRoutes,
+                            currentDimensionName(),
+                            walkTarget[0], walkTarget[1], walkTarget[2])) {
+                emit("organize_vertical_route_uncovered_floor_discovery", Map.of(
+                        "origin_y", playerY,
+                        "destination", posString(walkTarget),
+                        "disposition", "verify_bounded_loaded_world_route"));
+            }
+            if (currentRole == TargetRole.DESTINATION && taskCargo.hasAcquiredCargo()
+                    && activeVerticalRoute == null && playerY - walkTarget[1] >= 3) {
+                activeVerticalRoute = OrganizerVerticalRoute.selectSafeDescent(
+                        config.organizerVerticalRoutes, currentDimensionName(),
+                        playerX, playerY, playerZ,
+                        walkTarget[0], walkTarget[1], walkTarget[2]);
+                if (activeVerticalRoute != null) {
+                    emit("organize_vertical_descent_route_activated", Map.of(
+                            "stages", activeVerticalRoute.length,
+                            "destination", posString(walkTarget),
+                            "first_waypoint", posString(activeVerticalRoute[0])));
+                }
+            }
+            if (currentRole == TargetRole.DESTINATION && taskCargo.hasAcquiredCargo()
+                    && activeVerticalRoute == null && Math.abs(walkTarget[1] - playerY) >= 3) {
+                // Zenith's navigation cell rounds a player's feet up when standing on
+                // partial-height container tops. floor(y) can still be the chest block.
+                var navigationStart = StationWorksiteAccess.navigationCell(
+                        new StationWalkRecovery.Position(player.getX(), player.getY(), player.getZ()));
+                var nearbyStart = discoverVerticalRoute(player.getX(), player.getY(),
+                        player.getZ(), BOT.isOnGround());
+                var inspection = nearbyStart.search();
+                var discovered = inspection.plan();
+                if (discovered == null) {
+                    emit("organize_vertical_route_rejected", Map.of(
+                            "reason", inspection.reason(),
+                            "visited_cells", inspection.visited(),
+                            "processed_cells", inspection.processed(),
+                            "near_target_standing", inspection.nearTargetStanding(),
+                            "nearest_distance", inspection.nearestDistance(),
+                            "lowest_y", inspection.lowestY(),
+                            "highest_y", inspection.highestY(),
+                            "classified", inspection.classified().toString(),
+                            "start", navigationStart.x() + "," + navigationStart.y()
+                                    + "," + navigationStart.z(),
+                            "destination", posString(walkTarget)));
+                    abortWithCargo("vertical_route_not_verified_with_cargo",
+                            "No bounded route through loaded safe standing cells and ladders was verified; cargo is preserved.");
+                    return;
+                }
+                activeVerticalRoute = discovered.stages().stream()
+                        .map(StationWalkRecovery.Point::array).toArray(int[][]::new);
+                activeVerticalRouteDiscovered = true;
+                if (nearbyStart.bootstrap() != null) {
+                    emit("organize_vertical_route_nearby_start_selected", Map.of(
+                            "reason", "grounded_pose_in_unusable_navigation_cell",
+                            "navigation_start", navigationStart.x() + ","
+                                    + navigationStart.y() + "," + navigationStart.z(),
+                            "bootstrap", nearbyStart.bootstrap().x() + ","
+                                    + nearbyStart.bootstrap().y() + ","
+                                    + nearbyStart.bootstrap().z(),
+                            "disposition", "pathfinder_must_reach_verified_same_floor_start"));
+                }
+                emit("organize_vertical_route_discovered", Map.of(
+                        "stages", activeVerticalRoute.length,
+                        "visited_cells", discovered.visited(),
+                        "destination", posString(walkTarget)));
+            }
+            activeVerticalRouteIndex = activeVerticalRoute == null || activeVerticalRouteDiscovered
+                    ? 0 : OrganizerVerticalRoute.firstIndex(activeVerticalRoute,
+                            playerX, playerY, playerZ);
+            activeVerticalWaypoint = activeVerticalRoute == null ? null
+                    : activeVerticalRoute[activeVerticalRouteIndex];
+            tracePackedShulkerVerticalWaypoint("route_selected");
+            if (activeVerticalWaypoint != null) stopOwnedBaritoneProcess();
         }
         walkingTicks++;
+        double movedSq = Math.pow(player.getX() - walkMotionAnchorX, 2)
+                + Math.pow(player.getY() - walkMotionAnchorY, 2)
+                + Math.pow(player.getZ() - walkMotionAnchorZ, 2);
+        if (movedSq >= 0.16) {
+            walkMotionAnchorX = player.getX();
+            walkMotionAnchorY = player.getY();
+            walkMotionAnchorZ = player.getZ();
+            walkPathRequestsWithoutMovement = 0;
+        }
 
-        if (isAtWalkTargetAccessPosition()) {
+        boolean atAlternateCell = state == State.WALKING && alternateContainerAccessGoal != null
+                && (int) Math.floor(CACHE.getPlayerCache().getX()) == alternateContainerAccessGoal.x()
+                && (int) Math.floor(CACHE.getPlayerCache().getY()) == alternateContainerAccessGoal.y()
+                && (int) Math.floor(CACHE.getPlayerCache().getZ()) == alternateContainerAccessGoal.z();
+        BlockPos visibleHalf = visibleWalkTargetHalf();
+        if (atAlternateCell && visibleHalf == null) {
+            reapproachOrganizerContainer(ContainerOpenReach.band(
+                    player.getX(), player.getY(), player.getZ(),
+                    walkTarget[0], walkTarget[1], walkTarget[2]),
+                    false, "alternate_cell_sightline_lost");
+            return;
+        }
+        boolean freshCloseAccess = state == State.WALKING && alternateContainerAccessGoal != null
+                && !rejectedContainerStances.getOrDefault(targetKey, Set.of()).contains(
+                        ContainerOpenReach.stanceKey(player.getX(), player.getY(), player.getZ()))
+                && visibleHalf != null
+                && ContainerOpenReach.band(player.getX(), player.getY(), player.getZ(),
+                        visibleHalf.x(), visibleHalf.y(), visibleHalf.z())
+                        == ContainerOpenReach.Band.CLOSE;
+        // Being within interaction range does not mean the staged floor transition
+        // is complete.  In particular, a chest several blocks above a ladder can
+        // be in range before the bot has reached its supported landing.
+        if (activeVerticalWaypoint == null && (freshCloseAccess
+                || ((state != State.WALKING || alternateContainerAccessGoal == null)
+                && isAtWalkTargetAccessPosition()))) {
             BARITONE.stop();
+            alternateContainerAccessGoal = null;
+            alternateContainerProgress.reset();
+            activeVerticalWaypoint = null;
+            activeVerticalRoute = null;
+            activeVerticalRouteDiscovered = false;
+            restoreStationWalkSettings();
             onArrived();
             return;
         }
 
+        // A matching rule may activate after reaching its origin floor. Uncovered
+        // starts first require a verified bounded discovery above, never direct pathing.
+        if (activeVerticalRoute == null && currentRole == TargetRole.DESTINATION
+                && taskCargo.hasAcquiredCargo()
+                && OrganizerVerticalRoute.matchesAnyRule(config.organizerVerticalRoutes,
+                        currentDimensionName(), playerY,
+                        walkTarget[0], walkTarget[1], walkTarget[2])) {
+            int[][] route = OrganizerVerticalRoute.select(config.organizerVerticalRoutes,
+                    config.organizerVerticalWaypoint, config.organizerVerticalWaypoints,
+                    config.organizerVerticalRouteDestination, currentDimensionName(),
+                    playerX, playerY, playerZ,
+                    walkTarget[0], walkTarget[1], walkTarget[2]);
+            if (route == null) {
+                abortWithCargo("vertical_route_invalid_with_cargo",
+                        "A matching floor-transition rule has no valid next waypoint; cargo is preserved.");
+                return;
+            }
+            activeVerticalRoute = route;
+            activeVerticalRouteIndex = OrganizerVerticalRoute.firstIndex(route,
+                    playerX, playerY, playerZ);
+            activeVerticalWaypoint = route[activeVerticalRouteIndex];
+            walkSegmentStartY = playerY;
+            walkingTicks = 0;
+            lastWalkPathRequestTick = 0;
+            walkPathRequestsWithoutMovement = 1;
+            stopOwnedBaritoneProcess();
+            emit("organize_vertical_route_activated", Map.of(
+                    "origin_y", playerY,
+                    "destination", posString(walkTarget),
+                    "next_waypoint", posString(activeVerticalWaypoint),
+                    "remaining_stages", route.length - activeVerticalRouteIndex));
+            pathToWalkTarget();
+            return;
+        }
+
+        if (activeVerticalWaypoint != null) {
+            var waypoint = new StationWalkRecovery.Point(activeVerticalWaypoint[0],
+                    activeVerticalWaypoint[1], activeVerticalWaypoint[2]);
+            if (!isSafeActiveVerticalWaypointCell(waypoint)) {
+                abortWithCargo("vertical_waypoint_not_safe_with_cargo",
+                        "The configured stairwell waypoint is not a loaded, safe standing cell; cargo is preserved.");
+                return;
+            }
+            if (OrganizerVerticalRoute.reached(activeVerticalWaypoint, playerX, playerY, playerZ)) {
+                stopOwnedBaritoneProcess();
+                emit("organize_vertical_waypoint_reached", Map.of(
+                        "waypoint", posString(activeVerticalWaypoint),
+                        "stage", activeVerticalRouteIndex + 1,
+                        "total_stages", activeVerticalRoute.length,
+                        "destination", posString(walkTarget)));
+                activeVerticalRouteIndex++;
+                activeVerticalWaypoint = activeVerticalRouteIndex < activeVerticalRoute.length
+                        ? activeVerticalRoute[activeVerticalRouteIndex] : null;
+                tracePackedShulkerVerticalWaypoint("next_after_reach");
+                if (activeVerticalWaypoint != null
+                        && !isSafeActiveVerticalWaypointCell(new StationWalkRecovery.Point(
+                                activeVerticalWaypoint[0], activeVerticalWaypoint[1],
+                                activeVerticalWaypoint[2]))) {
+                    abortWithCargo("vertical_waypoint_not_safe_with_cargo",
+                            "The next floor-transition waypoint is not a loaded, safe standing cell; cargo is preserved.");
+                    return;
+                }
+                walkSegmentStartY = playerY;
+                walkingTicks = 0;
+                lastWalkPathRequestTick = 0;
+                walkPathRequestsWithoutMovement = 1;
+                pathToWalkTarget();
+                return;
+            }
+        }
+        int minimumSafeY = OrganizerVerticalRoute.minimumSafeY(
+                walkSegmentStartY, walkTarget[1], activeVerticalWaypoint,
+                activeVerticalRoute != null);
+        if (playerY < minimumSafeY && currentRole == TargetRole.DESTINATION
+                && taskCargo.hasAcquiredCargo()) {
+            emit("organize_vertical_route_guarded", Map.of(
+                    "player_y", playerY,
+                    "segment_start_y", walkSegmentStartY,
+                    "minimum_safe_y", minimumSafeY,
+                    "destination", posString(walkTarget),
+                    "pending_waypoint", activeVerticalWaypoint == null
+                            ? "none" : posString(activeVerticalWaypoint),
+                    "staged_route", activeVerticalRoute != null));
+            abortWithCargo("vertical_route_dropped_below_floor_with_cargo",
+                    "Baritone left the expected stairwell floor while carrying cargo; the checkpoint is preserved.");
+            return;
+        }
+
+        if (state == State.WALKING && alternateContainerAccessGoal != null
+                && alternateContainerProgress.stalled(
+                        alternateContainerAccessGoal.x(), alternateContainerAccessGoal.y(),
+                        alternateContainerAccessGoal.z(),
+                        player.getX(), player.getY(), player.getZ())) {
+            rejectedContainerStances.computeIfAbsent(targetKey, ignored -> new HashSet<>())
+                    .add(ContainerOpenReach.stanceKey(alternateContainerAccessGoal.x() + 0.5,
+                            alternateContainerAccessGoal.y(), alternateContainerAccessGoal.z() + 0.5));
+            emit("organize_container_approach_stalled", Map.of(
+                    "elapsed_ticks", alternateContainerProgress.elapsedTicks(),
+                    "idle_ticks", alternateContainerProgress.idleTicks(),
+                    "disposition", "try_next_stance"));
+            reapproachOrganizerContainer(ContainerOpenReach.band(
+                    player.getX(), player.getY(), player.getZ(),
+                    walkTarget[0], walkTarget[1], walkTarget[2]),
+                    visibleHalf != null, "path_stalled");
+            return;
+        }
+
         if (walkingTicks > config.organizerWalkTimeoutTicks) {
+            tracePackedShulkerVerticalWaypoint("walk_timeout");
             BARITONE.stop();
+            if (alternateContainerAccessGoal != null && state == State.WALKING) {
+                rejectedContainerStances.computeIfAbsent(targetKey, ignored -> new HashSet<>())
+                        .add(ContainerOpenReach.stanceKey(
+                                alternateContainerAccessGoal.x() + 0.5,
+                                alternateContainerAccessGoal.y(),
+                                alternateContainerAccessGoal.z() + 0.5));
+                alternateContainerAccessGoal = null;
+                alternateContainerProgress.reset();
+            }
             trackedWalkTargetKey = Long.MIN_VALUE;
             if (currentRole == TargetRole.LANE_PREFLIGHT) {
                 deferLaneAdmission("lane_preflight_walk_timeout");
@@ -3054,15 +3921,101 @@ public final class StashOrganizer {
             return;
         }
 
-        if (!BARITONE.getCustomGoalProcess().isActive()) {
+        if (!BARITONE.getCustomGoalProcess().isActive()
+                && (ownedBaritoneRequest == null || ownedBaritoneRequest.isCompleted())
+                && walkingTicks - lastWalkPathRequestTick >= WALK_PATH_RETRY_INTERVAL_TICKS) {
+            if (walkPathRequestsWithoutMovement >= MAX_WALK_PATH_REQUESTS_WITHOUT_MOVEMENT) {
+                if (currentRole == TargetRole.DESTINATION && taskCargo.hasAcquiredCargo()) {
+                    if (!switchToNextLaneChestWithCargo("destination_no_path")) {
+                        abortWithCargo("destination_no_path_with_cargo",
+                                "Baritone repeatedly found no route without moving; cargo and checkpoint are preserved.");
+                    }
+                } else {
+                    retryUntouchedSourceAtTail("source_no_path");
+                }
+                return;
+            }
+            lastWalkPathRequestTick = walkingTicks;
+            walkPathRequestsWithoutMovement++;
             pathToWalkTarget();
         }
     }
 
     private void pathToWalkTarget() {
         setBaritoneBreakingAllowed(false);
-        ownCustomGoal(BARITONE.pathTo(
-                new GoalGetToBlock(new BlockPos(walkTarget[0], walkTarget[1], walkTarget[2]))));
+        int[] verticalPathGoal = pathfinderVerticalWaypoint();
+        Goal goal = activeVerticalWaypoint != null
+                ? new GoalBlock(new BlockPos(verticalPathGoal[0], verticalPathGoal[1],
+                        verticalPathGoal[2]))
+                : state == State.WALKING && alternateContainerAccessGoal != null
+                        ? new GoalBlock(alternateContainerAccessGoal)
+                        : new GoalGetToBlock(new BlockPos(walkTarget[0], walkTarget[1], walkTarget[2]));
+        ownCustomGoal(BARITONE.pathTo(goal));
+    }
+
+    private int[] pathfinderVerticalWaypoint() {
+        if (activeVerticalWaypoint == null) return null;
+        if (activeVerticalRoute == null
+                || activeVerticalRouteIndex + 1 >= activeVerticalRoute.length) {
+            return activeVerticalWaypoint;
+        }
+        int[] next = activeVerticalRoute[activeVerticalRouteIndex + 1];
+        var feet = BARITONE.getPlayerContext().playerFeet();
+        var player = CACHE.getPlayerCache();
+        if (OrganizerVerticalRoute.needsNextLadderGoal(activeVerticalWaypoint, next,
+                new int[]{feet.x(), feet.y(), feet.z()}, (int) Math.floor(player.getY()))
+                && discoverVerticalCell(new StationWalkRecovery.Point(activeVerticalWaypoint[0],
+                        activeVerticalWaypoint[1], activeVerticalWaypoint[2]))
+                        == DiscoveredVerticalRoute.Cell.LADDER
+                && discoverVerticalCell(new StationWalkRecovery.Point(next[0], next[1], next[2]))
+                        == DiscoveredVerticalRoute.Cell.LADDER) {
+            return next;
+        }
+        if (activeVerticalRouteDiscovered
+                && OrganizerVerticalRoute.needsLadderLipGoal(activeVerticalWaypoint, next,
+                        new int[]{feet.x(), feet.y(), feet.z()},
+                        (int) Math.floor(player.getY()))
+                && discoverVerticalCell(new StationWalkRecovery.Point(activeVerticalWaypoint[0],
+                        activeVerticalWaypoint[1], activeVerticalWaypoint[2]))
+                        == DiscoveredVerticalRoute.Cell.LADDER
+                && discoverVerticalCell(new StationWalkRecovery.Point(activeVerticalWaypoint[0],
+                        activeVerticalWaypoint[1] - 1, activeVerticalWaypoint[2]))
+                        == DiscoveredVerticalRoute.Cell.LADDER
+                && discoverVerticalCell(new StationWalkRecovery.Point(next[0], next[1], next[2]))
+                        == DiscoveredVerticalRoute.Cell.STANDING) {
+            // The discovered route already proved this ladder-to-standing edge. The
+            // extra live checks ensure the landing is still loaded and supported.
+            return next;
+        }
+        return activeVerticalWaypoint;
+    }
+
+    /** Bounded diagnostics for a guarded packed-box route; never changes navigation or cargo. */
+    private void tracePackedShulkerVerticalWaypoint(String reason) {
+        if (state != State.SHULKER_STORE_WALK || activeVerticalWaypoint == null) return;
+        var player = CACHE.getPlayerCache();
+        var waypoint = new StationWalkRecovery.Point(activeVerticalWaypoint[0],
+                activeVerticalWaypoint[1], activeVerticalWaypoint[2]);
+        var navigation = StationWorksiteAccess.navigationCell(
+                new StationWalkRecovery.Position(player.getX(), player.getY(), player.getZ()));
+        Map<String, Object> details = new LinkedHashMap<>();
+        details.put("reason", reason);
+        details.put("stage", activeVerticalRouteIndex + 1);
+        details.put("total_stages", activeVerticalRoute == null ? 0 : activeVerticalRoute.length);
+        details.put("pathfinder_goal", "GoalBlock(" + posString(pathfinderVerticalWaypoint()) + ")");
+        var pathfinderFeet = BARITONE.getPlayerContext().playerFeet();
+        details.put("pathfinder_feet", pathfinderFeet.x() + "," + pathfinderFeet.y()
+                + "," + pathfinderFeet.z());
+        details.put("waypoint_cell", discoverVerticalCell(waypoint).name());
+        details.put("player_pose", player.getX() + "," + player.getY() + "," + player.getZ());
+        details.put("navigation_cell", navigation.x() + "," + navigation.y() + "," + navigation.z());
+        details.put("on_ground", BOT.isOnGround());
+        details.put("baritone_goal_active", BARITONE.getCustomGoalProcess().isActive());
+        details.put("owned_request_completed", ownedBaritoneRequest != null
+                && ownedBaritoneRequest.isCompleted());
+        details.put("walking_ticks", walkingTicks);
+        details.put("requests_without_movement", walkPathRequestsWithoutMovement);
+        emit("organize_packed_vertical_waypoint_trace", details);
     }
 
     private boolean isStationWalkState() {
@@ -3086,6 +4039,23 @@ public final class StashOrganizer {
         if (stationWalkRecovery.snapshot() == null
                 || !target.equals(stationWalkRecovery.snapshot().target())) rejectedStationAccessCells.clear();
         stationWalkRecovery.begin(target, position);
+        if (!stationWalkRecovery.returnRouteConfigured()) {
+            var stages = OrganizerVerticalRoute.returnStages(config.organizerVerticalRoutes,
+                    currentDimensionName(), position.block().x(), position.block().y(),
+                    position.block().z(), target.x(), target.y(), target.z());
+            if (!stages.isEmpty()) {
+                if (!isSafeVerticalWaypointCell(stages.getFirst())) {
+                    failStationWalk("return_route_waypoint_not_safe", position);
+                    return;
+                }
+                stationWalkRecovery.setReturnRoute(stages, position);
+                stationPathTarget = null;
+                emit("organize_station_return_route_activated", Map.of(
+                        "stages", stages.size(), "first_waypoint", posString(stages.getFirst().array()),
+                        "station", posString(target.array())));
+                if (!persistStationWalk()) return;
+            }
+        }
         if (StationWorksiteAccess.canWorkFrom(position, stationAccessWorksite())) {
             emit("organize_station_walk_recovered", stationWalkDetails("worksite_access_verified", position));
             stopOwnedBaritoneProcess();
@@ -3101,6 +4071,21 @@ public final class StashOrganizer {
             return;
         }
 
+        if (stationWalkRecovery.waypoint() == null && stationWalkRecovery.hasReturnRoute()
+                && stationWalkRecovery.atSafeReturnWaypoint(position,
+                        this::isSafeStationDetourCell)) {
+            stopOwnedBaritoneProcess();
+            var reached = stationWalkRecovery.returnWaypoint();
+            stationWalkRecovery.advanceReturnRoute(position);
+            stationPathTarget = null;
+            emit("organize_station_return_waypoint_reached", Map.of(
+                    "waypoint", posString(reached.array()),
+                    "arrival_cell", posString(position.block().array()),
+                    "arrival_kind", "walkable",
+                    "remaining_stages", stationWalkRecovery.hasReturnRoute() ? 1 : 0));
+            if (!persistStationWalk()) return;
+        }
+
         boolean invalidWaypoint = false;
         if (stationWalkRecovery.waypoint() != null) {
             if (stationWalkRecovery.atWaypoint(position)) {
@@ -3109,7 +4094,8 @@ public final class StashOrganizer {
                 stationPathTarget = null;
                 emit("organize_station_walk_detour_completed", stationWalkDetails("retry_station", position));
                 if (!persistStationWalk()) return;
-                requestStationWalkPath(target);
+                requestStationWalkPath(stationWalkRecovery.hasReturnRoute()
+                        ? stationWalkRecovery.returnWaypoint() : target);
                 return;
             }
             invalidWaypoint = !isSafeStationDetourCell(stationWalkRecovery.waypoint());
@@ -3126,7 +4112,8 @@ public final class StashOrganizer {
                 failStationWalk("walk_recovery_budget_exhausted", position);
                 return;
             }
-            var detour = stationWalkRecovery.nextDetour(position, this::isSafeStationDetourCell);
+            var detour = stationWalkRecovery.nextDetour(position, this::isSafeStationDetourCell,
+                    isOnLoadedStationLadder(position));
             if (detour == null) {
                 failStationWalk("no_safe_local_detour", position);
                 return;
@@ -3138,7 +4125,13 @@ public final class StashOrganizer {
             emit("organize_station_walk_detour", stationWalkDetails(reason, position));
         }
 
-        var next = stationWalkRecovery.waypoint() == null ? target : stationWalkRecovery.waypoint();
+        var next = stationWalkRecovery.waypoint() != null ? stationWalkRecovery.waypoint()
+                : stationWalkRecovery.hasReturnRoute() ? stationWalkRecovery.returnWaypoint() : target;
+        if (stationWalkRecovery.hasReturnRoute() && stationWalkRecovery.waypoint() == null
+                && !isSafeVerticalWaypointCell(next)) {
+            failStationWalk("return_route_waypoint_not_safe", position);
+            return;
+        }
         int elapsed = stationWalkRecovery.snapshot().elapsedTicks();
         if (!next.equals(stationPathTarget)
                 || (!BARITONE.getCustomGoalProcess().isActive() && elapsed - stationLastPathTick >= 20)) {
@@ -3158,7 +4151,7 @@ public final class StashOrganizer {
         stationPathTarget = target;
         stationLastPathTick = stationWalkRecovery.snapshot().elapsedTicks();
         Goal goal = new GoalBlock(new BlockPos(target.x(), target.y(), target.z()));
-        if (stationWalkRecovery.waypoint() == null) {
+        if (stationWalkRecovery.waypoint() == null && !stationWalkRecovery.hasReturnRoute()) {
             var worksite = stationAccessWorksite();
             if (StationWorksiteAccess.loaded(worksite)) {
                 var candidates = new ArrayList<>(StationWorksiteAccess.candidates(worksite));
@@ -3203,13 +4196,161 @@ public final class StashOrganizer {
             if (World.getChunkSection(x, y - 1, z) == null || World.getChunkSection(x, y, z) == null
                     || World.getChunkSection(x, y + 1, z) == null) return false;
             var floor = World.getBlock(x, y - 1, z);
-            return BlockCompat.isAir(World.getBlock(x, y, z))
+            var slabType = World.getBlockState(x, y - 1, z)
+                    .getProperty(com.zenith.mc.block.properties.api.BlockStateProperties.SLAB_TYPE);
+            boolean clearStandingCell = BlockCompat.isAir(World.getBlock(x, y, z))
                     && BlockCompat.isAir(World.getBlock(x, y + 1, z))
                     && BlockCompat.isSolid(x, y - 1, z)
                     && !BlockCompat.isInteractable(floor)
-                    && StationWalkRecovery.safeFloor(floor.name());
+                    && StationWalkRecovery.safeDetourFloor(floor.name(), slabType);
+            return clearStandingCell || isSafeCarpetStandingCell(cell);
         } catch (RuntimeException ignored) {
             // Missing or inconsistent world data cannot authorize a recovery step.
+            return false;
+        }
+    }
+
+    private boolean isOnLoadedStationLadder(StationWalkRecovery.Position position) {
+        var cell = position.block();
+        if (!World.isInWorldBounds(cell.x(), cell.y(), cell.z())
+                || !World.isChunkLoadedBlockPos(cell.x(), cell.z())) return false;
+        try {
+            return World.getChunkSection(cell.x(), cell.y(), cell.z()) != null
+                    && StationWalkRecovery.isLadderBlockName(
+                            World.getBlock(cell.x(), cell.y(), cell.z()).name());
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    private DiscoveredVerticalRoute.NearbyStartResult discoverVerticalRoute(
+            double playerX, double playerY, double playerZ, boolean onGround) {
+        var start = StationWorksiteAccess.navigationCell(
+                new StationWalkRecovery.Position(playerX, playerY, playerZ));
+        var target = new StationWalkRecovery.Point(walkTarget[0], walkTarget[1], walkTarget[2]);
+        return DiscoveredVerticalRoute.inspectFromGroundedPose(playerX, playerY, playerZ,
+                onGround, new StationWalkRecovery.Point(start.x(), start.y(), start.z()), target,
+                new DiscoveredVerticalRoute.WorldView() {
+            @Override
+            public DiscoveredVerticalRoute.Cell cell(StationWalkRecovery.Point point) {
+                return discoverVerticalCell(point);
+            }
+
+            @Override
+            public boolean canAccess(StationWalkRecovery.Point point,
+                                     StationWalkRecovery.Point chest) {
+                var band = ContainerOpenReach.band(point.x() + 0.5, point.y(),
+                        point.z() + 0.5, chest.x(), chest.y(), chest.z());
+                return band == ContainerOpenReach.Band.CLOSE
+                        && (ContainerAccessPlanner.visibleInteractionHalf(
+                                point.x() + 0.5, point.y(), point.z() + 0.5,
+                                chest.x(), chest.y(), chest.z()) != null
+                            || ContainerAccessPlanner.coveredChestProbe(
+                                    chest.x(), chest.y(), chest.z(), band));
+            }
+
+            @Override
+            public boolean safeLadderLip(StationWalkRecovery.Point standing,
+                                         StationWalkRecovery.Point ladder) {
+                // A floor may end one block above its highest ladder rung. Only
+                // bridge the lip when the rung below is also loaded and intact.
+                return discoverVerticalCell(standing) == DiscoveredVerticalRoute.Cell.STANDING
+                        && discoverVerticalCell(ladder) == DiscoveredVerticalRoute.Cell.LADDER
+                        && discoverVerticalCell(new StationWalkRecovery.Point(
+                                ladder.x(), ladder.y() - 1, ladder.z()))
+                                == DiscoveredVerticalRoute.Cell.LADDER
+                        && Math.abs(standing.x() - ladder.x())
+                                + Math.abs(standing.z() - ladder.z()) == 1
+                        && standing.y() == ladder.y() + 1;
+            }
+        });
+    }
+
+    private boolean isSafeActiveVerticalWaypointCell(StationWalkRecovery.Point cell) {
+        if (!activeVerticalRouteDiscovered) return isSafeVerticalWaypointCell(cell);
+        var observed = discoverVerticalCell(cell);
+        return observed == DiscoveredVerticalRoute.Cell.STANDING
+                || observed == DiscoveredVerticalRoute.Cell.LADDER;
+    }
+
+    private DiscoveredVerticalRoute.Cell discoverVerticalCell(StationWalkRecovery.Point cell) {
+        int x = cell.x(), y = cell.y(), z = cell.z();
+        if (!World.isInWorldBounds(x, y - 1, z) || !World.isInWorldBounds(x, y + 1, z)
+                || !World.isChunkLoadedBlockPos(x, z)) return DiscoveredVerticalRoute.Cell.UNKNOWN;
+        try {
+            if (World.getChunkSection(x, y - 1, z) == null
+                    || World.getChunkSection(x, y, z) == null
+                    || World.getChunkSection(x, y + 1, z) == null) {
+                return DiscoveredVerticalRoute.Cell.UNKNOWN;
+            }
+            if (isSafeStationDetourCell(cell)) return DiscoveredVerticalRoute.Cell.STANDING;
+            if (isSafeContainerTopTransitCell(cell)) {
+                return DiscoveredVerticalRoute.Cell.CONTAINER_TOP;
+            }
+            if (StationWalkRecovery.isLadderBlockName(World.getBlock(x, y, z).name())
+                    && World.getFluidState(x, y, z) == null) {
+                var above = World.getBlock(x, y + 1, z);
+                if (StationWalkRecovery.isLadderBlockName(above.name())
+                        || BlockCompat.isAir(above)) return DiscoveredVerticalRoute.Cell.LADDER;
+            }
+            var block = World.getBlock(x, y, z);
+            if (World.getBlockState(x, y, z).getProperty(
+                    com.zenith.mc.block.properties.api.BlockStateProperties.SLAB_TYPE)
+                    == com.zenith.mc.block.properties.SlabType.BOTTOM
+                    && World.getChunkSection(x, y + 2, z) != null
+                    && BlockCompat.isSolid(x, y, z)
+                    && !BlockCompat.isInteractable(block)
+                    && StationWalkRecovery.safeFloor(block.name())
+                    && World.getFluidState(x, y, z) == null
+                    && BlockCompat.isAir(World.getBlock(x, y + 1, z))
+                    && BlockCompat.isAir(World.getBlock(x, y + 2, z))) {
+                return DiscoveredVerticalRoute.Cell.BOTTOM_SLAB;
+            }
+        } catch (RuntimeException ignored) {
+            return DiscoveredVerticalRoute.Cell.UNKNOWN;
+        }
+        return DiscoveredVerticalRoute.Cell.BLOCKED;
+    }
+
+    /** A loaded chest/hopper top can be crossed, but never used as a route waypoint. */
+    private boolean isSafeContainerTopTransitCell(StationWalkRecovery.Point cell) {
+        int x = cell.x(), y = cell.y(), z = cell.z();
+        try {
+            var floor = World.getBlock(x, y - 1, z);
+            String name = floor.name().replace("minecraft:", "");
+            if (!(name.equals("chest") || name.equals("trapped_chest")
+                    || name.equals("hopper") || name.equals("barrel"))) return false;
+            return BlockCompat.isSolid(x, y - 1, z)
+                    && World.getFluidState(x, y, z) == null
+                    && BlockCompat.isAir(World.getBlock(x, y, z))
+                    && BlockCompat.isAir(World.getBlock(x, y + 1, z));
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
+    /** Both station detours and configured stair approaches use the same verified footing. */
+    private boolean isSafeVerticalWaypointCell(StationWalkRecovery.Point cell) {
+        return isSafeStationDetourCell(cell);
+    }
+
+    private boolean isSafeCarpetStandingCell(StationWalkRecovery.Point cell) {
+        int x = cell.x(), y = cell.y(), z = cell.z();
+        if (!World.isInWorldBounds(x, y - 1, z) || !World.isInWorldBounds(x, y + 2, z)
+                || !World.isChunkLoadedBlockPos(x, z)) return false;
+        try {
+            if (World.getChunkSection(x, y - 1, z) == null
+                    || World.getChunkSection(x, y, z) == null
+                    || World.getChunkSection(x, y + 1, z) == null
+                    || World.getChunkSection(x, y + 2, z) == null) return false;
+            var carpet = World.getBlock(x, y, z);
+            var floor = World.getBlock(x, y - 1, z);
+            return OrganizerVerticalRoute.supportedCarpetFooting(
+                    carpet.name(), BlockCompat.isSolid(x, y - 1, z)
+                            && !BlockCompat.isInteractable(floor), floor.name(),
+                    BlockCompat.isAir(World.getBlock(x, y + 1, z)),
+                    BlockCompat.isAir(World.getBlock(x, y + 2, z)));
+        } catch (RuntimeException ignored) {
             return false;
         }
     }
@@ -3232,6 +4373,13 @@ public final class StashOrganizer {
         details.put("player_feet_y", position.y());
         details.put("player_x", position.x());
         details.put("player_z", position.z());
+        var feet = position.block();
+        details.put("footing", WorldGeometrySnapshot.describeBlock(feet.x(), feet.y() - 1, feet.z()));
+        details.put("nearby_footing", List.of(
+                WorldGeometrySnapshot.describeBlock(feet.x() + 1, feet.y() - 1, feet.z()),
+                WorldGeometrySnapshot.describeBlock(feet.x() - 1, feet.y() - 1, feet.z()),
+                WorldGeometrySnapshot.describeBlock(feet.x(), feet.y() - 1, feet.z() + 1),
+                WorldGeometrySnapshot.describeBlock(feet.x(), feet.y() - 1, feet.z() - 1)));
         var worksite = stationAccessWorksite();
         if (worksite != null) details.put("worksite", posString(worksite.array()));
         if (progress.waypoint() != null) {
@@ -3355,6 +4503,17 @@ public final class StashOrganizer {
             if (currentRole == TargetRole.DESTINATION) {
                 destinationOpenFailures.remove(destinationCargoKey());
             }
+            if (walkTarget != null) {
+                long openedKey = posKey(walkTarget[0], walkTarget[1], walkTarget[2]);
+                var player = CACHE.getPlayerCache();
+                successfulContainerStances.put(openedKey, new BlockPos(
+                        (int) Math.floor(player.getX()), (int) Math.floor(player.getY()),
+                        (int) Math.floor(player.getZ())));
+                rejectedContainerStances.remove(openedKey);
+                alternateContainerAttempts.remove(openedKey);
+            }
+            alternateContainerAccessGoal = null;
+            alternateContainerProgress.reset();
             actionSlotIndex = 0;
             actionCooldown = 0;
             movedThisVisit = 0;
@@ -3367,6 +4526,49 @@ public final class StashOrganizer {
         if (!prepareStandingContainerInteraction()) return;
         openWaitTicks++;
 
+        if (walkTarget == null) {
+            failNormalContainerOpen("open_target_missing");
+            return;
+        }
+        var player = CACHE.getPlayerCache();
+        BlockPos visibleHalf = visibleWalkTargetHalf();
+        ContainerOpenReach.Band band = ContainerOpenReach.band(
+                player.getX(), player.getY(), player.getZ(),
+                visibleHalf == null ? walkTarget[0] : visibleHalf.x(),
+                visibleHalf == null ? walkTarget[1] : visibleHalf.y(),
+                visibleHalf == null ? walkTarget[2] : visibleHalf.z());
+        boolean visible = visibleHalf != null;
+        if (!visible && ContainerAccessPlanner.coveredChestProbe(
+                walkTarget[0], walkTarget[1], walkTarget[2], band)) {
+            if (openInteractionAttempts == 0) {
+                emit("organize_covered_chest_probe", Map.of(
+                        "target", posString(walkTarget),
+                        "reach_band", band.name().toLowerCase(Locale.ROOT),
+                        "reason", "top_slab_hides_center_ray"));
+                requestContainerInteraction(walkTarget);
+                return;
+            }
+            // Let the single Zenith interaction and its GUI packet settle. A failed
+            // probe falls through to the ordinary bounded reapproach/abort path.
+            boolean probePending = ownedBaritoneProcess == OwnedBaritoneProcess.INTERACTION
+                    && ownedBaritoneRequest != null && !ownedBaritoneRequest.isCompleted();
+            if (probePending && openWaitTicks - lastOpenInteractionTick
+                    < INTERACTION_ATTEMPT_TIMEOUT_TICKS) return;
+            if (openWaitTicks - lastOpenInteractionTick < OPEN_RETRY_INTERVAL_TICKS) return;
+        }
+        if (band == ContainerOpenReach.Band.OUT_OF_REACH || !visible) {
+            reapproachOrganizerContainer(band, visible, "reach_or_sightline");
+            return;
+        }
+        boolean requestPending = ownedBaritoneProcess == OwnedBaritoneProcess.INTERACTION
+                && ownedBaritoneRequest != null && !ownedBaritoneRequest.isCompleted()
+                && openWaitTicks - lastOpenInteractionTick < INTERACTION_ATTEMPT_TIMEOUT_TICKS;
+        if (openInteractionAttempts >= ContainerOpenReach.maxAttempts(band) && !requestPending
+                && openWaitTicks - lastOpenInteractionTick >= OPEN_RETRY_INTERVAL_TICKS) {
+            reapproachOrganizerContainer(band, true, "attempt_budget");
+            return;
+        }
+
         if (openWaitTicks > organizerOpenTimeoutTicks()) {
             failNormalContainerOpen(currentRole == TargetRole.DESTINATION
                     ? "destination_open_retry"
@@ -3377,11 +4579,83 @@ public final class StashOrganizer {
         // A single missed right-click (rotation not settled, brief lag, etc.) should not
         // doom the whole task — retry periodically like tickShulkerOpening does.
         if (openWaitTicks == 1 || openWaitTicks % OPEN_RETRY_INTERVAL_TICKS == 0) {
-            requestContainerInteraction(walkTarget);
+            if (openInteractionAttempts < ContainerOpenReach.maxAttempts(band)) {
+                requestContainerInteraction(new int[]{visibleHalf.x(), visibleHalf.y(), visibleHalf.z()});
+            }
         }
     }
 
+    private boolean canSeeWalkTarget() {
+        return visibleWalkTargetHalf() != null;
+    }
+
+    private BlockPos visibleWalkTargetHalf() {
+        if (walkTarget == null) return null;
+        var player = CACHE.getPlayerCache();
+        return ContainerAccessPlanner.visibleInteractionHalf(player.getX(), player.getY(), player.getZ(),
+                walkTarget[0], walkTarget[1], walkTarget[2]);
+    }
+
+    private void reapproachOrganizerContainer(ContainerOpenReach.Band band,
+                                               boolean visible, String reason) {
+        var player = CACHE.getPlayerCache();
+        long key = posKey(walkTarget[0], walkTarget[1], walkTarget[2]);
+        Set<Long> rejected = rejectedContainerStances.computeIfAbsent(key, ignored -> new HashSet<>());
+        rejected.add(ContainerOpenReach.stanceKey(player.getX(), player.getY(), player.getZ()));
+        List<BlockPos> candidates = new ArrayList<>(ContainerAccessPlanner.alternateStances(
+                player.getX(), player.getY(), player.getZ(),
+                walkTarget[0], walkTarget[1], walkTarget[2], rejected));
+        BlockPos proven = successfulContainerStances.get(key);
+        if (proven != null
+                && !rejected.contains(ContainerOpenReach.stanceKey(
+                        proven.x() + 0.5, proven.y(), proven.z() + 0.5))
+                && World.isChunkLoadedBlockPos(proven.x(), proven.z())
+                && World.getChunkSection(proven.x(), proven.y(), proven.z()) != null
+                && World.getChunkSection(proven.x(), proven.y() + 1, proven.z()) != null
+                && BlockCompat.isAir(World.getBlock(proven.x(), proven.y(), proven.z()))
+                && BlockCompat.isAir(World.getBlock(proven.x(), proven.y() + 1, proven.z()))) {
+            // The live GUI proved this cell worked, even if the generic floor classifier
+            // cannot recognize an unusual stair or chest-top approach in a storage tower.
+            candidates.remove(proven);
+            candidates.add(0, proven);
+        }
+        String requestOutcome = lastOrganizerOpenRequestOutcome();
+        stopOwnedBaritoneProcess();
+        int attempted = alternateContainerAttempts.getOrDefault(key, 0);
+        if (candidates.isEmpty() || attempted >= MAX_CONTAINER_ALTERNATE_STANCES) {
+            emit("organize_container_reach_exhausted", Map.of(
+                    "reason", reason,
+                    "reach_band", band.name().toLowerCase(Locale.ROOT),
+                    "sightline", visible,
+                    "interaction_attempts", openInteractionAttempts,
+                    "last_request", requestOutcome,
+                    "alternate_attempts", attempted,
+                    "rejected_stances", rejected.size()));
+            failNormalContainerOpen(currentRole == TargetRole.DESTINATION
+                    ? "destination_open_reach_exhausted" : "source_open_reach_exhausted");
+            return;
+        }
+        alternateContainerAccessGoal = candidates.getFirst();
+        alternateContainerAttempts.put(key, attempted + 1);
+        alternateContainerProgress.reset();
+        emit("organize_container_reapproach", Map.of(
+                "reason", reason,
+                "reach_band", band.name().toLowerCase(Locale.ROOT),
+                "sightline", visible,
+                "interaction_attempts", openInteractionAttempts,
+                "last_request", requestOutcome,
+                "alternate_attempts", attempted + 1,
+                "rejected_stances", rejected.size()));
+        walkingTicks = 0;
+        trackedWalkTargetKey = key;
+        state = State.WALKING;
+        pathToWalkTarget();
+        persistDurableCheckpoint(state);
+    }
+
     private void failNormalContainerOpen(String reason) {
+        alternateContainerAccessGoal = null;
+        alternateContainerProgress.reset();
         BARITONE.stop();
         if (currentRole == TargetRole.LANE_PREFLIGHT) {
             deferLaneAdmission("lane_preflight_open_timeout");
@@ -3984,15 +5258,28 @@ public final class StashOrganizer {
                 countItemInOpenPlayerInventory(open, chestSlots, packItemId),
                 isShulkerAtPosition(reconciliationWorksite));
         boolean transactionShulkerProven = transactionShulkerSlot >= 0;
+        if (movedThisVisit == 0 && packStoreVerificationTicks == 0
+                && actionSlotIndex <= HOTBAR_SIZE) {
+            emitPackedShulkerWindowAudit(open, chestSlots, transactionShulkerSlot, "first_window_check");
+        }
         QuickMovePoll transfer = pollPendingQuickMove();
         if (transfer.outcome() != QuickMoveOutcome.NONE) {
             if (transfer.outcome() == QuickMoveOutcome.CONFIRMED_DRAINED) {
+                // The authoritative destination window now owns the packed box. Clear a
+                // prior pickup-sync recovery marker only after this server-confirmed move.
+                // Same-type cargo can remain loose after any partial-box fill. Credit only
+                // the task units absent from the authoritative player section after delivery.
+                int looseTaskUnits = countItemInOpenPlayerInventory(open, chestSlots, packItemId);
+                int depositUnits = PackedShulkerWindowProbePolicy.creditedTaskUnits(
+                        taskCargo.remaining(), shulkerFillMovedUnits, looseTaskUnits);
+                temporaryShulkerOutstanding = false;
+                shulkerRecoveryTrigger = null;
+                manualPackedBoxCount = 0;
                 actionSlotIndex++;
                 movedThisVisit++;
                 // A partial box only delivers the units confirmed during this fill. The
                 // remaining loose cargo still needs another box or a staged receipt.
-                taskCargo.recordDeposited(Math.min(
-                        taskCargo.remaining(), Math.max(0, shulkerFillMovedUnits)));
+                taskCargo.recordDeposited(depositUnits);
                 packStoreVerificationTicks = 0;
                 if (isImportStagingPack()) {
                     recordWritableImportDestination(
@@ -4005,8 +5292,11 @@ public final class StashOrganizer {
             return;
         }
 
-        // Deposit only the shulker produced for this exact packed item variant.
-        while (actionSlotIndex < 45) {
+        // A deferred task can own another bulk box of the same storage class. Deposit
+        // only the collected shell from this fill, and never submit a second box after
+        // its first confirmed handoff (even if the candidate calculation changes).
+        while (PackedShulkerHandoffPolicy.maySubmit(movedThisVisit)
+                && actionSlotIndex < 45) {
             if (isProtectedInventorySlot(actionSlotIndex)) {
                 actionSlotIndex++;
                 continue;
@@ -4023,7 +5313,8 @@ public final class StashOrganizer {
                         ItemIdentifier.readShulkerContents(stack));
                 boolean matchingBulk = classification.kind() == ShulkerClassification.Kind.BULK
                         && StorageClassPolicy.sameClass(packItemId, classification.storageKey());
-                if (matchingBulk || transactionShulkerProven && actionSlotIndex == transactionShulkerSlot) {
+                if (transactionShulkerProven && actionSlotIndex == transactionShulkerSlot) {
+                    emitPackedShulkerWindowAudit(open, chestSlots, transactionShulkerSlot, "before_submit");
                     // A late SetContent can reveal the collected box after this window was
                     // first scanned. Refresh the baseline before submitting its click.
                     packStoreMatchingShulkersBefore = Math.max(
@@ -4065,6 +5356,7 @@ public final class StashOrganizer {
             // Collection and the destination window can arrive out of order. Rescan from the
             // first usable player slot so a later SetContent can expose the packed box.
             if (packStoreVerificationTicks++ == 0) {
+                emitPackedShulkerWindowAudit(open, chestSlots, transactionShulkerSlot, "sync_wait");
                 emit("organize_packed_shulker_inventory_sync_wait", Map.of(
                         "reason", "packed_shulker_not_yet_visible_in_destination_window",
                         "timeout_ticks", packedShulkerVerificationTimeoutTicks(),
@@ -4089,6 +5381,7 @@ public final class StashOrganizer {
             completePackedShulkerStore(
                     looseItemsRemaining, true, matchingShulkersAfter);
         } else if (movedThisVisit == 0) {
+            emitPackedShulkerWindowAudit(open, chestSlots, transactionShulkerSlot, "sync_timeout");
             recoverPackedShulkerInventoryVisibility(
                     "packed_shulker_not_found_in_destination_window");
         } else {
@@ -4388,6 +5681,36 @@ public final class StashOrganizer {
                             "The selected shulker never appeared in the held hotbar slot; no box was placed.");
                 }
                 return;
+            }
+            if (protectedHotbarExchangeSource >= 0) {
+                ItemStack displaced = getPlayerInventoryStack(protectedHotbarExchangeSource);
+                ItemStack expected = protectedHotbarExchangeExpected;
+                if (displaced == null || expected == null
+                        || displaced.getId() != expected.getId()
+                        || displaced.getAmount() != expected.getAmount()
+                        || !Objects.equals(displaced.getDataComponents(), expected.getDataComponents())) {
+                    if (++shulkerTicks >= TRANSFER_VERIFICATION_TIMEOUT_TICKS) {
+                        abortWithCargo("kept_hotbar_exchange_unverified",
+                                "The kept hotbar item was not verified in the shulker's former slot.");
+                    }
+                    return;
+                }
+                if (!refreshProtectedInventorySlots()
+                        || !isProtectedInventorySlot(protectedHotbarExchangeSource)
+                        || isProtectedInventorySlot(protectedHotbarExchangeTarget)) {
+                    abortWithCargo("kept_hotbar_exchange_unverified",
+                            "Keep-list protection did not follow the exchanged hotbar item.");
+                    return;
+                }
+                emit("organize_kept_hotbar_exchanged", Map.of(
+                        "kept_slot", protectedHotbarExchangeSource,
+                        "shulker_slot", protectedHotbarExchangeTarget));
+                clearProtectedHotbarExchange();
+                if (!persistDurableCheckpoint(state)) {
+                    abortWithCargo("kept_hotbar_exchange_checkpoint_failed",
+                            "Could not checkpoint the verified kept-item exchange.");
+                    return;
+                }
             }
             ownedInventoryRequest = null;
         }
@@ -5328,21 +6651,30 @@ public final class StashOrganizer {
                 .sorted()
                 .toList();
         boolean shellSupply = isPackedShellSupplyTask(mixedTask);
-        // Released crafting shells must remain loose, or packing simply recreates the shortage.
-        List<MoveTask> batch = shellSupply ? List.of()
+        boolean chestSupply = isPackedChestSupplyTask(mixedTask);
+        // Crafting materials must remain loose, or packing simply recreates the shortage.
+        List<MoveTask> batch = shellSupply || chestSupply ? List.of()
                 : stagedMixedBatchTasks(storageClasses, mixedTask.destination());
 
         List<MoveTask> recoveredCargoTasks = inventoryCargoTasks == null
                 ? List.of()
                 : List.copyOf(inventoryCargoTasks);
         completedTasks++;
-        decomposedMixedShulkers++;
+        recordDrainedShulker(mixedTask);
         generatedLooseTasks += batch.size() + recoveredCargoTasks.size();
         if (shellSupply) {
             supplyStagesWithoutDelivery.clear();
             packingSupplySearch.reset();
             emit("organize_packed_shell_supply_recovered", Map.of(
                     "shells_released", mixedTask.mixedContents().getOrDefault("shulker_shell", 0),
+                    "confirmed_staging_sources", mixedStagingLedger.snapshot().confirmed().size(),
+                    "deferred_tasks", supplyDeferredTasks.size()));
+        }
+        if (chestSupply) {
+            supplyStagesWithoutDelivery.clear();
+            packingSupplySearch.reset();
+            emit("organize_packed_chest_supply_recovered", Map.of(
+                    "chests_released", mixedTask.mixedContents().getOrDefault("chest", 0),
                     "confirmed_staging_sources", mixedStagingLedger.snapshot().confirmed().size(),
                     "deferred_tasks", supplyDeferredTasks.size()));
         }
@@ -5507,7 +6839,7 @@ public final class StashOrganizer {
         List<MoveTask> inventoryCargo = List.copyOf(mixedShellVerificationCargo);
 
         completedTasks++;
-        decomposedMixedShulkers++;
+        recordDrainedShulker(mixedTask);
         generatedLooseTasks += stagedSources.size() + inventoryCargo.size();
         totalTasks += stagedSources.size() + inventoryCargo.size();
         emitProgressMilestoneIfCrossed();
@@ -6027,7 +7359,7 @@ public final class StashOrganizer {
         restorePlaceBlockSneak();
 
         completedTasks++;
-        decomposedMixedShulkers++;
+        recordDrainedShulker(mixedTask);
         generatedLooseTasks += stagedSources.size();
         totalTasks += stagedSources.size();
         emitProgressMilestoneIfCrossed();
@@ -6087,7 +7419,25 @@ public final class StashOrganizer {
         reconcileRecoveredPendingMixedTransfer();
         shulkerPlacePos = reconciliationWorksite;
 
-        if (recoveredBoxIdentified && continueRecoveredMixedBoxWithInventoryCargo()) {
+        refreshStagingImportDestinations();
+        boolean fullImportBackpressure = !mixedCargoSlots.isEmpty()
+                && isResumableStagingCapacityFailure(reason)
+                && ImportCapacityBackpressure.stopBeforeRepack(
+                        stagingImportDestinations.stream()
+                                .map(this::importInventoryKey).toList(),
+                        mixedUnavailableStagingDestinations,
+                        pendingMixedInventoryCargoTasks().stream().anyMatch(task ->
+                                columnAssignment.containsKey(
+                                        StorageClassPolicy.route(task.itemId()))));
+        if (fullImportBackpressure) {
+            emit("organize_import_backpressure_armed", Map.of(
+                    "reason", reason,
+                    "registered_inventories", stagingImportDestinations.size(),
+                    "rejected_inventories", mixedUnavailableStagingDestinations.size(),
+                    "disposition", "preserve_recovered_box_and_loose_cargo"));
+        }
+        if (recoveredBoxIdentified && !fullImportBackpressure
+                && continueRecoveredMixedBoxWithInventoryCargo()) {
             emit("organize_capacity_recovery_continued", Map.of(
                     "reason", reason,
                     "disposition", "pack_recovered_mixed_cargo"
@@ -6266,7 +7616,7 @@ public final class StashOrganizer {
         MoveTask recoveredTask = currentTask;
         List<String> removedClasses = removedStorageClasses(
                 originalTask.mixedContents(), recovered.contents());
-        List<MoveTask> stagedCargo = isPackedShellSupplyTask(originalTask) ? List.of()
+        List<MoveTask> stagedCargo = isPackedCraftMaterialSupplyTask(originalTask) ? List.of()
                 : stagedMixedBatchTasks(removedClasses, originalTask.destination());
         List<MoveTask> orderedPending = preferAssignedStorageClasses(
                 preferStorageClass(
@@ -6287,7 +7637,7 @@ public final class StashOrganizer {
             taskQueue.addFirst(recoveredTask);
         } else if (reuseRecoveredBulk) {
             completedTasks++;
-            decomposedMixedShulkers++;
+            recordDrainedShulker(originalTask);
         } else {
             Column column = columnAssignment.get(recovered.storageKey());
             int[] destination = column == null
@@ -6296,7 +7646,7 @@ public final class StashOrganizer {
             taskQueue.addFirst(new MoveTask(
                     currentPlayerPosition(), destination, originalTask.itemId(),
                     recovered.storageKey(), true));
-            decomposedMixedShulkers++;
+            recordDrainedShulker(originalTask);
         }
 
         generatedLooseTasks += orderedPending.size() + stagedCargo.size();
@@ -6601,6 +7951,7 @@ public final class StashOrganizer {
                         .thenComparingInt(container ->
                                 looseItemCount(container, "shulker_shell") > 0
                                         && looseItemCount(container, "chest") > 0 ? 0 : 1)
+                        .thenComparingInt(container -> isPlacedShulkerBox(container) ? 1 : 0)
                         .thenComparingDouble(container -> distanceTo(
                                 new int[]{container.x(), container.y(), container.z()}))
                         .thenComparingInt(ContainerEntry::x)
@@ -7970,6 +9321,17 @@ public final class StashOrganizer {
             return;
         }
 
+        // An inventory-only plan is a closed snapshot while any cargo is in flight.
+        // Once all planned handoffs finish, the final audit may still find another
+        // physical box of the same class or a newly exposed surplus keep stack.
+        // Re-admit those items only on an explicit checkpoint resume, after every
+        // prior handoff and window has settled; never expand an in-flight plan.
+        if (inventoryRecoveryOnly && lastFailure != null
+                && "inventory_reconciliation_incomplete".equals(lastFailure.reason())) {
+            resumeInventoryReconciliationRemainder();
+            return;
+        }
+
         // Inspect the live box before state-specific recovery. A failed pickup checkpoint can
         // otherwise bypass both overflow and store recovery even though the transaction ledger
         // proves that packing cargo was clicked into an actual mixed box.
@@ -8006,6 +9368,47 @@ public final class StashOrganizer {
                  SHULKER_RECOVERY_PICKUP -> resumeTemporaryShulkerCheckpoint(interrupted);
             case IDLE, YIELDED, DONE, FAILED -> markFailed("checkpoint_state_not_resumable", interrupted);
         }
+    }
+
+    static boolean safeInventoryReconciliationRemainderBoundary(
+            boolean inventoryOnly, String failureReason, boolean queuesEmpty,
+            int cargoRemaining, boolean temporaryBoxOutstanding,
+            boolean transferPending, boolean windowOpen, boolean cursorOccupied) {
+        return inventoryOnly && "inventory_reconciliation_incomplete".equals(failureReason)
+                && queuesEmpty && cargoRemaining == 0 && !temporaryBoxOutstanding
+                && !transferPending && !windowOpen && !cursorOccupied;
+    }
+
+    private void resumeInventoryReconciliationRemainder() {
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventoryCache.getMouseStack();
+        boolean safe = safeInventoryReconciliationRemainderBoundary(
+                inventoryRecoveryOnly, lastFailure == null ? null : lastFailure.reason(),
+                taskQueue.isEmpty() && consolidationQueue.isEmpty(), taskCargo.remaining(),
+                temporaryShulkerOutstanding, pendingQuickMove != null
+                        || pendingOverflowSplit != null || INVENTORY.hasActiveRequest(),
+                inventoryCache.getOpenContainerId() > 0,
+                cursor != null && cursor.getAmount() > 0);
+        if (!safe || !loadAndSnapshotProtectedInventorySlots()) {
+            abortWithCargo("inventory_reconciliation_replan_boundary_unverified",
+                    "The prior inventory handoffs are not at a clean, zero-cargo boundary; "
+                            + "the saved checkpoint and live inventory need review.");
+            return;
+        }
+        currentTask = null;
+        consolidationMode = false;
+        mixedBatchConsolidationMode = false;
+        int previousTotal = totalTasks;
+        if (!queueInventoryDepositTasks(false)) {
+            finishOrganization();
+            return;
+        }
+        emit("organize_inventory_reconciliation_replanned", Map.of(
+                "previous_total", previousTotal,
+                "new_total", totalTasks,
+                "new_tasks", totalTasks - previousTotal,
+                "disposition", "explicit_resume_verified_remainder"));
+        advanceToNextTask();
     }
 
     private void resumeOverflowCheckpoint() {
@@ -8627,6 +10030,20 @@ public final class StashOrganizer {
                 "restored_import_staging_capacity_exhausted")) {
             return;
         }
+        if (MANUAL_PACKED_WINDOW_PROBE.equals(shulkerRecoveryTrigger)) {
+            Container inventory = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+            if (manualPackedWindowProbeLedgerValid(
+                    countCurrentTaskCargoUnitsInInventory(),
+                    isShulkerAtPosition(reconciliationWorksite))
+                    && uniqueManualPackedShulkerSlot(
+                            inventory, -1, manualPackedBoxCount) >= 0) {
+                walkToPackedShulkerDestination(packDestination);
+            } else {
+                abortWithCargo("manual_packed_box_changed",
+                        "The attested box or task cargo changed before its live-window handoff. No box was moved.");
+            }
+            return;
+        }
         if (temporaryShulkerPickupConfirmed && hasPackedShulkerForHandoff()) {
             if (packedShulkerInventorySyncRecoveries > 0) {
                 emit("organize_recovery_completed", Map.of(
@@ -8750,7 +10167,7 @@ public final class StashOrganizer {
         return matchesShulkerTaskFilter(currentTask, classification);
     }
 
-    private static boolean matchesShulkerTaskFilter(
+    static boolean matchesShulkerTaskFilter(
             MoveTask task,
             ShulkerClassification classification) {
         if (task == null || classification == null || task.shulkerContentFilter() == null) {
@@ -8758,6 +10175,11 @@ public final class StashOrganizer {
         }
         if (EMPTY_SHULKER_STAGING_FILTER.equals(task.shulkerContentFilter())) {
             return classification.kind() == ShulkerClassification.Kind.EMPTY;
+        }
+        if (task.shulkerContentFilter().startsWith(INTACT_MIXED_IMPORT_FILTER)) {
+            return classification.kind() == ShulkerClassification.Kind.MIXED
+                    && task.shulkerContentFilter().substring(INTACT_MIXED_IMPORT_FILTER.length())
+                            .equals(classification.fingerprint());
         }
         if (task.mixedDecomposition()) {
             // Recovery also matches the emptied box after a verified pickup.
@@ -8774,12 +10196,42 @@ public final class StashOrganizer {
                 && task.mixedContents().getOrDefault("shulker_shell", 0) >= 2;
     }
 
+    private static boolean isPackedChestSupplyTask(MoveTask task) {
+        return task != null && task.mixedDecomposition()
+                && task.mixedContents().size() == 1
+                && task.mixedContents().getOrDefault("chest", 0) >= 1;
+    }
+
+    private static boolean isPackedCraftMaterialSupplyTask(MoveTask task) {
+        return isPackedShellSupplyTask(task) || isPackedChestSupplyTask(task);
+    }
+
+    private static boolean isConsolidationDonorTask(MoveTask task) {
+        return task != null && task.mixedDecomposition()
+                && task.mixedContents().size() == 1
+                && !isPackedCraftMaterialSupplyTask(task);
+    }
+
+    private void recordDrainedShulker(MoveTask task) {
+        if (isConsolidationDonorTask(task)) {
+            emit("organize_partial_shulker_drained", Map.of(
+                    "storage_class", StorageClassPolicy.route(
+                            task.mixedContents().keySet().iterator().next()),
+                    "disposition", "repack_into_compatible_partial"));
+        } else {
+            decomposedMixedShulkers++;
+        }
+    }
+
     private static boolean isDecompositionSourceShape(
             MoveTask task, ShulkerClassification classification) {
         return classification.kind() == ShulkerClassification.Kind.MIXED
-                || isPackedShellSupplyTask(task)
+                || isConsolidationDonorTask(task)
                 && classification.kind() == ShulkerClassification.Kind.BULK
-                && "shulker_shell".equals(classification.storageKey());
+                || isPackedCraftMaterialSupplyTask(task)
+                && classification.kind() == ShulkerClassification.Kind.BULK
+                && (isPackedShellSupplyTask(task) && "shulker_shell".equals(classification.storageKey())
+                    || isPackedChestSupplyTask(task) && "chest".equals(classification.storageKey()));
     }
 
     private static boolean isEmptyShulkerStagingTask(MoveTask task) {
@@ -8980,8 +10432,7 @@ public final class StashOrganizer {
     /** Long jobs and restored checkpoints can outlive import-chest registration changes. */
     private void refreshStagingImportDestinations() {
         if (config.pos1 == null || config.pos2 == null) return;
-        index.getInRegion(config.pos1, config.pos2).stream()
-                .filter(index::isImportChest)
+        scopedImportContainers().stream()
                 .map(entry -> new int[]{entry.x(), entry.y(), entry.z()})
                 .forEach(this::rememberStagingImportDestination);
     }
@@ -9270,6 +10721,8 @@ public final class StashOrganizer {
     }
 
     private void advanceToNextTask() {
+        alternateContainerAccessGoal = null;
+        alternateContainerProgress.reset();
         // A failure/timeout path may bail out here while a container is still open server-side
         // (e.g. containerDataReceived arrived just after the timeout fired) — always close first
         // so a stale window never lingers into the next task's WALKING phase.
@@ -9428,6 +10881,153 @@ public final class StashOrganizer {
                 && classification.contents().getOrDefault("shulker_shell", 0) >= 2;
     }
 
+    /** Expose one indexed chest-only box through the verified mixed-box worksite flow. */
+    private boolean queuePackedChestSupplyDecomposition() {
+        if (!config.craftShulkersEnabled || findCraftingTable() == null
+                || countItemInRegion("shulker_shell") + countItemInInventory("shulker_shell") < 2
+                || countItemInRegion("chest") + countItemInInventory("chest") > 0
+                || isPackedChestSupplyTask(currentTask)
+                || taskQueue.stream().anyMatch(StashOrganizer::isPackedChestSupplyTask)
+                || chestSupplySourcesTried.size() >= MAX_PACKED_CHEST_SUPPLY_SOURCES) {
+            return false;
+        }
+
+        List<PackedShellSupplyCandidate> candidates = new ArrayList<>();
+        for (ContainerEntry container : indexedCraftMaterialSources()) {
+            for (ContainerEntry.ShulkerDetail detail : container.shulkerDetails()) {
+                if (!detail.isPhysicalInstance()) continue;
+                ShulkerClassification classification = ShulkerClassification.classify(detail.items());
+                if (isPackedChestSupplyCandidate(classification)) {
+                    candidates.add(new PackedShellSupplyCandidate(container, detail, classification));
+                }
+            }
+        }
+        // Choose the smallest box likely to cover the remaining packing tasks. This keeps
+        // most chest stock boxed and limits the number of import slots needed to stage it.
+        int target = Math.max(64, Math.min(256, totalTasks - completedTasks));
+        candidates.sort(Comparator
+                .comparingInt((PackedShellSupplyCandidate candidate) ->
+                        candidate.classification().contents().get("chest") >= target ? 0 : 1)
+                .thenComparingInt(candidate -> candidate.classification().contents().get("chest"))
+                .thenComparingDouble(candidate -> distanceTo(new int[]{
+                        candidate.container().x(), candidate.container().y(), candidate.container().z()})));
+
+        for (PackedShellSupplyCandidate candidate : candidates) {
+            ContainerEntry source = candidate.container();
+            int[] sourcePosition = {source.x(), source.y(), source.z()};
+            ShellSupplySource sourceKey = new ShellSupplySource(
+                    importInventoryKey(sourcePosition), candidate.detail().slot(),
+                    candidate.classification().fingerprint());
+            if (chestSupplySourcesTried.contains(sourceKey)) continue;
+            int requiredSlots = MixedShulkerPlaybook.minimumStagingSlotsWithShell(
+                    candidate.classification().contents());
+            int[] staging = scopedImportContainers().stream()
+                    .map(ImportStagingPolicy::from)
+                    .filter(importChest -> importChest.estimatedFreeSlots() >= requiredSlots)
+                    .max(Comparator.comparingInt(ImportStagingPolicy.Candidate::estimatedFreeSlots))
+                    .map(ImportStagingPolicy.Candidate::position)
+                    .orElse(null);
+            if (staging == null) continue;
+            rememberStagingImportDestination(staging);
+            chestSupplySourcesTried.add(sourceKey);
+            taskQueue.addFirst(MoveTask.mixed(
+                    sourcePosition, staging, shulkerItemId(candidate.detail().color()),
+                    candidate.classification().fingerprint(), candidate.classification().contents()));
+            totalTasks++;
+            emit("organize_packed_chest_supply_selected", Map.of(
+                    "chests_indexed", candidate.classification().contents().get("chest"),
+                    "source", posString(sourcePosition),
+                    "sources_tried", chestSupplySourcesTried.size(),
+                    "deferred_tasks", supplyDeferredTasks.size(),
+                    "disposition", "verified_unpack_then_craft"));
+            return true;
+        }
+        return false;
+    }
+
+    static boolean isPackedChestSupplyCandidate(ShulkerClassification classification) {
+        return classification != null
+                && classification.kind() == ShulkerClassification.Kind.BULK
+                && classification.contents().size() == 1
+                && classification.contents().getOrDefault("chest", 0) >= 1;
+    }
+
+    /** Drain one fresh partial box, then pack its cargo before considering another donor. */
+    private boolean queuePartialShulkerConsolidation() {
+        if (consolidationScanCutoff < 0) {
+            consolidationScanCutoff = 0;
+            try {
+                var db = StashManagerPlugin.getDatabase();
+                var scan = db == null ? Optional.<com.zenith.plugin.stashmanager.database.DatabaseManager.ScanSummary>empty()
+                        : db.getLatestScanSummary(config.pos1, config.pos2);
+                if (scan.isPresent() && scan.get().completed()
+                        && !ScanCompletionPolicy.shouldAbort(
+                                scan.get().found(), scan.get().indexed(), scan.get().failed())) {
+                    consolidationScanCutoff = scan.get().startedAtEpochMilli();
+                    if (scan.get().failed() > 0) {
+                        emit("organize_scan_coverage_incomplete", Map.of(
+                                "failed_targets", scan.get().failed(),
+                                "disposition", "exclude_stale_sources_from_consolidation"));
+                    }
+                }
+            } catch (SQLException e) {
+                emit("organize_consolidation_scan_check_failed", Map.of(
+                        "reason", "latest_scan_unavailable"));
+            }
+        }
+        if (consolidationScanCutoff <= 0) return false;
+
+        Set<String> attempted = journalTasks.values().stream()
+                .filter(StashOrganizer::isConsolidationDonorTask)
+                .map(task -> posKey(task.source()[0], task.source()[1], task.source()[2])
+                        + ":" + task.shulkerContentFilter())
+                .collect(Collectors.toSet());
+        if (attempted.size() >= MAX_PARTIAL_SHULKER_DONORS_PER_JOB) {
+            emit("organize_consolidation_limit_reached", Map.of(
+                    "attempted_donors", attempted.size(),
+                    "disposition", "rescan_then_continue_in_new_job"));
+            return false;
+        }
+
+        var next = ShulkerConsolidationPlanner.next(
+                index.getInRegion(config.pos1, config.pos2),
+                entry -> managedSourceContainerKeys.contains(entry.posKey())
+                        && !isOrganizerExcludedPosition(new int[]{entry.x(), entry.y(), entry.z()}),
+                consolidationScanCutoff, attempted);
+        if (next.isEmpty()) return false;
+        var donor = next.get();
+        int requiredSlots = MixedShulkerPlaybook.minimumStagingSlotsWithShell(donor.contents());
+        int[] staging = scopedImportContainers().stream()
+                .map(ImportStagingPolicy::from)
+                .filter(candidate -> candidate.estimatedFreeSlots() >= requiredSlots)
+                .max(Comparator.comparingInt(ImportStagingPolicy.Candidate::estimatedFreeSlots))
+                .map(ImportStagingPolicy.Candidate::position)
+                .orElse(null);
+        if (staging == null) {
+            emit("organize_consolidation_staging_unavailable", Map.of(
+                    "required_free_slots", requiredSlots,
+                    "disposition", "preserve_partial_boxes_and_finish"));
+            return false;
+        }
+
+        int[] source = {donor.source().x(), donor.source().y(), donor.source().z()};
+        rememberStagingImportDestination(staging);
+        taskQueue.addLast(MoveTask.mixed(
+                source, staging, shulkerItemId(donor.color()),
+                donor.fingerprint(), donor.contents()));
+        totalTasks++;
+        emit("organize_partial_shulker_consolidation_queued", Map.ofEntries(
+                Map.entry("item_id", donor.itemId()),
+                Map.entry("storage_class", donor.storageClass()),
+                Map.entry("donor_slots", donor.occupiedSlots()),
+                Map.entry("recipient_slots_indexed", donor.recipientSlots()),
+                Map.entry("attempted_donors", attempted.size() + 1),
+                Map.entry("source", posString(source)),
+                Map.entry("staging", posString(staging)),
+                Map.entry("disposition", "verify_drain_then_pack_before_next_donor")));
+        return true;
+    }
+
     private void finishOrganization() {
         if (!supplyDeferredTasks.isEmpty()) {
             if (releaseSupplyDeferredGroup(countEmptyPackingShells(null) > 0)) {
@@ -9436,36 +11036,73 @@ public final class StashOrganizer {
                 advanceConsolidation();
                 return;
             }
+            if (queuePackedChestSupplyDecomposition()) {
+                advanceToNextTask();
+                return;
+            }
             if (queuePackedShellSupplyDecomposition()) {
                 advanceToNextTask();
                 return;
             }
             currentTask = null;
             state = State.CLOSING_SOURCE;
-            emit("organize_packing_supply_unavailable", Map.of(
-                    "crafting_enabled", config.craftShulkersEnabled,
-                    "assigned_tables_in_region", index.getCraftingTables().stream()
-                            .filter(pos -> isInRegion(pos[0], pos[1], pos[2])).count(),
-                    "eligible_shells_indexed", countItemInRegion("shulker_shell"),
-                    "eligible_chests_indexed", countItemInRegion("chest"),
-                    "shells_in_unassigned_chests", countUnmanagedCraftMaterial("shulker_shell"),
-                    "chests_in_unassigned_chests", countUnmanagedCraftMaterial("chest"),
-                    "packed_shell_sources_tried", shellSupplySourcesTried.size(),
-                    "deferred_tasks", supplyDeferredTasks.size()));
+            emit("organize_packing_supply_unavailable", Map.ofEntries(
+                    Map.entry("crafting_enabled", config.craftShulkersEnabled),
+                    Map.entry("assigned_tables_in_region", index.getCraftingTables().stream()
+                            .filter(pos -> isInRegion(pos[0], pos[1], pos[2])).count()),
+                    Map.entry("eligible_shells_indexed", countItemInRegion("shulker_shell")),
+                    Map.entry("eligible_chests_indexed", countItemInRegion("chest")),
+                    Map.entry("indexed_shells_in_region", countIndexedLooseItemInRegion("shulker_shell")),
+                    Map.entry("indexed_chests_in_region", countIndexedLooseItemInRegion("chest")),
+                    Map.entry("shells_in_unassigned_containers", countUnmanagedCraftMaterial("shulker_shell")),
+                    Map.entry("chests_in_unassigned_containers", countUnmanagedCraftMaterial("chest")),
+                    Map.entry("packed_shell_sources_tried", shellSupplySourcesTried.size()),
+                    Map.entry("packed_chest_sources_tried", chestSupplySourcesTried.size()),
+                    Map.entry("deferred_tasks", supplyDeferredTasks.size())));
             abortWithCargo("packing_supply_unavailable",
-                    "Remaining packing cargo is saved in import chests. Accessible packed-shell sources "
-                            + "were exhausted; provide loose shells or empty shulkers, then resume the saved job.");
+                    "Remaining packing cargo is saved in import chests. Accessible loose materials "
+                            + "and packed crafting-material sources were exhausted; replenish stock or empty "
+                            + "shulkers, then resume the saved job.");
             return;
         }
-        if (stageUnusedPackingShells()) return;
+        if (!inventoryRecoveryOnly && queuePartialShulkerConsolidation()) {
+            advanceToNextTask();
+            return;
+        }
+        if (!inventoryRecoveryOnly && stageUnusedPackingShells()) return;
+        if (inventoryRecoveryOnly) {
+            for (int raw = 9; raw <= 44; raw++) {
+                if (isProtectedInventorySlot(raw)) continue;
+                ItemStack stack = getCurrentPlayerInventoryStack(raw);
+                if (stack != null && stack.getAmount() > 0) {
+                    abortWithCargo("inventory_reconciliation_incomplete",
+                            "Unprotected inventory cargo remains in raw slot " + raw
+                                    + "; the saved recovery transaction needs review.");
+                    return;
+                }
+            }
+        }
+        Map<String, Object> completion = organizerCompletionPayload();
         BARITONE.stop();
         clearOwnedAutomation();
         restoreBaritoneBreaking();
         restorePlaceBlockSneak();
+        boolean finishedInventoryRecovery = inventoryRecoveryOnly;
+        boolean retainedKitShell = finishedInventoryRecovery && !pinnedInventorySlots.isEmpty();
         state = State.DONE;
         clearDurableJournal();
-        emit("organize_completed", organizerCompletionPayload());
-        info("Organization complete! " + completedTasks + " moves executed.");
+        inventoryRecoveryOnly = false;
+        pinnedInventorySlots = Set.of();
+        if (finishedInventoryRecovery) {
+            emit("organize_inventory_reconciliation_completed", completion);
+            info("Inventory-only reconciliation complete: " + completedTasks
+                    + " guarded handoff(s). " + (retainedKitShell
+                    ? "The separate kit checkpoint remains paused for audit."
+                    : "No kit checkpoint was changed."));
+            return;
+        }
+        emit("organize_completed", completion);
+        info("Planned organization moves complete: " + completedTasks + " executed. Run /stash scan to verify remaining coverage and consolidation.");
 
         if (decomposedMixedShulkers > 0) {
             info(decomposedMixedShulkers + " mixed shulker(s) were separated into exact-item storage.");
@@ -9523,6 +11160,28 @@ public final class StashOrganizer {
         payload.put("staged_storage_classes", stagedStorageClasses.size());
         payload.put("staging_storage_classes_planned", stagingStorageClassesPlanned.size());
         payload.put("permanent_lane_gaps", permanentLaneGaps);
+        int scanFailures = -1;
+        boolean partialPairsRemain = false;
+        try {
+            var db = StashManagerPlugin.getDatabase();
+            var scan = db == null ? Optional.<com.zenith.plugin.stashmanager.database.DatabaseManager.ScanSummary>empty()
+                    : db.getLatestScanSummary(config.pos1, config.pos2);
+            if (scan.isPresent()) {
+                scanFailures = scan.get().failed();
+                long cutoff = scan.get().startedAtEpochMilli();
+                partialPairsRemain = ShulkerConsolidationPlanner.next(
+                        index.getInRegion(config.pos1, config.pos2),
+                        entry -> managedSourceContainerKeys.contains(entry.posKey())
+                                && !isOrganizerExcludedPosition(new int[]{entry.x(), entry.y(), entry.z()}),
+                        cutoff, Set.of()).isPresent();
+            }
+        } catch (SQLException ignored) {
+            // Unknown coverage is not a verified clean finish.
+        }
+        payload.put("scan_failed_targets", scanFailures);
+        payload.put("partial_consolidation_candidates_remaining", partialPairsRemain);
+        payload.put("followup_required", scanFailures != 0 || partialPairsRemain
+                || permanentLaneGaps > 0 || stagedShulkers > 0);
         if (stagingReason != null) payload.put("staging_reason", stagingReason);
         return payload;
     }
@@ -9589,7 +11248,20 @@ public final class StashOrganizer {
                 CACHE.getPlayerCache().getInventoryCache().getOpenContainerId());
         details.put("cache_wait_ticks", containerCacheReadyTicks);
         details.put("distance", walkTarget == null ? -1.0 : distanceTo(walkTarget));
+        if (walkTarget != null) {
+            var player = CACHE.getPlayerCache();
+            details.put("reach_band", ContainerOpenReach.band(player.getX(), player.getY(), player.getZ(),
+                    walkTarget[0], walkTarget[1], walkTarget[2]).name().toLowerCase(Locale.ROOT));
+            details.put("sightline", canSeeWalkTarget());
+        }
+        details.put("last_request", lastOrganizerOpenRequestOutcome());
         return details;
+    }
+
+    private String lastOrganizerOpenRequestOutcome() {
+        if (openInteractionAttempts == 0 || ownedBaritoneRequest == null) return "none";
+        if (!ownedBaritoneRequest.isCompleted()) return "pending";
+        return ownedBaritoneRequest.getNow() ? "accepted_unconfirmed" : "rejected";
     }
 
     private void interactWithBlock(int[] pos) {
@@ -9733,9 +11405,54 @@ public final class StashOrganizer {
             return;
         }
 
+        if (switchToNextLaneChestWithCargo(retryReason)) return;
+
         abortWithCargo("destination_unreachable_with_cargo",
                 "Destination remained unreachable after " + attempt
                         + " attempts; cargo is preserved in inventory.");
+    }
+
+    /** Keep acquired cargo in its assigned class while bypassing an inaccessible lane chest. */
+    private boolean switchToNextLaneChestWithCargo(String reason) {
+        if (currentTask == null || currentRole != TargetRole.DESTINATION
+                || taskCargo.remaining() <= 0 || isImportStagingMoveTask(currentTask)) return false;
+        String storageClass = currentTask.shulkerContentFilter() != null
+                ? currentTask.shulkerContentFilter() : StorageClassPolicy.route(currentTask.itemId());
+        Column lane = columnAssignment.get(storageClass);
+        if (lane == null) return false;
+        int nextIndex = CargoDestinationPolicy.nextLaneChest(
+                lane.chests(), currentTask.destination(), currentTask.source(),
+                this::importInventoryKey, candidate -> !isOrganizerExcludedPosition(candidate));
+        if (nextIndex < 0) return false;
+
+        int[] previous = copyPos(currentTask.destination());
+        int[] next = copyPos(lane.chests().get(nextIndex));
+        closeCurrentContainer();
+        stopOwnedBaritoneProcess();
+        replaceTaskReferences(currentTask, currentTask.withDestination(next));
+        walkTarget = copyPos(next);
+        depositColumnIndex = nextIndex;
+        actionSlotIndex = 0;
+        openWaitTicks = 0;
+        containerDataReceived = false;
+        alternateContainerAccessGoal = null;
+        alternateContainerProgress.reset();
+        trackedWalkTargetKey = Long.MIN_VALUE;
+        state = State.WALKING;
+        if (!persistDurableCheckpoint(state)) {
+            abortWithCargo("destination_fallback_checkpoint_unavailable",
+                    "The alternate destination could not be saved; cargo remains in inventory.");
+            return true;
+        }
+        emit("organize_cargo_destination_switched", Map.of(
+                "reason", reason,
+                "storage_class", storageClass,
+                "previous", posString(previous),
+                "next", posString(next),
+                "lane_step", nextIndex + 1,
+                "lane_steps", lane.chests().size(),
+                "cargo_remaining", taskCargo.remaining()));
+        return true;
     }
 
     /** Keeps a produced bulk shulker in hand until a live destination accepts it. */
@@ -10331,7 +12048,9 @@ public final class StashOrganizer {
     static boolean isCargoIntegrityFailure(String reason) {
         return "player_died_cargo_unverified".equals(reason)
                 || "overflow_cargo_not_found".equals(reason)
-                || "task_cargo_not_found_during_deposit".equals(reason);
+                || "task_cargo_not_found_during_deposit".equals(reason)
+                || "kept_hotbar_exchange_unverified".equals(reason)
+                || "kept_hotbar_exchange_checkpoint_failed".equals(reason);
     }
 
     /** Death invalidates inventory-based transfer evidence; never auto-resume this transaction. */
@@ -10516,6 +12235,7 @@ public final class StashOrganizer {
     private boolean refreshProtectedInventorySlots() {
         if (inventoryKeepPolicy.isEmpty()) {
             protectedInventorySlots.clear();
+            protectedInventorySlots.addAll(pinnedInventorySlots);
             return true;
         }
         Container liveOpen = getLiveOpenContainer();
@@ -10532,7 +12252,18 @@ public final class StashOrganizer {
             }
         }
         int movableCargoUnits = taskCargo.remaining();
-        if (movableCargoUnits == 0 && durableRecoveryLoaded && currentTask != null) {
+        if (hasUnresolvedPackedHandoff()) {
+            // The checkpoint's task units are already inside its exact carried box.
+            // A same-item food refill must not be selected as loose task cargo merely
+            // because a fresh stack happens to equal the remaining ledger count.
+            if (manualPackedBoxCount <= 0 || isShulkerAtPosition(reconciliationWorksite)
+                    || uniqueManualPackedShulkerSlot(player, -1, manualPackedBoxCount) < 0) {
+                return false;
+            }
+            movableCargoUnits = 0;
+        }
+        if (movableCargoUnits == 0 && durableRecoveryLoaded && currentTask != null
+                && !hasUnresolvedPackedHandoff()) {
             // Journals written before cargo counts were persisted can still recover a finite
             // keep-list handoff from the inventory excess. This is the migration path for a
             // checkpoint that failed after accepting cargo but before staging it.
@@ -10545,6 +12276,7 @@ public final class StashOrganizer {
                 movableCargoUnits);
         protectedInventorySlots.clear();
         protectedInventorySlots.addAll(refreshed);
+        protectedInventorySlots.addAll(pinnedInventorySlots);
         return true;
     }
 
@@ -10924,24 +12656,7 @@ public final class StashOrganizer {
 
     // Return true after selecting the next chest in the column.
     private boolean cascadeToNextInColumn() {
-        if (currentTask == null) return false;
-        String assignmentKey = currentTask.shulkerContentFilter() != null
-                ? currentTask.shulkerContentFilter()
-                : StorageClassPolicy.route(currentTask.itemId());
-        Column col = columnAssignment.get(assignmentKey);
-        if (col == null) return false;
-
-        depositColumnIndex++;
-        if (depositColumnIndex < col.chests().size()) {
-            int[] next = col.chests().get(depositColumnIndex);
-            walkTarget = next;
-            currentRole = TargetRole.DESTINATION;
-            actionSlotIndex = 0;
-            containerDataReceived = false;
-            state = State.WALKING;
-            return true;
-        }
-        return false;
+        return switchToNextLaneChestWithCargo("destination_full");
     }
 
     // Item Helpers
@@ -10967,8 +12682,7 @@ public final class StashOrganizer {
         // Planning can ask before the runtime list is hydrated. Use slot-aware scanned
         // capacity rather than totalItems < 27*64, which is wrong for double chests and
         // non-stackable cargo.
-        return index.getInRegion(config.pos1, config.pos2).stream()
-                .filter(index::isImportChest)
+        return scopedImportContainers().stream()
                 .map(ImportStagingPolicy::from)
                 .filter(candidate -> candidate.estimatedFreeSlots() > 0)
                 .max(Comparator
@@ -11047,7 +12761,8 @@ public final class StashOrganizer {
                     column.id(), column.chests().stream().map(StashOrganizer::copyPos).toList()));
         }
         return new OrganizerJournalStore.Plan(
-                OrganizerJournalStore.SCHEMA_VERSION,
+                inventoryRecoveryOnly ? OrganizerJournalStore.INVENTORY_RECOVERY_SCHEMA_VERSION
+                        : OrganizerJournalStore.SCHEMA_VERSION,
                 journalJobId,
                 journalCreatedAtEpochMilli,
                 journalDimension,
@@ -11055,7 +12770,9 @@ public final class StashOrganizer {
                 copyPos(config.pos2),
                 tasks,
                 assignments,
-                new ArrayList<>(managedSourceContainerKeys));
+                new ArrayList<>(managedSourceContainerKeys),
+                crossRegionIntakes, inventoryRecoveryOnly,
+                pinnedInventorySlots.stream().sorted().toList());
     }
 
     private OrganizerJournalStore.Checkpoint snapshotJournalCheckpoint(
@@ -11065,7 +12782,8 @@ public final class StashOrganizer {
         List<Integer> consolidationIds = consolidationQueue.stream()
                 .map(this::ensureJournalTaskId).toList();
         return new OrganizerJournalStore.Checkpoint(
-                OrganizerJournalStore.SCHEMA_VERSION,
+                inventoryRecoveryOnly ? OrganizerJournalStore.INVENTORY_RECOVERY_SCHEMA_VERSION
+                        : OrganizerJournalStore.SCHEMA_VERSION,
                 journalJobId,
                 updatedAtEpochMilli,
                 resumableState.name(),
@@ -11118,7 +12836,9 @@ public final class StashOrganizer {
                                 .map(this::ensureJournalTaskId).toList(),
                         stagingForPackingSupply, supplyStagingLedger.snapshot(),
                         new LinkedHashMap<>(supplyStagesWithoutDelivery),
-                        craftingHeadroomStrategyVersion),
+                        craftingHeadroomStrategyVersion,
+                        craftMaterialSourceSnapshots(shellSupplySourcesTried),
+                        craftMaterialSourceSnapshots(chestSupplySourcesTried)),
                 inventoryRecoveryGuard.snapshot(), stationWalkRecovery.snapshot(),
                 mixedShellVerificationActive ? new OrganizerJournalStore.MixedShellVerification(
                         mixedShellVerificationTicks, temporaryShulkerPickupConfirmed, temporaryShulkerPickupFingerprint,
@@ -11128,7 +12848,19 @@ public final class StashOrganizer {
                         temporaryShulkerPickupConfirmed, temporaryShulkerPickupFingerprint,
                         temporaryShulkerPickupStorageKey, temporaryShulkerPickupItemId,
                         packedShulkerInventorySyncRecoveries,
-                        PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION));
+                        PACKED_SHULKER_INVENTORY_SYNC_STRATEGY_VERSION,
+                        manualPackedBoxCount));
+    }
+
+    private static List<OrganizerJournalStore.CraftMaterialSource> craftMaterialSourceSnapshots(
+            Set<ShellSupplySource> sources) {
+        return sources.stream()
+                .sorted(Comparator.comparingLong(ShellSupplySource::inventoryKey)
+                        .thenComparingInt(ShellSupplySource::slot)
+                        .thenComparing(ShellSupplySource::fingerprint))
+                .map(source -> new OrganizerJournalStore.CraftMaterialSource(
+                        source.inventoryKey(), source.slot(), source.fingerprint()))
+                .toList();
     }
 
     private void syncJournalTaskCatalog() {
@@ -11173,10 +12905,12 @@ public final class StashOrganizer {
         try {
             journalStore.clear();
             resetJournalMemory();
+            crossRegionIntakes = List.of();
             return true;
         } catch (IOException e) {
             reportJournalFailure(e);
             resetJournalMemory();
+            crossRegionIntakes = List.of();
             durableRecoveryError = "could not remove organizer checkpoint: " + e.getMessage();
             journalPersistenceFailed = true;
             return false;
@@ -11184,6 +12918,7 @@ public final class StashOrganizer {
     }
 
     private void resetJournalMemory() {
+        consolidationScanCutoff = -1;
         supplyDeferredTasks.clear();
         shellSupplySourcesTried.clear();
         supplyStagesWithoutDelivery.clear();
@@ -11364,11 +13099,13 @@ public final class StashOrganizer {
         placementInventorySyncConfirmedAbsent = false;
         stopAfterShulkerRecovery = false;
         shulkerRecoveryTrigger = null;
+        manualPackedBoxCount = 0;
         shulkerRecoveryBreakAttempts = 0;
         shulkerInventoryCountBeforePlacement = 0;
         compatibleShulkerCountBeforePlacement = 0;
         selectedShulkerHotbarRawSlot = -1;
         selectedShulkerRoutingKey = null;
+        clearProtectedHotbarExchange();
         shulkerHotbarSelectionRetries = 0;
         shulkerPlacePos = null;
         resetShulkerPlacementAttempt();
@@ -11607,10 +13344,14 @@ public final class StashOrganizer {
     }
 
     private boolean requiresFreshIdentityScan() {
+        return requiresFreshIdentityScan(config.pos1, config.pos2);
+    }
+
+    private boolean requiresFreshIdentityScan(int[] pos1, int[] pos2) {
         var db = StashManagerPlugin.getDatabase();
         if (db == null || !db.isInitialized()) return false;
         try {
-            return !db.latestScanHasFullItemIdentity(config.pos1, config.pos2);
+            return !db.latestScanHasFullItemIdentity(pos1, pos2);
         } catch (SQLException e) {
             return true;
         }
@@ -11750,6 +13491,59 @@ public final class StashOrganizer {
         return audit;
     }
 
+    /** Read-only evidence from both cache views; never use this audit to authorize a click. */
+    private void emitPackedShulkerWindowAudit(
+            Container open, int chestSlots, int selectedRawSlot, String phase) {
+        int windowLoose = countItemInOpenPlayerInventory(open, chestSlots, packItemId);
+        boolean worksitePresent = isShulkerAtPosition(reconciliationWorksite);
+        Map<String, Object> audit = new LinkedHashMap<>();
+        audit.put("phase", phase);
+        audit.put("container_id", openContainerId);
+        audit.put("container_slots", chestSlots);
+        audit.put("selected_raw_slot", selectedRawSlot);
+        audit.put("strict_candidate_raw_slot", uniqueTransactionEligibleShulkerSlot(open, chestSlots));
+        audit.put("partial_candidate_raw_slot", partialPackedShulkerTransactionSlot(
+                open, chestSlots, windowLoose, worksitePresent));
+        audit.put("window_shulkers", shulkerWindowAudit(open, chestSlots));
+        Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        audit.put("player_cache_shulkers", player == null ? "unavailable" : shulkerWindowAudit(player, -1));
+        audit.put("window_loose_task_units", windowLoose);
+        audit.put("player_cache_loose_task_units", countCurrentTaskCargoUnitsInInventory());
+        audit.put("ordinary_ledger_proven", packedShulkerTransactionProven(
+                1, windowLoose, worksitePresent));
+        audit.put("manual_ledger_proven", manualPackedWindowProbeLedgerValid(
+                windowLoose, worksitePresent));
+        audit.put("pickup_packet_confirmed", temporaryShulkerPickupConfirmed);
+        audit.put("pickup_item_id", Objects.toString(temporaryShulkerPickupItemId, "none"));
+        audit.put("fill_moved_units", shulkerFillMovedUnits);
+        audit.put("task_cargo_acquired", taskCargo.acquired());
+        audit.put("task_cargo_deposited", taskCargo.deposited());
+        audit.put("compatible_boxes_before_placement", compatibleShulkerCountBeforePlacement);
+        audit.put("worksite_block_present", worksitePresent);
+        audit.put("manual_probe_count", manualPackedBoxCount);
+        emit("organize_packed_shulker_window_audit", audit);
+    }
+
+    private List<String> shulkerWindowAudit(Container inventory, int chestSlots) {
+        List<String> boxes = new ArrayList<>();
+        for (int rawSlot = 9; rawSlot <= 44; rawSlot++) {
+            int slot = chestSlots < 0 ? rawSlot : rawPlayerSlotToWindowSlot(chestSlots, rawSlot);
+            if (slot < 0 || slot >= inventory.getSize()) continue;
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0
+                    || !isShulkerBoxItem(itemIdFromStack(stack))) continue;
+            ShulkerClassification shape = ShulkerClassification.classify(
+                    ItemIdentifier.readShulkerContents(stack));
+            int units = shape.contents().values().stream().mapToInt(Integer::intValue).sum();
+            boxes.add(rawSlot + "@" + slot + ":" + itemIdFromStack(stack)
+                    + ":" + shape.kind().name().toLowerCase(Locale.ROOT)
+                    + ":" + Objects.toString(shape.storageKey(), "none")
+                    + ":" + units
+                    + (isProtectedInventorySlot(rawSlot) ? ":protected" : ":movable"));
+        }
+        return boxes;
+    }
+
     /** Console-triggered evidence for repairing a preserved legacy packing checkpoint. */
     public void emitPackedShulkerInventoryAudit() {
         emit("organize_packed_shulker_inventory_audit", packedShulkerInventoryAudit());
@@ -11764,7 +13558,7 @@ public final class StashOrganizer {
                 || packedShulkerPickupTransactionProven(
                         temporaryShulkerPickupConfirmed,
                         mixedDecompositionMode,
-                        currentTask != null && currentTask.mixedBatchConsolidation(),
+                        isCurrentPackingHandoff(),
                         shulkerFillMovedUnits,
                         taskCargo.acquired(),
                         taskCargo.deposited(),
@@ -11792,7 +13586,7 @@ public final class StashOrganizer {
             int candidateShulkers, int looseCargoUnits, boolean worksiteBlockPresent) {
         return packedShulkerTransactionProven(
                 mixedDecompositionMode,
-                currentTask != null && currentTask.mixedBatchConsolidation(),
+                isCurrentPackingHandoff(),
                 shulkerFillMovedUnits,
                 taskCargo.acquired(),
                 taskCargo.deposited(),
@@ -11805,13 +13599,19 @@ public final class StashOrganizer {
     private boolean hasUnresolvedPackedShulkerTransaction() {
         return packedShulkerTransactionLedgerProven(
                 mixedDecompositionMode,
-                currentTask != null && currentTask.mixedBatchConsolidation(),
+                isCurrentPackingHandoff(),
                 shulkerFillMovedUnits,
                 taskCargo.acquired(),
                 taskCargo.deposited(),
                 countCurrentTaskCargoUnitsInInventory(),
                 packDestination != null,
                 isShulkerAtPosition(reconciliationWorksite));
+    }
+
+    private boolean isCurrentPackingHandoff() {
+        return PackedShulkerWindowProbePolicy.packingHandoff(currentTask != null,
+                currentTask != null && currentTask.mixedBatchConsolidation(),
+                fetchedPackingShulker);
     }
 
     static boolean packedShulkerTransactionProven(
@@ -11951,18 +13751,51 @@ public final class StashOrganizer {
             int chestSlots,
             int looseCargoUnits,
             boolean worksiteBlockPresent) {
+        if (chestSlots >= 0 && MANUAL_PACKED_WINDOW_PROBE.equals(shulkerRecoveryTrigger)) {
+            // Container(0) merely armed this probe. The opened destination window must
+            // independently show the unique, correctly filled player-inventory box.
+            // Never fall through to the ordinary box selector on a failed identity check.
+            if (!manualPackedWindowProbeLedgerValid(looseCargoUnits, worksiteBlockPresent)) {
+                return -1;
+            }
+            return uniqueManualPackedShulkerSlot(inventory, chestSlots, manualPackedBoxCount);
+        }
+        int partialCandidate = partialPackedShulkerTransactionSlot(
+                inventory, chestSlots, looseCargoUnits, worksiteBlockPresent);
+        if (partialCandidate >= 0) return partialCandidate;
+        if (chestSlots >= 0 && inventoryRecoveryOnly
+                && packedShulkerInventorySyncRecoveries > 0
+                && compatibleShulkerCountBeforePlacement == 0
+                && !worksiteBlockPresent && looseCargoUnits == 0
+                && packedShulkerTransactionProven(
+                        1, looseCargoUnits, worksiteBlockPresent)) {
+            // Only the opened server window can override a missing second pickup packet.
+            // An exact single-type box, uniquely present in the player section, is the
+            // transaction receipt; Container(0) alone is never sufficient to click.
+            int exact = exactPackedShulkerSlot(inventory, chestSlots);
+            if (exact >= 0) return exact;
+        }
         int strictCandidate = uniqueTransactionEligibleShulkerSlot(inventory, chestSlots);
         if (strictCandidate >= 0 && packedShulkerTransactionProven(
                 1, looseCargoUnits, worksiteBlockPresent)) {
             int strictSlot = chestSlots < 0
                     ? strictCandidate
                     : rawPlayerSlotToWindowSlot(chestSlots, strictCandidate);
+            ItemStack strictStack = inventory.getItemStack(strictSlot);
             ShulkerClassification strictShape = ShulkerClassification.classify(
-                    ItemIdentifier.readShulkerContents(inventory.getItemStack(strictSlot)));
+                    ItemIdentifier.readShulkerContents(strictStack));
+            boolean soleMovable = uniqueMovableShulkerSlot(inventory, chestSlots)
+                    == strictCandidate;
             // An exact bulk box identifies itself. An empty box is only transaction-specific
             // when no second movable shulker can be mistaken for the collected worksite shell.
-            if (isCompatiblePackedBulk(strictShape)
-                    || uniqueMovableShulkerSlot(inventory, chestSlots) == strictCandidate) {
+            // A compatible bulk box of a different color may belong to a later task.
+            if (PackedShulkerHandoffPolicy.uniquePickupCandidate(
+                    temporaryShulkerPickupItemId, itemIdFromStack(strictStack),
+                    temporaryShulkerPickupItemId == null ? 0
+                            : countShulkerBoxesOfItemId(
+                                    inventory, chestSlots, temporaryShulkerPickupItemId),
+                    soleMovable)
+                    && (isCompatiblePackedBulk(strictShape) || soleMovable)) {
                 return strictCandidate;
             }
         }
@@ -11990,7 +13823,7 @@ public final class StashOrganizer {
                             countShulkerBoxes(inventory, chestSlots),
                             compatibleShulkerCountBeforePlacement,
                             mixedDecompositionMode,
-                            currentTask != null && currentTask.mixedBatchConsolidation(),
+                            isCurrentPackingHandoff(),
                             shulkerFillMovedUnits,
                             taskCargo.acquired(),
                             taskCargo.deposited(),
@@ -12014,7 +13847,7 @@ public final class StashOrganizer {
                     && packedShulkerPickupTransactionProven(
                             temporaryShulkerPickupConfirmed,
                             mixedDecompositionMode,
-                            currentTask != null && currentTask.mixedBatchConsolidation(),
+                            isCurrentPackingHandoff(),
                             shulkerFillMovedUnits,
                             taskCargo.acquired(),
                             taskCargo.deposited(),
@@ -12036,6 +13869,83 @@ public final class StashOrganizer {
         }
 
         return -1;
+    }
+
+    /** A live window may deliver a verified box even after an earlier partial delivery. */
+    private int partialPackedShulkerTransactionSlot(
+            Container inventory, int chestSlots, int looseCargoUnits,
+            boolean worksiteBlockPresent) {
+        if (inventory == null || chestSlots < 0 || looseCargoUnits < 0
+                || mixedDecompositionMode || currentTask == null
+                || !PackedShulkerWindowProbePolicy.partialHandoffTaskEligible(
+                        currentTask.mixedBatchConsolidation(), isCurrentPackingHandoff())
+                || packDestination == null
+                || worksiteBlockPresent || !temporaryShulkerPickupConfirmed
+                || temporaryShulkerPickupItemId == null
+                || !PackedShulkerWindowProbePolicy.partialCollectedBoxCountProven(
+                        shulkerInventoryCountBeforePlacement,
+                        countShulkerBoxes(inventory, chestSlots),
+                        countShulkerBoxesOfItemId(
+                                inventory, chestSlots, temporaryShulkerPickupItemId))
+                || !PackedShulkerWindowProbePolicy.taskCargoAccountedFor(
+                        taskCargo.acquired(), taskCargo.deposited(),
+                        shulkerFillMovedUnits, looseCargoUnits)) return -1;
+        int candidate = uniqueTransactionEligibleShulkerSlot(inventory, chestSlots);
+        if (candidate < 0) return -1;
+        ItemStack box = inventory.getItemStack(rawPlayerSlotToWindowSlot(chestSlots, candidate));
+        if (!temporaryShulkerPickupItemId.equals(itemIdFromStack(box))
+                || !PackedShulkerWindowProbePolicy.matchesContents(
+                        ItemIdentifier.readShulkerContents(box), packItemId,
+                        shulkerFillMovedUnits, compatibleShulkerCountBeforePlacement)) return -1;
+        return candidate;
+    }
+
+    private int exactPackedShulkerSlot(Container inventory, int chestSlots) {
+        if (inventory == null || packItemId == null || shulkerFillMovedUnits <= 0) return -1;
+        int candidate = -1;
+        for (int raw = 9; raw <= 44; raw++) {
+            if (isProtectedInventorySlot(raw)) continue;
+            int slot = chestSlots < 0 ? raw : rawPlayerSlotToWindowSlot(chestSlots, raw);
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack == null || stack.getAmount() != 1
+                    || !isShulkerBoxItem(itemIdFromStack(stack))) continue;
+            Map<String, Integer> contents = ItemIdentifier.readShulkerContents(stack);
+            if (contents.size() != 1
+                    || contents.getOrDefault(packItemId, 0) != shulkerFillMovedUnits) continue;
+            if (candidate >= 0) return -1;
+            candidate = raw;
+        }
+        return candidate;
+    }
+
+    /** A manual probe may carry a pre-filled partial box; never infer delivery from this cache. */
+    private boolean manualPackedWindowProbeLedgerValid(
+            int looseTaskUnits, boolean worksiteBlockPresent) {
+        return !mixedDecompositionMode
+                && isCurrentPackingHandoff()
+                && shulkerInventoryCountBeforePlacement >= 1
+                && (compatibleShulkerCountBeforePlacement == 0
+                    || compatibleShulkerCountBeforePlacement == 1)
+                && PackedShulkerWindowProbePolicy.taskCargoAccountedFor(
+                        taskCargo.acquired(), taskCargo.deposited(),
+                        shulkerFillMovedUnits, looseTaskUnits)
+                && packDestination != null && !worksiteBlockPresent;
+    }
+
+    private int uniqueManualPackedShulkerSlot(
+            Container inventory, int chestSlots, int expectedCount) {
+        if (inventory == null || expectedCount <= 0) return -1;
+        List<PackedShulkerWindowProbePolicy.Candidate> boxes = new ArrayList<>();
+        for (int raw = 9; raw <= 44; raw++) {
+            int slot = chestSlots < 0 ? raw : rawPlayerSlotToWindowSlot(chestSlots, raw);
+            ItemStack stack = inventory.getItemStack(slot);
+            if (stack == null || stack.getAmount() != 1
+                    || !isShulkerBoxItem(itemIdFromStack(stack))) continue;
+            boxes.add(new PackedShulkerWindowProbePolicy.Candidate(raw,
+                    isProtectedInventorySlot(raw), ItemIdentifier.readShulkerContents(stack)));
+        }
+        return PackedShulkerWindowProbePolicy.uniqueMatchingSlot(boxes, packItemId,
+                shulkerFillMovedUnits, compatibleShulkerCountBeforePlacement, expectedCount);
     }
 
     private int countShulkerBoxesOfItemId(
@@ -12485,12 +14395,23 @@ public final class StashOrganizer {
             if (selected == null || selected.getAmount() <= 0
                     || !isShulkerBoxItem(itemIdFromStack(selected))) return false;
             var builder = InventoryActionRequest.builder().owner(this).priority(6000);
+            int exchangeTarget = -1;
+            ItemStack displacedKeep = null;
             if (slot >= 36 && slot <= 44) {
                 selectedShulkerHotbarRawSlot = slot;
                 builder.actions(new SetHeldItem(slot - 36));
             } else {
                 int hotbarIndex = preferredUnprotectedHotbarIndex();
-                if (hotbarIndex < 0) return false;
+                if (hotbarIndex < 0) {
+                    // A swap preserves the kept stack in the shulker's former main slot.
+                    // Never evict a tool or armor just to obtain a temporary held slot.
+                    if (isProtectedInventorySlot(slot)) return false;
+                    hotbarIndex = preferredProtectedSupplyHotbarIndex();
+                    if (hotbarIndex < 0) return false;
+                    exchangeTarget = 36 + hotbarIndex;
+                    displacedKeep = getPlayerInventoryStack(exchangeTarget);
+                    if (displacedKeep == null || displacedKeep.getAmount() <= 0) return false;
+                }
                 selectedShulkerHotbarRawSlot = 36 + hotbarIndex;
                 builder.actions(
                     new MoveToHotbarSlot(slot, MoveToHotbarAction.from(hotbarIndex)),
@@ -12499,14 +14420,46 @@ public final class StashOrganizer {
             }
             selectedShulkerRoutingKey = cargoRoutingKey(selected);
             RequestFuture future = INVENTORY.submit(builder.build());
+            if (future.isDone() && !future.isAccepted()) {
+                selectedShulkerHotbarRawSlot = -1;
+                selectedShulkerRoutingKey = null;
+                return false;
+            }
+            if (exchangeTarget >= 0) {
+                protectedHotbarExchangeSource = slot;
+                protectedHotbarExchangeTarget = exchangeTarget;
+                protectedHotbarExchangeExpected = displacedKeep;
+            }
             ownInventory(future);
-            return !(future.isDone() && !future.isAccepted());
+            return true;
         } catch (Exception e) {
             selectedShulkerHotbarRawSlot = -1;
             selectedShulkerRoutingKey = null;
+            clearProtectedHotbarExchange();
             info("Failed to move shulker to hotbar: " + e.getMessage());
             return false;
         }
+    }
+
+    private int preferredProtectedSupplyHotbarIndex() {
+        Map<Integer, String> hotbar = new LinkedHashMap<>();
+        for (int raw = 36; raw <= 44; raw++) {
+            ItemStack stack = getPlayerInventoryStack(raw);
+            if (stack != null && stack.getAmount() > 0) {
+                hotbar.put(raw, itemIdFromStack(stack));
+            }
+        }
+        Set<Integer> movableProtected = new HashSet<>(protectedInventorySlots);
+        movableProtected.removeAll(pinnedInventorySlots);
+        int raw = OrganizerHotbarExchangePolicy.protectedSupplySlot(hotbar,
+                movableProtected, 36 + CACHE.getPlayerCache().getHeldItemSlot());
+        return raw < 36 ? -1 : raw - 36;
+    }
+
+    private void clearProtectedHotbarExchange() {
+        protectedHotbarExchangeSource = -1;
+        protectedHotbarExchangeTarget = -1;
+        protectedHotbarExchangeExpected = null;
     }
 
     private boolean selectedShulkerReadyForPlacement() {
@@ -12661,7 +14614,7 @@ public final class StashOrganizer {
 
     private int countUnmanagedCraftMaterial(String itemId) {
         int count = 0;
-        for (ContainerEntry container : indexedCraftMaterialSources()) {
+        for (ContainerEntry container : indexedMaterialContainers(false)) {
             if (!isManagedSourceContainer(container)
                     && !isAssignedCraftMaterialChest(container)) {
                 count += looseItemCount(container, itemId);
@@ -12670,10 +14623,23 @@ public final class StashOrganizer {
         return count;
     }
 
+    private int countIndexedLooseItemInRegion(String itemId) {
+        int count = 0;
+        for (ContainerEntry container : indexedMaterialContainers(false)) {
+            count += looseItemCount(container, itemId);
+        }
+        return count;
+    }
+
     private List<ContainerEntry> indexedCraftMaterialSources() {
+        return indexedMaterialContainers(true);
+    }
+
+    private List<ContainerEntry> indexedMaterialContainers(boolean eligibleOnly) {
         Map<Long, ContainerEntry> inventories = new HashMap<>();
         for (ContainerEntry container : index.getAll()) {
-            if (!isCraftMaterialSourceContainer(container)) continue;
+            if (eligibleOnly ? !isCraftMaterialSourceContainer(container)
+                    : !isInRegion(container.x(), container.y(), container.z())) continue;
             long key = importInventoryKey(new int[]{container.x(), container.y(), container.z()});
             inventories.merge(key, container, (current, candidate) ->
                     candidate.timestamp() > current.timestamp()
@@ -12713,12 +14679,19 @@ public final class StashOrganizer {
     private boolean isCraftMaterialSourceContainer(ContainerEntry container) {
         if (container == null || !isInRegion(container.x(), container.y(), container.z())) return false;
         if (isProtectedCraftMaterialInventory(container)) return false;
+        if (isTemporaryCraftMaterialWorksite(container)) return false;
         long inventory = importInventoryKey(new int[]{container.x(), container.y(), container.z()});
         if (config.supplyChests != null && config.supplyChests.stream()
                 .anyMatch(pos -> pos != null && importInventoryKey(pos) == inventory)) return false;
         return isManagedSourceContainer(container)
                 || isAssignedCraftMaterialChest(container)
-                || isAutomaticCraftMaterialChest(container);
+                || isAutomaticCraftMaterialSource(container);
+    }
+
+    private boolean isTemporaryCraftMaterialWorksite(ContainerEntry container) {
+        int[] position = {container.x(), container.y(), container.z()};
+        return Arrays.equals(position, reconciliationWorksite)
+                || Arrays.equals(position, shulkerPlacePos);
     }
 
     private boolean isAssignedCraftMaterialChest(ContainerEntry container) {
@@ -12727,7 +14700,8 @@ public final class StashOrganizer {
                 .anyMatch(pos -> pos != null && importInventoryKey(pos) == inventory);
     }
 
-    private boolean isAutomaticCraftMaterialChest(ContainerEntry container) {
+    private boolean isAutomaticCraftMaterialSource(ContainerEntry container) {
+        if (isPlacedShulkerBox(container)) return !container.isDouble();
         String block = container.blockType();
         if (!"chest".equals(block) && !"minecraft:chest".equals(block)
                 && !"trapped_chest".equals(block) && !"minecraft:trapped_chest".equals(block)) {
@@ -12739,6 +14713,13 @@ public final class StashOrganizer {
         int otherZ = container.inventoryZ() + ("Z".equals(container.doubleChestAxis()) ? 1 : 0);
         return isInRegion(container.inventoryX(), container.inventoryY(), container.inventoryZ())
                 && isInRegion(otherX, container.inventoryY(), otherZ);
+    }
+
+    private static boolean isPlacedShulkerBox(ContainerEntry container) {
+        String block = container == null ? null : container.blockType();
+        if (block == null) return false;
+        if (block.startsWith("minecraft:")) block = block.substring("minecraft:".length());
+        return "shulker_box".equals(block) || block.endsWith("_shulker_box");
     }
 
     private boolean isProtectedCraftMaterialInventory(ContainerEntry container) {

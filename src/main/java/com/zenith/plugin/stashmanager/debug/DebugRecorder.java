@@ -17,22 +17,40 @@ import java.util.List;
 // exportable troubleshooting, mirroring OpenCraft's ChatDebugRecorder.
 public final class DebugRecorder {
 
-    private static final int MAX_EVENTS = 500;
-    private static final int MAX_DETAIL_LENGTH = 1000;
-    private final Deque<DebugEvent> events = new ArrayDeque<>(MAX_EVENTS);
+    private static final int DEFAULT_MAX_EVENTS = 500;
+    private static final int DEFAULT_MAX_DETAIL_LENGTH = 1000;
+    private final int maxEvents;
+    private final int maxDetailLength;
+    private final Deque<DebugEvent> events;
+
+    public DebugRecorder() {
+        this(DEFAULT_MAX_EVENTS);
+    }
+
+    public DebugRecorder(int maxEvents) {
+        this(maxEvents, DEFAULT_MAX_DETAIL_LENGTH);
+    }
+
+    public DebugRecorder(int maxEvents, int maxDetailLength) {
+        if (maxEvents < 1) throw new IllegalArgumentException("maxEvents must be positive");
+        if (maxDetailLength < 4) throw new IllegalArgumentException("maxDetailLength must be at least 4");
+        this.maxEvents = maxEvents;
+        this.maxDetailLength = maxDetailLength;
+        this.events = new ArrayDeque<>(maxEvents);
+    }
 
     public synchronized void record(String stage, String detail) {
         record(stage, detail, null);
     }
 
     public synchronized void record(String stage, String detail, @Nullable Throwable error) {
-        if (events.size() >= MAX_EVENTS) {
+        if (events.size() >= maxEvents) {
             events.removeFirst();
         }
         events.addLast(new DebugEvent(
             Instant.now().toString(),
-            compact(stage),
-            compact(detail),
+            compact(stage, DEFAULT_MAX_DETAIL_LENGTH),
+            compact(detail, maxDetailLength),
             error == null ? null : stackTraceOf(error)
         ));
     }
@@ -77,12 +95,12 @@ public final class DebugRecorder {
         return sw.toString();
     }
 
-    private static String compact(@Nullable String text) {
+    private static String compact(@Nullable String text, int limit) {
         if (text == null) return "";
         String singleLine = text.replaceAll("[\\r\\n]+", " ").strip();
-        return singleLine.length() <= MAX_DETAIL_LENGTH
+        return singleLine.length() <= limit
             ? singleLine
-            : singleLine.substring(0, MAX_DETAIL_LENGTH - 3) + "...";
+            : singleLine.substring(0, limit - 3) + "...";
     }
 
     public record DebugEvent(String timestamp, String stage, String detail, @Nullable String stackTrace) {

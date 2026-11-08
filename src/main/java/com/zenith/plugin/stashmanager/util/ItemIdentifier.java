@@ -123,6 +123,90 @@ public final class ItemIdentifier {
         return slots;
     }
 
+    /** Physical contents for live, component-exact kit planning; never persist these stacks. */
+    public static List<ItemStack> readShulkerPhysicalStacks(ItemStack shulkerStack) {
+        if (shulkerStack == null || shulkerStack.getAmount() <= 0) return List.of();
+        try {
+            DataComponents components = shulkerStack.getDataComponents();
+            if (components == null) return List.of();
+            Object value = components.get(DataComponentTypes.CONTAINER);
+            if (!(value instanceof List<?> entries)) return List.of();
+            List<ItemStack> stacks = new java.util.ArrayList<>();
+            for (Object entry : entries) {
+                Object unwrapped = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
+                if (unwrapped instanceof ItemStack stack && stack.getId() != 0
+                        && stack.getAmount() > 0) {
+                    stacks.add(new ItemStack(stack.getId(), stack.getAmount(),
+                            stack.getDataComponents()));
+                }
+            }
+            return List.copyOf(stacks);
+        } catch (Exception ignored) {
+            return List.of();
+        }
+    }
+
+    /**
+     * Preserve the actual inner slot numbers for a guarded physical exchange.
+     * An unreadable or malformed container is not usable as exchange evidence.
+     */
+    public static Map<Integer, ItemStack> readShulkerPhysicalSlotStacks(ItemStack shulkerStack) {
+        if (shulkerStack == null || shulkerStack.getAmount() != 1) return Map.of();
+        try {
+            DataComponents components = shulkerStack.getDataComponents();
+            if (components == null) return Map.of();
+            Object value = components.get(DataComponentTypes.CONTAINER);
+            if (!(value instanceof List<?> entries) || entries.size() != 27) return Map.of();
+            Map<Integer, ItemStack> stacks = new LinkedHashMap<>();
+            for (int slot = 0; slot < entries.size(); slot++) {
+                Object entry = entries.get(slot);
+                Object unwrapped = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
+                if (unwrapped == null) continue;
+                if (!(unwrapped instanceof ItemStack stack) || stack.getId() == 0
+                        || stack.getAmount() < 1) return Map.of();
+                stacks.put(slot, new ItemStack(stack.getId(), stack.getAmount(),
+                        stack.getDataComponents()));
+            }
+            return Map.copyOf(stacks);
+        } catch (Exception ignored) {
+            return Map.of();
+        }
+    }
+
+    /** Diagnostic only: physical counts and equality groups, without exposing item components. */
+    public static List<String> readShulkerStackDetails(ItemStack shulkerStack, String itemId) {
+        List<String> details = new java.util.ArrayList<>();
+        if (shulkerStack == null || shulkerStack.getAmount() <= 0 || itemId == null) return details;
+        try {
+            DataComponents components = shulkerStack.getDataComponents();
+            if (components == null) return details;
+            Object value = components.get(DataComponentTypes.CONTAINER);
+            if (!(value instanceof List<?> entries)) return details;
+            List<DataComponents> variants = new java.util.ArrayList<>();
+            for (int slot = 0; slot < entries.size(); slot++) {
+                Object entry = entries.get(slot);
+                Object unwrapped = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
+                if (!(unwrapped instanceof ItemStack stack) || stack.getAmount() <= 0
+                        || !itemId.equals(getItemId(stack))) continue;
+                int variant = -1;
+                for (int i = 0; i < variants.size(); i++) {
+                    if (java.util.Objects.equals(variants.get(i), stack.getDataComponents())) {
+                        variant = i;
+                        break;
+                    }
+                }
+                if (variant < 0) {
+                    variants.add(stack.getDataComponents());
+                    variant = variants.size() - 1;
+                }
+                details.add(slot + ":" + stack.getAmount() + "@variant" + (variant + 1));
+            }
+        } catch (Exception ignored) {
+            // Never let malformed container metadata turn a read-only diagnostic into a failure.
+        }
+        return details;
+    }
+
     // Physical stack count matters during mixed-box admission: 27 non-stackable tools need
     // more unpack room than 27 blocks even though both aggregate to a quantity of 27.
     public static int readShulkerOccupiedSlots(ItemStack shulkerStack) {

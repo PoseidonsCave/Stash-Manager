@@ -16,6 +16,12 @@ final class AutomationNotificationPolicy {
                  "organize_planning_blocked",
                  "organize_checkpoint_failed",
                  "organize_checkpoint_invalid",
+                 "kit_fulfillment_started",
+                 "kit_fulfillment_completed",
+                 "kit_fulfillment_partial",
+                 "kit_fulfillment_blocked",
+                 "kit_recovery_blocked",
+                 "kit_recovery_manual_review",
                  "retrieve_started",
                  "retrieve_no_targets" -> true;
             default -> false;

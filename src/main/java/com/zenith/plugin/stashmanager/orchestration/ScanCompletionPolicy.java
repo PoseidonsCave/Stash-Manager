@@ -3,7 +3,7 @@ package com.zenith.plugin.stashmanager.orchestration;
 /** Rejects incomplete scans before they can be treated as a trusted snapshot. */
 public final class ScanCompletionPolicy {
     private static final int ABSOLUTE_FAILURE_ALLOWANCE = 10;
-    private static final double FAILURE_RATE_ALLOWANCE = 0.05;
+    private static final double FAILURE_RATE_ALLOWANCE = 0.01;
 
     private ScanCompletionPolicy() { }
 
@@ -58,6 +58,13 @@ public final class ScanCompletionPolicy {
             int containersIndexed,
             int containersFailed) {
         return !assess(containersFound, containersIndexed, containersFailed).accepted();
+    }
+
+    /** A tolerated partial scan is finished, but stale rows must not drive organizer work. */
+    public static boolean trustedSnapshot(
+            int containersFound, int containersIndexed, int containersFailed) {
+        return containersFound >= 0 && containersIndexed == containersFound
+                && containersFailed == 0;
     }
 
     public record Assessment(

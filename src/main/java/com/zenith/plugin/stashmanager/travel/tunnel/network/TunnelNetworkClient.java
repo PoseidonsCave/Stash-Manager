@@ -52,7 +52,7 @@ public final class TunnelNetworkClient {
         try {
             return Optional.ofNullable(GSON.fromJson(response.body(), CapabilitiesDto.class));
         } catch (Exception e) {
-            LOGGER.debug("Failed to parse tunnel capabilities: {}", e.getMessage());
+            LOGGER.debug("Failed to parse tunnel capabilities ({})", e.getClass().getSimpleName());
             return Optional.empty();
         }
     }
@@ -76,7 +76,7 @@ public final class TunnelNetworkClient {
                 }
             }
         } catch (Exception e) {
-            LOGGER.debug("Failed to parse tunnel download payload: {}", e.getMessage());
+            LOGGER.debug("Failed to parse tunnel download payload ({})", e.getClass().getSimpleName());
         }
         return List.of();
     }
@@ -117,11 +117,11 @@ public final class TunnelNetworkClient {
             return httpClient.send(builder.build(), HttpResponse.BodyHandlers.ofString());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            LOGGER.debug("Tunnel network request interrupted: {}", e.getMessage());
+            LOGGER.debug("Tunnel network request interrupted ({})", e.getClass().getSimpleName());
         } catch (IOException e) {
-            LOGGER.debug("Tunnel network request failed: {}", e.getMessage());
+            LOGGER.debug("Tunnel network request failed ({})", e.getClass().getSimpleName());
         } catch (Exception e) {
-            LOGGER.debug("Tunnel network request error: {}", e.getMessage());
+            LOGGER.debug("Tunnel network request error ({})", e.getClass().getSimpleName());
         }
         return null;
     }

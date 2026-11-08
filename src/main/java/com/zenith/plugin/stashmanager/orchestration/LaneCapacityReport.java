@@ -27,6 +27,8 @@ public record LaneCapacityReport(
         NEEDS_FRESH_SCAN,
         NEEDS_FRESH_CONTAINER_SCAN,
         REGION_NOT_DEFINED,
+        NO_STORAGE_REGION,
+        MULTIPLE_STORAGE_REGIONS,
         NO_SCANNED_CONTAINERS,
         NO_LANES_DETECTED
     }

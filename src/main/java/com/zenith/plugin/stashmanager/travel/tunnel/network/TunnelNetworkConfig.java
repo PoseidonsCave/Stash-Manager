@@ -48,7 +48,12 @@ public final class TunnelNetworkConfig {
     }
 
     public boolean isConfigured() {
-        return enabled && endpointUri != null;
+        return enabled && endpointUri != null
+                && "https".equalsIgnoreCase(endpointUri.getScheme())
+                && endpointUri.getHost() != null
+                && endpointUri.getUserInfo() == null
+                && endpointUri.getQuery() == null
+                && endpointUri.getFragment() == null;
     }
 
     private static URI normalizeEndpoint(String endpointUrl) {
@@ -57,7 +62,11 @@ public final class TunnelNetworkConfig {
         if (value.isEmpty()) return null;
         if (!value.endsWith("/")) value = value + "/";
         try {
-            return URI.create(value);
+            URI uri = URI.create(value);
+            if (!"https".equalsIgnoreCase(uri.getScheme()) || uri.getHost() == null
+                    || uri.getUserInfo() != null || uri.getQuery() != null
+                    || uri.getFragment() != null) return null;
+            return uri;
         } catch (IllegalArgumentException e) {
             return null;
         }

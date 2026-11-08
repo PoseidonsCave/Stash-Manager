@@ -47,7 +47,7 @@ public class StashManagerPlugin implements ZenithProxyPlugin {
             try {
                 sharedDatabase.initialize(config);
             } catch (Exception e) {
-                System.err.println("[StashManager] Database initialization failed: " + e.getMessage());
+                System.err.println("[StashManager] Database initialization failed; inspect database connectivity and credentials");
             }
         }
 

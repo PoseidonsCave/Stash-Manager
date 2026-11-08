@@ -19,6 +19,7 @@ import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.StashManagerModule;
 import com.zenith.plugin.stashmanager.api.ApiServer;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
+import com.zenith.plugin.stashmanager.debug.WorldNbtAudit;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.index.IndexExporter;
@@ -34,6 +35,10 @@ import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import com.zenith.plugin.stashmanager.util.ItemResolver;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.charset.StandardCharsets;
 
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -44,6 +49,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeSet;
 import java.util.stream.Collectors;
 
@@ -52,10 +58,11 @@ import static com.mojang.brigadier.arguments.StringArgumentType.greedyString;
 import static com.mojang.brigadier.arguments.StringArgumentType.string;
 import static com.zenith.Globals.CACHE;
 import static com.zenith.Globals.BOT;
-import static com.zenith.Globals.DISCORD;
 
 // Main /stash command tree: pos1, pos2, scan, stop, status, list, export, clear, db, config.
 public class StashCommand extends Command {
+
+    private static final Logger WORLD_AUDIT_LOG = LoggerFactory.getLogger("Plugin.StashManager.WorldAudit");
 
     private static final int PAGE_SIZE = 10;
     private static final int KIT_CATALOG_PAGE_SIZE = 20;
@@ -91,10 +98,10 @@ public class StashCommand extends Command {
             .usageLines(
                 "pos1 [x y z]",
                 "pos2 [x y z]",
-                "scan / stop / return / status / summary",
+                "scan [region|all] / stop / return / status / summary",
                 "update / update check",
                 "list [page] / export / clear / clearall",
-                "debug <recent [count]|clear|export>",
+                "debug <recent [count]|clear|export|worldaudit [chunk_radius]|pose <on|off|recent [count]|clear|export>>",
                 "keep <add|remove|list> [count]",
                 "reequip [preview] (refill kept gear and equip empty armor/offhand slots)",
                 "import [remove|list|purge [confirm]] (face a chest for add/remove)",
@@ -103,11 +110,11 @@ public class StashCommand extends Command {
                 "crafting [add|remove|list|on|off] (face a crafting table to assign it)",
                 "crafting materials [add|remove|list] (face a chest with shells or chests)",
                 "label <x> <y> <z> <label> / labels",
-                "region <save|load|list|delete> [name]",
+                "region <save|load|list|role|delete> [name]",
                 "profile <create|enchant|unenchant|mode|lane|list|show|delete> ...",
-                "kit <create|catalog|select|profile|output|finish|list|show|snap|delete|add|remove> <name>",
+                "kit <create|catalog|select|profile|output|finish|crafting|build|job|stop|recover|resume|repairvariantto|auditvariantsource|cargo|auditcargo|auditborrowed|inspectsource|acklostsource|acklostborrowed|discard|list|show|snap|delete|add|remove> <name>",
                 "get <item_id> [count] / kit <name> / status / stop",
-                "lanes [export] / organize [stop|status]",
+                "lanes [export] / organize [region|stop|status]",
                 "db status / db clear",
                 "config <scanDelay|openTimeout|maxContainers|walkTimeout|preemptionCooldown|controlGrace> <value>",
                 "config returnToStart <on|off>",
@@ -183,8 +190,31 @@ public class StashCommand extends Command {
             )
             .then(literal("scan")
                 .executes(c -> {
-                    boolean started = module.startScan();
                     var embed = c.getSource().getEmbed();
+                    if (config.databaseEnabled) {
+                        if (database == null || !database.isInitialized()) {
+                            embed.title("Scan Failed")
+                                .description("Database unavailable; cannot check saved regions.")
+                                .errorColor();
+                            return OK;
+                        }
+                        try {
+                            var regions = database.listRegions();
+                            if (!regions.isEmpty()) {
+                                embed.title("Choose a Scan Region")
+                                    .description("Saved regions exist. Use `/stash scan <name>` for one "
+                                        + "or `/stash scan all` for every saved region.")
+                                    .primaryColor();
+                                return OK;
+                            }
+                        } catch (Exception e) {
+                            embed.title("Scan Failed")
+                                .description("Could not check saved regions: " + e.getMessage())
+                                .errorColor();
+                            return OK;
+                        }
+                    }
+                    boolean started = module.startScan();
                     if (started) {
                         embed.title("Stash Scan Started")
                             .successColor();
@@ -205,9 +235,85 @@ public class StashCommand extends Command {
                     }
                     return OK;
                 })
+                .then(literal("all")
+                    .executes(c -> {
+                        var embed = c.getSource().getEmbed();
+                        if (database == null || !database.isInitialized()) {
+                            embed.title("Scan Failed").description("Database not connected.").errorColor();
+                            return OK;
+                        }
+                        try {
+                            var regions = database.listRegions();
+                            if (regions.isEmpty()) {
+                                embed.title("Scan Failed")
+                                    .description("No saved regions. Set pos1/pos2 and use `/stash scan`, "
+                                        + "or save a region first.")
+                                    .errorColor();
+                                return OK;
+                            }
+                            if (module.startScanRegions(regions)) {
+                                embed.title("Multi-Region Scan Started")
+                                    .description("Scanning " + regions.size() + " saved region(s) in name order. "
+                                        + "Each region gets its own scan result; an unhealthy region stops the batch.")
+                                    .successColor();
+                            } else {
+                                embed.title("Scan Failed")
+                                    .description(withSpectatorTip(Objects.toString(
+                                        module.getScanStartBlocker(regions), "Scan could not be started.")))
+                                    .errorColor();
+                            }
+                        } catch (Exception e) {
+                            embed.title("Scan Failed")
+                                .description("Could not load saved regions: " + e.getMessage())
+                                .errorColor();
+                        }
+                        return OK;
+                    }))
+                .then(argument("region", string())
+                    .executes(c -> {
+                        String name = StringArgumentType.getString(c, "region");
+                        var embed = c.getSource().getEmbed();
+                        if (database == null || !database.isInitialized()) {
+                            embed.title("Scan Failed").description("Database not connected.").errorColor();
+                            return OK;
+                        }
+                        try {
+                            var region = database.loadRegion(name);
+                            if (region == null) {
+                                embed.title("Scan Failed")
+                                    .description("No saved region named " + name + ".")
+                                    .errorColor();
+                                return OK;
+                            }
+                            var selected = List.of(region);
+                            if (module.startScanRegions(selected)) {
+                                embed.title("Stash Scan Started")
+                                    .description("Region **" + name + "**: "
+                                        + formatPos(region.pos1()) + " → " + formatPos(region.pos2()))
+                                    .successColor();
+                            } else {
+                                embed.title("Scan Failed")
+                                    .description(withSpectatorTip(Objects.toString(
+                                        module.getScanStartBlocker(selected), "Scan could not be started.")))
+                                    .errorColor();
+                            }
+                        } catch (Exception e) {
+                            embed.title("Scan Failed")
+                                .description("Could not load region: " + e.getMessage())
+                                .errorColor();
+                        }
+                        return OK;
+                    }))
             )
             .then(literal("stop")
                 .executes(c -> {
+                    if (module.stopKitFulfillment()) {
+                        c.getSource().getEmbed().title("Kit Build Stopping")
+                                .description("The kit job is paused. Its checkpoint is saved; "
+                                        + "the bot will check for a placed shulker before another stash job can start.")
+                                .primaryColor();
+                        return OK;
+                    }
                     module.abortScan();
                     c.getSource().getEmbed()
                         .title("Stash Scan Stopped")
@@ -254,6 +360,13 @@ public class StashCommand extends Command {
                     }
 
                     if (module.getState() != StashManagerModule.ScanState.IDLE) {
+                        if (module.getActiveScanRegionName() != null) {
+                            embed.addField("Scanning", module.getActiveScanRegionName(), true);
+                            if (module.getRemainingScanRegions() > 0) {
+                                embed.addField("Regions Remaining",
+                                    String.valueOf(module.getRemainingScanRegions()), true);
+                            }
+                        }
                         embed.addField("Found", String.valueOf(module.getContainersFound()), true);
                         embed.addField("Indexed", String.valueOf(module.getContainersIndexed()), true);
                         embed.addField("Failed", String.valueOf(module.getContainersFailed()), true);
@@ -318,7 +431,7 @@ public class StashCommand extends Command {
                     })
                 )
             )
-            .then(literal("export")
+            .then(literal("export").requires(Command::validateAccountOwner)
                 .executes(c -> {
                     var embed = c.getSource().getEmbed();
 
@@ -377,7 +490,18 @@ public class StashCommand extends Command {
                     return OK;
                 })
             )
-            .then(literal("debug")
+            .then(literal("debug").requires(c -> config.diagnosticCommandsEnabled
+                    && validateAccountOwner(c))
+                .then(literal("worldaudit")
+                    .executes(c -> {
+                        runWorldAudit(c.getSource(), 8);
+                        return OK;
+                    })
+                    .then(argument("chunk_radius", integer(1, 12))
+                        .executes(c -> {
+                            runWorldAudit(c.getSource(), IntegerArgumentType.getInteger(c, "chunk_radius"));
+                            return OK;
+                        })))
                 .then(literal("recent")
                     .executes(c -> {
                         sendRecentDebugEvents(c.getSource(), 20);
@@ -416,6 +540,107 @@ public class StashCommand extends Command {
                             .fileAttachment(new com.zenith.discord.Embed.FileAttachment("stash_debug.log", text));
                         return OK;
                     }))
+                .then(literal("geometry")
+                    .executes(c -> {
+                        c.getSource().getEmbed().title("World Geometry Debug")
+                                .description(module.getGeometryRecorder().size()
+                                        + " failure snapshots recorded. Use `stash debug geometry export` for the full block map.")
+                                .successColor();
+                        return OK;
+                    })
+                    .then(literal("recent")
+                        .executes(c -> {
+                            sendRecentEvents(c.getSource(), 5, module.getGeometryRecorder(),
+                                    "Recent World Geometry");
+                            return OK;
+                        })
+                        .then(argument("count", integer(1, 25))
+                            .executes(c -> {
+                                sendRecentEvents(c.getSource(), IntegerArgumentType.getInteger(c, "count"),
+                                        module.getGeometryRecorder(), "Recent World Geometry");
+                                return OK;
+                            })))
+                    .then(literal("clear")
+                        .executes(c -> {
+                            int count = module.getGeometryRecorder().size();
+                            module.getGeometryRecorder().clear();
+                            c.getSource().getEmbed().title("World Geometry Cleared")
+                                    .description("Removed " + count + " failure snapshot(s).")
+                                    .successColor();
+                            return OK;
+                        }))
+                    .then(literal("export")
+                        .executes(c -> {
+                            var recorder = module.getGeometryRecorder();
+                            if (recorder.size() == 0) {
+                                c.getSource().getEmbed().title("World Geometry Export Failed")
+                                        .description("No failure snapshots recorded yet.")
+                                        .errorColor();
+                                return OK;
+                            }
+                            c.getSource().getEmbed().title("World Geometry Export")
+                                    .description("Exported " + recorder.size() + " failure snapshot(s).")
+                                    .successColor()
+                                    .fileAttachment(new com.zenith.discord.Embed.FileAttachment(
+                                            "stash_geometry.log", recorder.exportText()));
+                            return OK;
+                        })))
+                .then(literal("pose")
+                    .executes(c -> {
+                        sendPoseTraceStatus(c.getSource());
+                        return OK;
+                    })
+                    .then(literal("on")
+                        .executes(c -> {
+                            module.getPoseTraceRecorder().setEnabled(true);
+                            sendPoseTraceStatus(c.getSource());
+                            return OK;
+                        }))
+                    .then(literal("off")
+                        .executes(c -> {
+                            module.getPoseTraceRecorder().setEnabled(false);
+                            sendPoseTraceStatus(c.getSource());
+                            return OK;
+                        }))
+                    .then(literal("recent")
+                        .executes(c -> {
+                            sendRecentEvents(c.getSource(), 20,
+                                    module.getPoseTraceRecorder().events(), "Recent Pose Traces");
+                            return OK;
+                        })
+                        .then(argument("count", integer(1, 100))
+                            .executes(c -> {
+                                sendRecentEvents(c.getSource(), IntegerArgumentType.getInteger(c, "count"),
+                                        module.getPoseTraceRecorder().events(), "Recent Pose Traces");
+                                return OK;
+                            })))
+                    .then(literal("clear")
+                        .executes(c -> {
+                            var recorder = module.getPoseTraceRecorder().events();
+                            int count = recorder.size();
+                            recorder.clear();
+                            c.getSource().getEmbed().title("Pose Trace Cleared")
+                                    .description("Removed " + count + " pose trace event(s).")
+                                    .successColor();
+                            return OK;
+                        }))
+                    .then(literal("export")
+                        .executes(c -> {
+                            var recorder = module.getPoseTraceRecorder().events();
+                            int count = recorder.size();
+                            if (count == 0) {
+                                c.getSource().getEmbed().title("Pose Trace Export Failed")
+                                        .description("No pose traces recorded. Use `stash debug pose on` during a job.")
+                                        .errorColor();
+                                return OK;
+                            }
+                            c.getSource().getEmbed().title("Pose Trace Export")
+                                    .description("Exported " + count + " pose trace event(s).")
+                                    .successColor()
+                                    .fileAttachment(new com.zenith.discord.Embed.FileAttachment(
+                                            "stash_pose_trace.log", recorder.exportText()));
+                            return OK;
+                        })))
             )
             .then(literal("keep")
                 .then(literal("add")
@@ -693,6 +918,14 @@ public class StashCommand extends Command {
                             String name = StringArgumentType.getString(c, "name");
                             var embed = c.getSource().getEmbed();
 
+                            if (Set.of("all", "stop", "status", "resume", "discard")
+                                    .contains(name.toLowerCase(Locale.ROOT))) {
+                                embed.title("Region Save Failed")
+                                    .description("That name is reserved for a stash command. Choose another region name.")
+                                    .errorColor();
+                                return OK;
+                            }
+
                             if (config.pos1 == null || config.pos2 == null) {
                                 embed.title("Region Save Failed")
                                     .description("Region not defined. Set pos1 and pos2 first.")
@@ -709,8 +942,11 @@ public class StashCommand extends Command {
 
                             try {
                                 database.saveRegion(name, config.pos1, config.pos2);
+                                var saved = database.loadRegion(name);
                                 embed.title("Region Saved")
-                                    .description("**" + name + "**: " + formatPos(config.pos1) + " → " + formatPos(config.pos2))
+                                    .description("**" + name + "**: " + formatPos(config.pos1) + " → "
+                                            + formatPos(config.pos2) + " · role: "
+                                            + (saved == null ? "all_purpose" : saved.role().databaseValue()))
                                     .successColor();
                             } catch (Exception e) {
                                 embed.title("Region Save Failed")
@@ -774,7 +1010,8 @@ public class StashCommand extends Command {
                             } else {
                                 for (var region : regions) {
                                     embed.addField(region.name(),
-                                        formatPos(region.pos1()) + " → " + formatPos(region.pos2()), false);
+                                        region.role().databaseValue() + " · "
+                                            + formatPos(region.pos1()) + " → " + formatPos(region.pos2()), false);
                                 }
                             }
                         } catch (Exception e) {
@@ -783,6 +1020,12 @@ public class StashCommand extends Command {
                         return OK;
                     })
                 )
+                .then(literal("role")
+                    .then(argument("name", string())
+                        .then(argument("role", StringArgumentType.word())
+                            .executes((com.mojang.brigadier.Command<CommandContext>) c -> setRegionRole(c.getSource(),
+                                StringArgumentType.getString(c, "name"),
+                                StringArgumentType.getString(c, "role"))))))
                 .then(literal("delete")
                     .then(argument("name", string())
                         .executes(c -> {
@@ -862,10 +1105,352 @@ public class StashCommand extends Command {
                             StringArgumentType.getString(c, "name")))))
             )
             .then(literal("kit")
+                .then(literal("stop").executes(c -> {
+                    boolean stopped = module.stopKitFulfillment();
+                    var embed = c.getSource().getEmbed().title("Kit Build");
+                    if (stopped) embed.description("Paused with a checkpoint. "
+                            + "Check `/stash kit job` and let worksite recovery finish.").primaryColor();
+                    else embed.description("No active kit build to stop.").errorColor();
+                    return OK;
+                }))
+                .then(literal("build")
+                    .then(argument("name", string())
+                        .then(argument("count", integer(1, 64))
+                            .executes(c -> {
+                                String name = StringArgumentType.getString(c, "name");
+                                int count = IntegerArgumentType.getInteger(c, "count");
+                                String blocker = module.startKitFulfillment(name, count);
+                                var embed = c.getSource().getEmbed().title("Kit Build");
+                                if (blocker == null) {
+                                    embed.description("Started building " + count + " × **" + name
+                                            + "**. Boxes are packed one at a time and delivered to its export chest.")
+                                            .primaryColor();
+                                } else {
+                                    embed.description("Could not start: " + blocker).errorColor();
+                                }
+                                return OK;
+                            }))))
+                .then(literal("job").executes(c -> {
+                    c.getSource().getEmbed().title("Kit Build Status")
+                            .description(module.kitFulfillmentStatus()).primaryColor();
+                    return OK;
+                }))
+                .then(literal("diagnose").requires(c -> config.diagnosticCommandsEnabled
+                        && validateAccountOwner(c))
+                    .executes(c -> {
+                        c.getSource().getEmbed().title("Kit Source Diagnostics")
+                                .description(module.diagnoseKitSources()).primaryColor();
+                        return OK;
+                    })
+                    .then(argument("x", integer())
+                        .then(argument("y", integer())
+                            .then(argument("z", integer()).executes(c -> {
+                                int x = IntegerArgumentType.getInteger(c, "x");
+                                int y = IntegerArgumentType.getInteger(c, "y");
+                                int z = IntegerArgumentType.getInteger(c, "z");
+                                c.getSource().getEmbed().title("Kit Target Geometry")
+                                        .description(module.diagnoseKitTarget(x, y, z))
+                                        .primaryColor();
+                                return OK;
+                            })))))
+                .then(literal("inspectsource").requires(c -> config.diagnosticCommandsEnabled
+                        && validateAccountOwner(c)).executes(c -> {
+                    c.getSource().getEmbed().title("Kit Source GUI Inspection")
+                            .description(module.inspectOpenKitSource()).primaryColor();
+                    return OK;
+                }))
+                .then(literal("auditborrowed")
+                    .then(argument("evidence", greedyString()).executes(c -> {
+                        String evidence = StringArgumentType.getString(c, "evidence");
+                        String blocker = module.auditMismatchedBorrowedSource(evidence);
+                        var embed = c.getSource().getEmbed().title("Kit Borrowed Source Audit");
+                        if (blocker == null) embed.description("Exact live shell, borrowed source, "
+                                + "worksite, and pinned cargo were reconciled. The existing "
+                                + "checkpoint is scheduled after cooldown; no new build was started.")
+                                .successColor();
+                        else embed.description("No checkpoint change: " + blocker).errorColor();
+                        return OK;
+                    })))
+                .then(literal("acklostsource")
+                    .then(argument("units", integer(1, 1728)).executes(c -> {
+                        int units = IntegerArgumentType.getInteger(c, "units");
+                        String blocker = module.acknowledgeLostKitSource(units);
+                        var embed = c.getSource().getEmbed().title("Kit Borrowed Source Loss");
+                        if (blocker == null) {
+                            embed.description("Recorded operator-attested loss of the journaled "
+                                    + "borrowed shulker and its " + units + " remaining items. "
+                                    + "No items were moved and the kit remains blocked. "
+                                    + "Review `/stash kit job`, then use `/stash kit resume` "
+                                    + "to continue this checkpoint.").primaryColor();
+                        } else {
+                            embed.description("Loss was not recorded: " + blocker).errorColor();
+                        }
+                        return OK;
+                    })))
+                .then(literal("acklostborrowed")
+                    .then(argument("lastKnownUnits", integer(1, 1728)).executes(c -> {
+                        int units = IntegerArgumentType.getInteger(c, "lastKnownUnits");
+                        String blocker = module.acknowledgeLostBorrowedKitSource(units);
+                        var embed = c.getSource().getEmbed().title("Kit Borrowed Source Loss");
+                        if (blocker == null) {
+                            embed.description("Recorded the operator-attested loss of one journaled "
+                                    + "borrowed shulker. " + units + " is its last journaled "
+                                    + "content count, not a verified count of items lost. "
+                                    + "No items were moved. Loose cargo remains unaudited and "
+                                    + "the kit is blocked; inspect `/stash kit job` before any "
+                                    + "separate cargo reconciliation.").primaryColor();
+                        } else {
+                            embed.description("Loss was not recorded: " + blocker).errorColor();
+                        }
+                        return OK;
+                    })))
+                .then(literal("recover").executes(c -> {
+                    boolean started = module.retryKitRecovery();
+                    var embed = c.getSource().getEmbed().title("Kit Recovery");
+                    if (started) embed.description("Checking the journaled shulker worksites now.").primaryColor();
+                    else embed.description("Recovery could not start. Check `/stash kit job`.").errorColor();
+                    return OK;
+                }))
+                .then(literal("resume").executes(c -> {
+                    String blocker = module.scheduleKitFulfillmentResume();
+                    var embed = c.getSource().getEmbed().title("Kit Resume");
+                    if (blocker == null) embed.description("Resume scheduled after the configured cooldown "
+                            + "and a quiet automation window. Check `/stash kit job` for the phase.")
+                            .primaryColor();
+                    else embed.description("Could not schedule resume: " + blocker).errorColor();
+                    return OK;
+                }))
+                .then(literal("repairvariantto")
+                    .then(argument("x", integer())
+                        .then(argument("y", integer())
+                            .then(argument("z", integer()).executes(c -> {
+                                int[] target = new int[]{
+                                        IntegerArgumentType.getInteger(c, "x"),
+                                        IntegerArgumentType.getInteger(c, "y"),
+                                        IntegerArgumentType.getInteger(c, "z")};
+                                String blocker = module.scheduleKitVariantRepairToImport(target);
+                                var embed = c.getSource().getEmbed().title("Kit Variant Repair");
+                                if (blocker == null) embed.description("The existing checkpoint "
+                                        + "has a guarded whole-stack exchange scheduled. "
+                                        + "The matching source variant and import capacity must "
+                                        + "be verified in live server windows before transfer.")
+                                        .primaryColor();
+                                else embed.description("No checkpoint change: " + blocker)
+                                        .errorColor();
+                                return OK;
+                            })))))
+                .then(literal("auditvariantsource")
+                    .then(literal("rebaseline")
+                        .then(argument("raw_slot", integer())
+                            .then(argument("saved_legacy_shell", string())
+                                .then(argument("live_canonical_shell", string()).executes(c -> {
+                                    int raw = IntegerArgumentType.getInteger(c, "raw_slot");
+                                    String saved = StringArgumentType.getString(c,
+                                            "saved_legacy_shell");
+                                    String live = StringArgumentType.getString(c,
+                                            "live_canonical_shell");
+                                    String blocker = module.auditKitVariantSourceCargoRebaseline(
+                                            raw, saved, live);
+                                    var embed = c.getSource().getEmbed()
+                                            .title("Kit Variant Shell Re-baseline");
+                                    if (blocker == null) embed.description("The current full shell "
+                                            + "and exact already-held source cargo passed the "
+                                            + "guarded audit. A pack-only continuation is "
+                                            + "scheduled after cooldown; no second retrieval "
+                                            + "will run.").primaryColor();
+                                    else embed.description("No checkpoint change: " + blocker)
+                                            .errorColor();
+                                    return OK;
+                                })))))
+                    .then(argument("raw_slot", integer()).executes(c -> {
+                        int raw = IntegerArgumentType.getInteger(c, "raw_slot");
+                        String blocker = module.auditKitVariantSourceCargo(raw);
+                        var embed = c.getSource().getEmbed().title("Kit Variant Source Audit");
+                        if (blocker == null) embed.description("The exact already-held variant "
+                                + "stack is journaled for a pack-only continuation after cooldown. "
+                                + "No second retrieval will run.").primaryColor();
+                        else embed.description("No checkpoint change: " + blocker).errorColor();
+                        return OK;
+                    })))
+                .then(literal("diagnosevariant").requires(c -> config.diagnosticCommandsEnabled
+                        && validateAccountOwner(c))
+                    .then(argument("raw_slot", integer()).executes(c -> {
+                        int raw = IntegerArgumentType.getInteger(c, "raw_slot");
+                        c.getSource().getEmbed().title("Kit Variant Diagnosis")
+                                .description(module.diagnoseKitVariantSourceCargo(raw))
+                                .primaryColor();
+                        return OK;
+                    })))
+                .then(literal("returnto")
+                    .then(argument("x", integer())
+                        .then(argument("y", integer())
+                            .then(argument("z", integer()).executes(c -> {
+                                int[] target = new int[]{
+                                        IntegerArgumentType.getInteger(c, "x"),
+                                        IntegerArgumentType.getInteger(c, "y"),
+                                        IntegerArgumentType.getInteger(c, "z")};
+                                String blocker = module.scheduleKitSourceReturnToCapacityImport(target);
+                                var embed = c.getSource().getEmbed().title("Kit Source Return");
+                                if (blocker == null) embed.description("The existing checkpoint is "
+                                        + "scheduled to return its exact borrowed source box. "
+                                        + "The selected import chest must verify free capacity in its live "
+                                        + "server window before any transfer click.").primaryColor();
+                                else embed.description("No checkpoint change: " + blocker).errorColor();
+                                return OK;
+                            })))))
+                .then(literal("cargo").requires(Command::validateAccountOwner).executes(c -> {
+                    c.getSource().getEmbed().title("Kit Cargo")
+                            .description(module.diagnoseKitCargo()).primaryColor();
+                    return OK;
+                }))
+                .then(literal("reconcileinventory")
+                    .executes(c -> {
+                        String blocker = module.startKitInventoryReconciliation();
+                        var embed = c.getSource().getEmbed().title("Kit Inventory Reconciliation");
+                        if (blocker == null) embed.description("Started a checkpointed, inventory-only "
+                                + "handoff. Kept supplies and any kit-owned shell remain protected; "
+                                + "unassigned cargo is packed or staged through registered import chests. "
+                                + "No stash source moves are planned.").primaryColor();
+                        else embed.description("No inventory was moved: " + blocker).errorColor();
+                        return OK;
+                    })
+                    .then(literal("preview").executes(c -> {
+                        c.getSource().getEmbed().title("Kit Inventory Reconciliation Preview")
+                                .description(module.previewKitInventoryReconciliation())
+                                .primaryColor();
+                        return OK;
+                    })))
+                .then(literal("auditappleoverflow")
+                    .then(argument("keptSlot", integer(9, 44))
+                        .then(argument("keptCount", integer(1, 64))
+                            .then(argument("displacedSlots", greedyString()).executes(c -> {
+                                String blocker = module.scheduleKitAppleOverflowAudit(
+                                        IntegerArgumentType.getInteger(c, "keptSlot"),
+                                        IntegerArgumentType.getInteger(c, "keptCount"),
+                                        StringArgumentType.getString(c, "displacedSlots"));
+                                var embed = c.getSource().getEmbed().title("Kit Apple Overflow Audit");
+                                if (blocker == null) embed.description("Pinned exactly verified "
+                                        + "displaced apple stacks; the existing kit checkpoint "
+                                        + "will retry after cooldown. No inventory was moved.")
+                                        .primaryColor();
+                                else embed.description("No checkpoint change: " + blocker)
+                                        .errorColor();
+                                return OK;
+                            })))))
+                .then(literal("auditnocargo")
+                    .then(literal("batch")
+                        .then(argument("slots", greedyString()).executes(c -> {
+                            String slots = StringArgumentType.getString(c, "slots");
+                            String blocker = module.scheduleKitLostBorrowedNoCargoBatchAudit(slots);
+                            var embed = c.getSource().getEmbed().title("Kit No-Cargo Batch Audit");
+                            if (blocker == null) embed.description("Verified every declared kept stack, "
+                                    + "the exact owned kit shell, and a clean inventory. The "
+                                    + "existing checkpoint will retry retrieval after cooldown; "
+                                    + "any recorded source write-off remains unchanged.")
+                                    .primaryColor();
+                            else embed.description("No checkpoint change: " + blocker).errorColor();
+                            return OK;
+                        })))
+                    .then(argument("keptSlot", integer(9, 44))
+                        .then(argument("keptCount", integer(1, 64)).executes(c -> {
+                            int rawSlot = IntegerArgumentType.getInteger(c, "keptSlot");
+                            int count = IntegerArgumentType.getInteger(c, "keptCount");
+                            String blocker = module.scheduleKitLostBorrowedNoCargoAudit(rawSlot, count);
+                            var embed = c.getSource().getEmbed().title("Kit No-Cargo Audit");
+                            if (blocker == null) embed.description("Verified the declared kept stack, "
+                                    + "the exact owned kit shell, and a clean inventory. The "
+                                    + "existing checkpoint will retry retrieval after cooldown; "
+                                    + "any recorded source write-off remains unchanged.")
+                                    .primaryColor();
+                            else embed.description("No checkpoint change: " + blocker).errorColor();
+                            return OK;
+                        }))))
+                .then(literal("auditexport")
+                    .then(argument("fullBoxes", integer(1, 54)).executes(c -> {
+                        ChestTarget target = targetedChest();
+                        var embed = c.getSource().getEmbed().title("Kit Export Audit");
+                        if (!target.valid()) {
+                            embed.description(target.failure()).errorColor();
+                            return OK;
+                        }
+                        int fullBoxes = IntegerArgumentType.getInteger(c, "fullBoxes");
+                        String blocker = module.auditKitExportDelivery(target.positions(), fullBoxes);
+                        if (blocker == null) {
+                            embed.description("Verified the exact completed kits in the saved output chest "
+                                    + "and reconciled one delivery. The checkpoint remains paused; "
+                                    + "review `/stash kit job` before scheduling a resume.")
+                                    .successColor();
+                        } else {
+                            embed.description("No checkpoint change: " + blocker).errorColor();
+                        }
+                        return OK;
+                    })))
+                .then(literal("auditcargo")
+                    .then(literal("batch")
+                        .then(argument("slots", greedyString()).executes(c -> {
+                            String slots = StringArgumentType.getString(c, "slots");
+                            String blocker = module.scheduleKitCargoBatchAudit(slots);
+                            var embed = c.getSource().getEmbed().title("Kit Batch Cargo Audit");
+                            if (blocker == null) embed.description("Verified pinned cargo slots. "
+                                    + "The existing kit checkpoint will resume after cooldown.")
+                                    .primaryColor();
+                            else embed.description("Could not audit cargo: " + blocker).errorColor();
+                            return OK;
+                        })))
+                    .then(argument("inventorySlot", integer(9, 44))
+                        .then(argument("count", integer(1, 64)).executes(c -> {
+                            int slot = IntegerArgumentType.getInteger(c, "inventorySlot");
+                            int count = IntegerArgumentType.getInteger(c, "count");
+                            String blocker = module.scheduleKitCargoAudit(slot, count);
+                            var embed = c.getSource().getEmbed().title("Kit Cargo Audit");
+                            if (blocker == null) {
+                                embed.description("Verified " + count + " items in inventory slot "
+                                        + slot + ". The kit will pack that stack after the cooldown, "
+                                        + "then fetch the remaining amount.").primaryColor();
+                            } else {
+                                embed.description("Could not audit cargo: " + blocker).errorColor();
+                            }
+                            return OK;
+                        }))))
+                .then(literal("retire")
+                    .then(literal("stage").executes(c -> {
+                        String blocker = module.startKitRetirementStaging();
+                        var embed = c.getSource().getEmbed().title("Kit Retirement Staging");
+                        if (blocker == null) {
+                            embed.description("Started a durable inventory-only handoff of the "
+                                    + "incomplete owned shell and other non-kept cargo. "
+                                    + "The kit checkpoint remains blocked. Verify organizer "
+                                    + "completion and the staged shell before discarding it.")
+                                    .primaryColor();
+                        } else {
+                            embed.description("No inventory was moved: " + blocker).errorColor();
+                        }
+                        return OK;
+                    })))
+                .then(literal("discard")
+                    .then(literal("confirm").executes(c -> {
+                        String blocker = module.discardKitFulfillmentCheckpoint();
+                        var embed = c.getSource().getEmbed().title("Kit Checkpoint");
+                        if (blocker == null) {
+                            embed.description("Cleared the checkpoint after physical recovery. "
+                                    + "Check inventory and the export chest before another build.").primaryColor();
+                        } else {
+                            embed.description("Checkpoint not cleared: " + blocker).errorColor();
+                        }
+                        return OK;
+                    })))
                 .then(literal("create")
                     .then(argument("name", string())
                         .executes((com.mojang.brigadier.Command<CommandContext>) c -> createKitDraft(c,
                                 StringArgumentType.getString(c, "name")))))
+                .then(literal("crafting")
+                    .then(argument("name", string())
+                        .executes((com.mojang.brigadier.Command<CommandContext>) c ->
+                                showKitCrafting(c, StringArgumentType.getString(c, "name")))
+                        .then(literal("on").executes((com.mojang.brigadier.Command<CommandContext>) c -> setKitCrafting(c,
+                                StringArgumentType.getString(c, "name"), true)))
+                        .then(literal("off").executes((com.mojang.brigadier.Command<CommandContext>) c -> setKitCrafting(c,
+                                StringArgumentType.getString(c, "name"), false)))))
                 .then(literal("catalog")
                     .executes((com.mojang.brigadier.Command<CommandContext>) c -> renderKitCatalog(c, 1))
                     .then(argument("page", integer(1))
@@ -914,6 +1499,7 @@ public class StashCommand extends Command {
                                 embed.description(kits.stream()
                                         .map(kit -> "**" + kit.name() + "** · "
                                                 + kit.status().name().toLowerCase(Locale.ROOT)
+                                                + (kit.craftMissing() ? " · crafting requested" : "")
                                                 + " · " + kit.requiredSlots() + "/" + KitCapacity.MAX_SLOTS + " slots")
                                         .collect(Collectors.joining("\n")));
                             }
@@ -957,6 +1543,7 @@ public class StashCommand extends Command {
                                     embed.description(sb.toString())
                                         .addField("Status", definition.status().name().toLowerCase(Locale.ROOT), true)
                                         .addField("Shulker Slots", definition.requiredSlots() + "/" + KitCapacity.MAX_SLOTS, true)
+                                        .addField("Craft Missing Stock", definition.craftMissing() ? "Requested (not yet executable)" : "Off", true)
                                         .addField("Output", definition.exportPosition() == null ? "Not assigned" : "Export chest assigned", true);
                                 }
                             } catch (Exception e) {
@@ -1298,9 +1885,7 @@ public class StashCommand extends Command {
                     LaneCapacityReport report = module.getLaneCapacityReport();
                     LaneConstructionPlan construction = LaneConstructionPlan.assess(
                             report.laneStorage());
-                    boolean importStagingAvailable = config.pos1 != null && config.pos2 != null
-                            && index.getInRegion(config.pos1, config.pos2).stream()
-                                    .anyMatch(index::isImportChest);
+                    boolean importStagingAvailable = module.hasLaneCapacityImportStaging();
                     boolean canStageShortage = !report.canOrganize()
                             && report.canOrganizeWithImportStaging(importStagingAvailable);
                     String friendlyStatus = switch (report.status()) {
@@ -1316,6 +1901,8 @@ public class StashCommand extends Command {
                         case NEEDS_FRESH_SCAN -> "Run a fresh scan first";
                         case NEEDS_FRESH_CONTAINER_SCAN -> "Scan the chests again first";
                         case REGION_NOT_DEFINED -> "Set the stash area first";
+                        case NO_STORAGE_REGION -> "No storage-capable region saved";
+                        case MULTIPLE_STORAGE_REGIONS -> "Choose a storage region";
                         case NO_SCANNED_CONTAINERS -> "Scan the stash first";
                         case NO_LANES_DETECTED -> canStageShortage
                                 ? "Can reconcile into import staging"
@@ -1328,7 +1915,8 @@ public class StashCommand extends Command {
                             .addField("Lanes We're Leaving Alone", String.valueOf(report.protectedLanes()), true)
                             .addField("Lanes We Can Use", String.valueOf(report.assignableLanes()), true)
                             .addField("Item Lanes Needed", String.valueOf(report.requiredStorageClasses()), true)
-                            .addField("Import Chest Blocks", String.valueOf(index.getImportChestBlockCount()), true)
+                            .addField("Import Chest Blocks In Storage Region",
+                                    String.valueOf(module.getLaneCapacityImportChestBlockCount()), true)
                             .addField("Lanes Still Free", String.valueOf(report.spareLanes()), true)
                             .addField("More Lanes Needed", String.valueOf(report.laneShortfall()), true)
                             .addField("Shulker Spots Available",
@@ -1356,6 +1944,9 @@ public class StashCommand extends Command {
                                     report.bulkShulkers() + " / " + report.emptyShulkers(), true)
                             .addField("Mixed / Unclassified",
                                     report.mixedShulkers() + " / " + report.unclassifiedShulkers(), true);
+                    if (module.getLaneCapacityRegionName() != null) {
+                        embed.addField("Storage Region", module.getLaneCapacityRegionName(), true);
+                    }
 
                     if (!report.laneStorage().unresolvedStackSizeClasses().isEmpty()) {
                         String unresolved = String.join(", ",
@@ -1393,6 +1984,8 @@ public class StashCommand extends Command {
                         case NEEDS_FRESH_CONTAINER_SCAN -> embed.description("Some double chests came from an older scan. Scan the stash again so we can count them properly.")
                                 .errorColor();
                         case REGION_NOT_DEFINED -> embed.description("Set the stash corners with pos1 and pos2 first.").errorColor();
+                        case NO_STORAGE_REGION -> embed.description("Saved regions exist, but none is all-purpose or marked storage.").errorColor();
+                        case MULTIPLE_STORAGE_REGIONS -> embed.description("More than one storage-capable region is available. Load or select one before auditing lanes.").errorColor();
                         case NO_SCANNED_CONTAINERS -> embed.description("Scan the stash first so there's something to work from.").errorColor();
                         case NO_LANES_DETECTED -> {
                             if (canStageShortage) {
@@ -1491,6 +2084,22 @@ public class StashCommand extends Command {
             .then(literal("organize")
                 .executes(c -> {
                     var embed = c.getSource().getEmbed();
+                    if (database != null && database.isInitialized()) {
+                        try {
+                            if (!database.listRegions().isEmpty()) {
+                                embed.title("Choose an Organize Region")
+                                    .description("Saved regions exist. Use `/stash organize <name>` "
+                                            + "to select the storage region explicitly.")
+                                    .primaryColor();
+                                return OK;
+                            }
+                        } catch (Exception e) {
+                            embed.title("Organize Failed")
+                                .description("Could not check saved regions: " + e.getMessage())
+                                .errorColor();
+                            return OK;
+                        }
+                    }
                     String blocker = module.getOrganizerBlocker();
                     if (blocker != null) {
                         embed.title("Organize Failed")
@@ -1515,6 +2124,86 @@ public class StashCommand extends Command {
                     }
                     return OK;
                 })
+                .then(literal("all")
+                    .executes(c -> {
+                        c.getSource().getEmbed().title("Choose a Storage Region")
+                            .description("Use `/stash organize all <storage-region>`. The job will use "
+                                    + "registered import chests from every intake region with imports; "
+                                    + "unregistered chests and scan-only regions remain untouched.")
+                            .primaryColor();
+                        return OK;
+                    })
+                    .then(argument("storage", string())
+                        .executes(c -> {
+                            String name = StringArgumentType.getString(c, "storage");
+                            var embed = c.getSource().getEmbed();
+                            if (database == null || !database.isInitialized()) {
+                                embed.title("Organize Failed").description("Database not connected.").errorColor();
+                                return OK;
+                            }
+                            try {
+                                var storage = database.loadRegion(name);
+                                String blocker = module.startOrganizerAcrossRegions(storage);
+                                if (blocker == null) {
+                                    embed.title("Multi-Region Organize Started")
+                                        .description("Routing registered imports from all intake regions "
+                                                + "to storage region **" + name + "**. The route is "
+                                                + "pinned for restart recovery.")
+                                        .successColor();
+                                } else {
+                                    embed.title("Organize Failed").description(blocker).errorColor();
+                                }
+                            } catch (Exception e) {
+                                embed.title("Organize Failed")
+                                    .description("Could not load region: " + e.getMessage()).errorColor();
+                            }
+                            return OK;
+                        })))
+                .then(argument("region", string())
+                    .executes(c -> {
+                        String name = StringArgumentType.getString(c, "region");
+                        var embed = c.getSource().getEmbed();
+                        if (database == null || !database.isInitialized()) {
+                            embed.title("Organize Failed").description("Database not connected.").errorColor();
+                            return OK;
+                        }
+                        try {
+                            var region = database.loadRegion(name);
+                            if (region == null) {
+                                embed.title("Organize Failed")
+                                    .description("No saved region named " + name + ".")
+                                    .errorColor();
+                            } else if (!region.role().isStorageCapable()) {
+                                embed.title("Organize Failed")
+                                    .description("**" + name + "** is `" + region.role().databaseValue()
+                                            + "`. Mark it as storage or clear its role with `/stash region role "
+                                            + name + " default`.")
+                                    .errorColor();
+                            } else if (region.role() == DatabaseManager.RegionRole.UNASSIGNED
+                                    && database.listRegions().stream().anyMatch(saved ->
+                                            saved.role() == DatabaseManager.RegionRole.STORAGE)) {
+                                embed.title("Organize Failed")
+                                    .description("An explicit storage region is saved. Choose that region "
+                                            + "for lane planning, or assign **" + name + "** the storage role.")
+                                    .errorColor();
+                            } else if (module.startOrganizerForRegion(region)) {
+                                embed.title("Organizing Stash")
+                                    .description("Planning item moves in **" + name + "**. "
+                                            + "This region stays selected for restart recovery.")
+                                    .successColor();
+                            } else {
+                                embed.title("Organize Failed")
+                                    .description("Could not start in **" + name + "**. Check its latest scan, "
+                                            + "lane capacity, checkpoint, and console for the exact blocker.")
+                                    .errorColor();
+                            }
+                        } catch (Exception e) {
+                            embed.title("Organize Failed")
+                                .description("Could not load region: " + e.getMessage())
+                                .errorColor();
+                        }
+                        return OK;
+                    }))
                 .then(literal("stop")
                     .executes(c -> {
                         var organizer = module.getOrganizer();
@@ -1556,6 +2245,25 @@ public class StashCommand extends Command {
                         }
                         return OK;
                     })
+                    .then(argument("packed_box_count", integer(1, 27 * 64))
+                        .executes(c -> {
+                            int expected = IntegerArgumentType.getInteger(c, "packed_box_count");
+                            var organizer = module.getOrganizer();
+                            var embed = c.getSource().getEmbed().title("Guarded Organizer Resume");
+                            if (organizer == null || !organizer.hasDurableCheckpoint()) {
+                                embed.description("No organizer checkpoint is available.").errorColor();
+                            } else if (module.requestOrganizerCheckpointResume(expected)) {
+                                embed.description("One carried packed box uniquely matched the attested count. Resume is armed after normal cooldown; the destination window must verify it again before any transfer.")
+                                    .addField("Expected items in box", String.valueOf(expected), true)
+                                    .addField("Progress", organizer.getCompletedTasks()
+                                            + "/" + organizer.getTotalTasks(), true)
+                                    .successColor();
+                            } else {
+                                embed.description("Guarded resume was refused. The checkpoint, worksite, kept cargo, or unique matching box did not match the attestation; no item was moved.")
+                                    .errorColor();
+                            }
+                            return OK;
+                        }))
                 )
                 .then(literal("discard")
                     .then(literal("confirm")
@@ -1569,7 +2277,9 @@ public class StashCommand extends Command {
                                 embed.description("The saved plan and queue were discarded. No game items were moved.")
                                     .successColor();
                             } else {
-                                embed.description("The checkpoint could not be discarded while the organizer is running.")
+                                embed.description("The checkpoint could not be discarded: "
+                                        + Objects.toString(organizer.checkpointDiscardBlocker(),
+                                                "the journal could not be cleared") + ".")
                                     .errorColor();
                             }
                             return OK;
@@ -1638,7 +2348,7 @@ public class StashCommand extends Command {
                         if (database == null || !database.isInitialized()) {
                             embed.description("Database is not connected.")
                                 .addField("Enabled", String.valueOf(config.databaseEnabled), true)
-                                .addField("URL", config.databaseUrl, false);
+                                .addField("URL", "(configured; hidden)", false);
                             return OK;
                         }
 
@@ -1650,7 +2360,7 @@ public class StashCommand extends Command {
                                 .addField("Unique Item Types", String.valueOf(stats.getOrDefault("unique_item_types", 0)), true)
                                 .addField("Total Shulkers", String.valueOf(stats.getOrDefault("total_shulkers", 0)), true);
                         } catch (Exception e) {
-                            embed.description("Database error: " + e.getMessage())
+                            embed.description("Database query failed; inspect server logs for details.")
                                 .errorColor();
                         }
                         return OK;
@@ -1764,42 +2474,65 @@ public class StashCommand extends Command {
         return pos[0] + ", " + pos[1] + ", " + pos[2];
     }
 
-    // Discord embed descriptions have a real size limit far beyond Zenith's own
-    // 1024-char help threshold, but a wall of debug events can still exceed it —
-    // split across multiple messages instead of cramming everything into one.
+    // Keep recent output in the requesting command response; export the full log.
     private static final int DEBUG_CHUNK_CHAR_BUDGET = 3800;
 
+    private void runWorldAudit(CommandContext source, int radiusChunks) {
+        try {
+            WorldNbtAudit.Report report = WorldNbtAudit.capture(radiusChunks);
+            module.getDebugRecorder().record("world_nbt_audit", report.summary());
+            WORLD_AUDIT_LOG.info("Passive world audit: {}", report.summary());
+            source.getEmbed().title("Passive World/NBT Audit")
+                    .description(report.summary() + " No job, inventory, index, or checkpoint was changed. "
+                            + "Unopened chest and hopper contents still require a separate server-confirmed GUI audit.")
+                    .primaryColor()
+                    .fileAttachment(new com.zenith.discord.Embed.FileAttachment(
+                            "stash_world_audit.txt", report.text().getBytes(StandardCharsets.UTF_8)));
+        } catch (RuntimeException e) {
+            source.getEmbed().title("World/NBT Audit Failed")
+                    .description("No job action was taken: " + e.getMessage()).errorColor();
+        }
+    }
+
     private void sendRecentDebugEvents(CommandContext source, int limit) {
-        var recent = module.getDebugRecorder().recent(limit);
+        sendRecentEvents(source, limit, module.getDebugRecorder(), "Recent Debug Events");
+    }
+
+    private void sendPoseTraceStatus(CommandContext source) {
+        var trace = module.getPoseTraceRecorder();
+        source.getEmbed().title("Pose Trace")
+                .description((trace.isEnabled() ? "On" : "Off")
+                        + " · " + trace.events().size() + " recorded events. "
+                        + "Use `stash debug pose export` for the full trace.")
+                .successColor();
+    }
+
+    private void sendRecentEvents(CommandContext source, int limit,
+                                  com.zenith.plugin.stashmanager.debug.DebugRecorder recorder,
+                                  String baseTitle) {
+        var recent = recorder.recent(limit);
         if (recent.isEmpty()) {
-            source.getEmbed().title("Recent Debug Events").description("No recent debug events.");
+            source.getEmbed().title(baseTitle).description("No events recorded.");
             return;
         }
 
-        List<String> chunks = new ArrayList<>();
-        StringBuilder current = new StringBuilder();
-        for (var event : recent) {
+        List<String> shown = new ArrayList<>();
+        int used = 0;
+        for (int i = recent.size() - 1; i >= 0; i--) {
+            var event = recent.get(i);
             String line = event.timestamp() + " | " + event.stage() + " | " + event.detail();
-            if (!current.isEmpty() && current.length() + line.length() + 1 > DEBUG_CHUNK_CHAR_BUDGET) {
-                chunks.add(current.toString());
-                current = new StringBuilder();
+            if (line.length() > DEBUG_CHUNK_CHAR_BUDGET - 160) {
+                line = line.substring(0, DEBUG_CHUNK_CHAR_BUDGET - 163) + "...";
             }
-            if (!current.isEmpty()) current.append('\n');
-            current.append(line);
+            if (used + line.length() + 1 > DEBUG_CHUNK_CHAR_BUDGET - 100) break;
+            shown.add(0, line);
+            used += line.length() + 1;
         }
-        if (!current.isEmpty()) chunks.add(current.toString());
-
-        for (int i = 0; i < chunks.size(); i++) {
-            String title = chunks.size() > 1
-                ? "Recent Debug Events (" + (i + 1) + "/" + chunks.size() + ")"
-                : "Recent Debug Events";
-            if (i == 0) {
-                source.getEmbed().title(title).description(chunks.get(i));
-            } else {
-                var embed = com.zenith.discord.Embed.builder().title(title).description(chunks.get(i));
-                DISCORD.sendEmbedMessage(embed);
-            }
-        }
+        int omitted = recent.size() - shown.size();
+        String suffix = omitted > 0
+                ? "\n… " + omitted + " older event(s) omitted. Use the matching `export` command for the full log."
+                : "";
+        source.getEmbed().title(baseTitle).description(String.join("\n", shown) + suffix);
     }
 
     // Config Subtree
@@ -1824,7 +2557,7 @@ public class StashCommand extends Command {
 
                 // Database
                 embed.addField("Database Enabled", String.valueOf(config.databaseEnabled), true);
-                embed.addField("Database URL", config.databaseUrl, false);
+                embed.addField("Database URL", "(configured; hidden)", false);
                 embed.addField("Database User", config.databaseUser, true);
                 embed.addField("Database Pool Size", String.valueOf(config.databasePoolSize), true);
                 embed.addField("Database Connected", String.valueOf(database != null && database.isInitialized()), true);
@@ -1833,7 +2566,9 @@ public class StashCommand extends Command {
                 embed.addField("API Enabled", String.valueOf(config.apiEnabled), true);
                 embed.addField("API Bind", config.apiBindAddress + ":" + config.apiPort, true);
                 embed.addField("API Threads", String.valueOf(config.apiThreads), true);
-                embed.addField("API Key", config.apiKey.isBlank() ? "(none)" : "****" + config.apiKey.substring(Math.max(0, config.apiKey.length() - 4)), true);
+                embed.addField("API Key", config.apiKey == null || config.apiKey.isBlank() ? "(none)" : "(set; hidden)", true);
+                embed.addField("API Remote HTTP Opt-in", String.valueOf(config.apiAllowRemoteHttp), true);
+                embed.addField("Diagnostic Commands", String.valueOf(config.diagnosticCommandsEnabled), true);
                 embed.addField("API Running", String.valueOf(apiServer != null && apiServer.isRunning()), true);
 
                 // Updates
@@ -1998,7 +2733,7 @@ public class StashCommand extends Command {
                             config.databaseUrl = StringArgumentType.getString(c, "jdbc_url");
                             c.getSource().getEmbed()
                                 .title("Config Updated")
-                                .description("Database URL = " + config.databaseUrl)
+                                .description("Database URL updated (value hidden).")
                                 .successColor();
                             return OK;
                         })
@@ -2055,17 +2790,32 @@ public class StashCommand extends Command {
                             }
                             database.initialize(config);
                             embed.title("Database Connected")
-                                .description("Successfully connected to: " + config.databaseUrl)
+                                .description("Successfully connected to the configured database.")
                                 .successColor();
                         } catch (Exception e) {
                             embed.title("Database Connect Failed")
-                                .description("Error: " + e.getMessage())
+                                .description("Database connection failed; inspect server logs for details.")
                                 .errorColor();
                         }
                         return OK;
                     })
                 )
             )
+            .then(literal("diagnostics").requires(Command::validateAccountOwner)
+                .then(literal("on").executes(c -> {
+                    config.diagnosticCommandsEnabled = true;
+                    c.getSource().getEmbed().title("Config Updated")
+                            .description("Detailed diagnostic commands enabled; exports may contain stash positions and inventories.")
+                            .successColor();
+                    return OK;
+                }))
+                .then(literal("off").executes(c -> {
+                    config.diagnosticCommandsEnabled = false;
+                    c.getSource().getEmbed().title("Config Updated")
+                            .description("Detailed diagnostic commands disabled.")
+                            .successColor();
+                    return OK;
+                })))
             // API settings
             .then(literal("api")
                 .then(literal("enable")
@@ -2115,6 +2865,21 @@ public class StashCommand extends Command {
                         })
                     )
                 )
+                .then(literal("allowRemoteHttp")
+                    .then(literal("on").executes(c -> {
+                        config.apiAllowRemoteHttp = true;
+                        c.getSource().getEmbed().title("Config Updated")
+                                .description("Remote plain-HTTP API explicitly allowed on next start. Use only behind a trusted TLS proxy or isolated network.")
+                                .successColor();
+                        return OK;
+                    }))
+                    .then(literal("off").executes(c -> {
+                        config.apiAllowRemoteHttp = false;
+                        c.getSource().getEmbed().title("Config Updated")
+                                .description("Remote plain-HTTP API disallowed on next start.")
+                                .successColor();
+                        return OK;
+                    })))
                 .then(literal("key")
                     .then(argument("api_key", string())
                         .executes(c -> {
@@ -2430,6 +3195,61 @@ public class StashCommand extends Command {
         return OK;
     }
 
+    private int showKitCrafting(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name) {
+        var embed = command.getSource().getEmbed().title("Kit Crafting");
+        if (database == null || !database.isInitialized()) {
+            embed.description("Database not connected.").errorColor();
+            return OK;
+        }
+        try {
+            var kit = database.loadKitDefinition(name);
+            if (kit == null) {
+                embed.description("No kit named **" + name + "**.").errorColor();
+            } else {
+                embed.description("**" + name + "**: " + (kit.craftMissing() ? "requested" : "off")
+                        + ". Crafting is currently a planning preference only; a build that needs "
+                        + "crafted stock remains blocked until physical crafting is supported.")
+                        .primaryColor();
+            }
+        } catch (Exception e) {
+            embed.description("Could not load kit crafting preference: " + e.getMessage()).errorColor();
+        }
+        return OK;
+    }
+
+    private int setKitCrafting(
+            com.mojang.brigadier.context.CommandContext<CommandContext> command,
+            String name, boolean enabled) {
+        var embed = command.getSource().getEmbed().title("Kit Crafting");
+        if (database == null || !database.isInitialized()) {
+            embed.description("Database not connected.").errorColor();
+            return OK;
+        }
+        if (module.getKitFulfillment().isActive()
+                || module.getKitFulfillment().hasPendingCheckpoint()) {
+            embed.description("Finish or resolve the existing kit job checkpoint before changing kit crafting.")
+                    .errorColor();
+            return OK;
+        }
+        try {
+            if (!database.setKitCraftMissing(name, enabled)) {
+                embed.description("No kit named **" + name + "**.").errorColor();
+            } else {
+                embed.description("**" + name + "** crafting preference "
+                        + (enabled ? "requested" : "turned off")
+                        + ". A build that needs newly crafted items remains blocked until "
+                        + "the physical crafting executor is available.")
+                        .primaryColor();
+            }
+        } catch (Exception e) {
+            embed.description("Could not save kit crafting preference: " + e.getMessage())
+                    .errorColor();
+        }
+        return OK;
+    }
+
     private int createKitDraft(
             com.mojang.brigadier.context.CommandContext<CommandContext> command,
             String name) {
@@ -2589,7 +3409,7 @@ public class StashCommand extends Command {
                 return OK;
             }
             embed.title("Kit Output Assigned")
-                    .description("Completed **" + name + "** kits will be delivered to the selected export chest.")
+                    .description("Export chest reserved for **" + name + "**. Automatic kit packing and delivery are not enabled yet.")
                     .successColor();
         } catch (Exception e) {
             embed.title("Kit Output Failed").description("Database error: " + e.getMessage()).errorColor();
@@ -2632,7 +3452,7 @@ public class StashCommand extends Command {
                     "unique_items", definition.items().size(),
                     "shulker_slots", definition.requiredSlots()));
             embed.title("Kit Ready")
-                    .description("**" + name + "** is ready for fulfillment.")
+                    .description("**" + name + "** is saved for item retrieval. Automatic shulker packing and export are not enabled yet.")
                     .addField("Items", String.valueOf(definition.items().size()), true)
                     .addField("Shulker Slots", definition.requiredSlots() + "/" + KitCapacity.MAX_SLOTS, true)
                     .successColor();
@@ -3325,5 +4145,36 @@ public class StashCommand extends Command {
         String baseTerm = bracket < 0 ? trimmed : trimmed.substring(0, bracket);
         String variant = bracket < 0 ? "" : trimmed.substring(bracket);
         return ItemIdentifier.normalizeItemId(ItemResolver.resolve(baseTerm) + variant);
+    }
+
+    private int setRegionRole(CommandContext source, String name, String rawRole) {
+        var embed = source.getEmbed().title("Region Role");
+        DatabaseManager.RegionRole role = switch (rawRole.toLowerCase(Locale.ROOT)) {
+            case "default", "auto", "unassigned", "all-purpose", "all_purpose" -> DatabaseManager.RegionRole.UNASSIGNED;
+            case "storage" -> DatabaseManager.RegionRole.STORAGE;
+            case "intake" -> DatabaseManager.RegionRole.INTAKE;
+            case "scan-only", "scan_only" -> DatabaseManager.RegionRole.SCAN_ONLY;
+            default -> null;
+        };
+        if (role == null) {
+            embed.description("Choose `default`, `storage`, `intake`, or `scan-only`.").errorColor();
+            return OK;
+        }
+        if (database == null || !database.isInitialized()) {
+            embed.description("Database not connected.").errorColor();
+            return OK;
+        }
+        try {
+            if (database.setRegionRole(name, role)) {
+                embed.description("**" + name + "** is now `" + role.databaseValue() + "`. "
+                        + "Changing a role does not move any items or start a job.")
+                    .successColor();
+            } else {
+                embed.description("No saved region named " + name + ".").errorColor();
+            }
+        } catch (Exception e) {
+            embed.description("Could not update region role: " + e.getMessage()).errorColor();
+        }
+        return OK;
     }
 }

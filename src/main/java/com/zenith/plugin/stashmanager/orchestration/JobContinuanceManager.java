@@ -7,7 +7,8 @@ public final class JobContinuanceManager {
     public enum Job {
         NONE,
         SCAN,
-        ORGANIZE
+        ORGANIZE,
+        KIT
     }
 
     public enum Transition {

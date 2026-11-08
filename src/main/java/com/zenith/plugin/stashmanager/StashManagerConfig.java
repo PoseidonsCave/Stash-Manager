@@ -34,6 +34,26 @@ public class StashManagerConfig {
     // Dense shelving/silo layouts can need well over 20s for Baritone to compute+execute a
     // path without block-breaking rights — raised from 400 after repeated real-world timeouts.
     public int organizerWalkTimeoutTicks = 1200;
+    // Optional, site-specific walkable approach to a staircase/ladder used before an
+    // upward organizer cargo trip. Leave unset unless an operator has verified it in world.
+    public int[] organizerVerticalWaypoint = new int[0];
+    // Ordered, operator-verified standing cells for multi-floor cargo trips. When set,
+    // this supersedes organizerVerticalWaypoint for the exact destination below.
+    // Each stage is an exact Baritone goal; unset destination never activates it.
+    public int[][] organizerVerticalWaypoints = new int[0][];
+    public int[] organizerVerticalRouteDestination = new int[0];
+    // Optional reusable, operator-verified floor transitions. A rule applies only when the
+    // starting Y lies in originYRange and the destination lies in targetBounds (inclusive).
+    // Unlike the legacy exact-destination route, this can serve a whole bank of upper-floor
+    // chests without letting a path to an unrelated floor inherit its ladder waypoints.
+    public List<OrganizerVerticalRouteRule> organizerVerticalRoutes = new ArrayList<>();
+
+    public static class OrganizerVerticalRouteRule {
+        public String dimension = null; // e.g. OVERWORLD; must match the current dimension
+        public int[] originYRange = null; // [minY, maxY]
+        public int[] targetBounds = null; // [minX, minY, minZ, maxX, maxY, maxZ]
+        public int[][] waypoints = null;  // exact, ordered standing cells
+    }
     // Minimum loose item count to justify packing into a shulker box
     public int condenseMinItems = 1;
     // Opt-in: craft an empty box only when no usable packing box is available.
@@ -51,10 +71,18 @@ public class StashManagerConfig {
 
     // Embedded API server
     public boolean apiEnabled = false;
-    public String apiBindAddress = "0.0.0.0";
+    public String apiBindAddress = "127.0.0.1";
     public int apiPort = 8585;
     public int apiThreads = 2;
     public String apiKey = "";
+    // The embedded API is plain HTTP. Remote binding requires an explicit opt-in and
+    // a trusted TLS-terminating proxy/private network; a nonblank key is always required.
+    public boolean apiAllowRemoteHttp = false;
+    // Detailed world/pose/debug commands can expose coordinates and inventories.
+    public boolean diagnosticCommandsEnabled = false;
+    // Webhook titles remain useful without sending stash coordinates, item details,
+    // or exception text to a third-party channel by default.
+    public boolean webhookIncludeDetailedPayload = false;
 
     // Plugin updates
     public boolean updateCheckOnLoad = true;
