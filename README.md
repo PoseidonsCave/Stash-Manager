@@ -83,6 +83,13 @@ checksums, and artifact provenance. Release tags must match `plugin_version` in
 `gradle.properties`. Artifact attestations require a public repository unless the organization
 uses a qualifying GitHub plan.
 
+Contributors can start with [CONTRIBUTING.md](CONTRIBUTING.md). The
+[security policy](SECURITY.md) explains private reporting, and
+[secure development practice](docs/SECURE_DEVELOPMENT.md) records the project's
+SSDF-aligned controls and remaining gaps. Public-repository CodeQL analysis runs
+on pull requests, pushes, and weekly; private forks skip that job to avoid
+billable hosted scanning.
+
 ## 🎮 Commands
 
 Commands are available through **Discord**, the **terminal**, and **in game chat**. If your
@@ -188,7 +195,17 @@ one slot per stack, while tools, armor, and other non-stackable items use one sl
 | `stash kit finish <name>` | Validate capacity and mark a draft ready |
 | `stash kit crafting <name> [on|off]` | View or save the per-kit, off-by-default missing-stock crafting preference (planning only for now) |
 | `stash kit build <name> <count>` | Build and deliver boxes one at a time after a healthy scan and stock check |
+| `stash kit laneplan <name> <count>` | Owner-only, read-only working-stock box and chest estimate for a saved kit; no lane is reserved or filled |
+| `stash kit working reserve <name> <copies> <x> <y> <z>` | Owner-only; verifies a canonical empty double chest in a live server window, then reserves pending working slots for one saved kit |
+| `stash kit working release <x> <y> <z>` | Owner-only; releases an entirely pending reservation only after a live empty-double-chest audit |
+| `stash kit working fill <name>` | Owner-only; probes all pending reserved working slots against live intact source shulkers, then starts a guarded, checkpointed fill only when every source matches |
+| `stash kit working repack <name> <item_id> <units> <x> <y> <z>` | Owner-only; packs one exact-item box into a freshly indexed, role-free empty staging double chest; rescan before working fill |
+| `stash kit working recover` | Owner-only; audits both ends of a reviewed transfer and resumes only a proven phase without replaying submitted clicks |
+| `stash kit working status` | Owner-only source-probe or fill checkpoint status |
+| `stash kit consolidate preview all <count>` | Owner-only, read-only shared-demand, projected depletion, and residual-handoff sizing across populated saved kits |
+| `stash kit consolidate preview one <name> <count>` | Preview one saved kit without moving items or retiring lanes |
 | `stash kit job` | Show build or recovery status |
+| `stash kit return preview` | Owner-only, read-only check of terminal kit excess against the saved apple lane and live inventory |
 | `stash kit diagnose` | Owner-only, opt-in read-only checkpoint, live bot pose, shell identity, and exact indexed source/access report |
 | `stash kit diagnose <x> <y> <z>` | Owner-only, opt-in capture of one target's live block/reach geometry for `stash debug geometry export` |
 | `stash kit diagnosevariant <raw_slot>` | Owner-only, opt-in first-failed-guard and component-order comparison for a stopped variant exchange; does not audit or resume |
@@ -198,6 +215,9 @@ one slot per stack, while tools, armor, and other non-stackable items use one sl
 | `stash kit reconcileinventory preview` | Read-only route and shulker-content review for inventory that kit preflight would reject |
 | `stash kit reconcileinventory` | Start a checkpointed, inventory-only handoff of non-kept items before a new kit or at the reviewed old-kit no-cargo boundary |
 | `stash kit auditcargo <slot> <count>` | Recover a partial withdrawal only after confirming the exact loose stack and raw inventory slot |
+| `stash kit auditcargo partial <kept_slot> <kept_count> <cargo_slot:count>...` | Owner-attested recovery when a borrowed box and a partial cargo batch coexist with older same-item inventory; verifies and journals all three identities before scheduling recovery |
+| `stash kit rebasecheck <kept_count>` | Owner-only, read-only preflight for a carried borrowed box that now holds both the retrieved task units and attested older stock; reports the live versus journaled balance without changing ownership or resuming |
+| `stash kit rebase <kept_count>` | Owner-only guarded checkpoint rebase after the same live checks; schedules one exact task-only extraction from the carried box while older stock remains in the returned source |
 | `stash kit discard confirm` | Clear a checkpoint only after its world boxes are resolved and cargo is checked |
 | `stash kit list` | List all saved kits |
 | `stash kit show <name>` | Show the saved contents of a kit |
@@ -218,6 +238,12 @@ interruption, a clean between-items checkpoint waits through the configured cool
 window, then continues automatically. A submitted click, placed box, or uncertain export still
 pauses for recovery and cargo review; it never blindly replays an ingredient move. `stash kit stop`
 cancels automatic resumption. Use `stash kit resume` only after reviewing a safe paused checkpoint.
+
+After all deliveries, use the [return playbook](docs/RETURN_PLAYBOOK.md).
+Borrowed source boxes retain their checkpointed return obligations. Surplus
+filled boxes and loose displaced contents may go to their verified,
+backend-assigned lanes. The terminal kit checkpoint remains blocked until
+its protected apple stacks and the live lane destination are reconciled.
 
 Before a new kit build, use `stash kit reconcileinventory preview` if preflight reports
 unexpected inventory slots. The guarded inventory-only handoff leaves configured keep supplies
@@ -247,6 +273,30 @@ number of boxes. Changing a saved recipe does not alter boxes already delivered,
 after the last scan needs a fresh scan before a new build.
 If retrieval stops after moving only part of a stack, leave the inventory unchanged. An operator can
 use `stash kit auditcargo` to verify one exact stack before the bot packs it and fetches the rest.
+For a stopped borrowed-box batch where some same-item stock was already in inventory,
+first restore the borrowed box to its journaled contents and separate the old stock from
+the retrieved task stacks. `stash kit auditcargo partial` requires the saved mismatch
+count, exact live source box and kit shell, one declared kept stack, every task stack,
+and no other loose stack of that item. It records a protected kept-stack witness in
+the checkpoint and checks it again after the cooldown. The command does not move items.
+When all loose stock has instead been returned to the carried borrowed box,
+`stash kit rebasecheck <kept_count>` can verify the combined box against the saved
+post-retrieval source count and mismatch. This is a preflight only: a future
+checkpointed transaction must verify each extraction and keep the older stock
+in the borrowed box before any kit packing. A matching total does not authorize consuming
+older inventory or rewriting the scan index.
+With explicit operator attestation, `stash kit rebase <kept_count>` journals the
+combined carried-box identity and schedules recovery. The retriever takes only
+the saved observed task amount, verifies the recovered source box and loose
+cargo, and leaves the attested older amount inside the returned source box.
+For an existing blocked kit, this command also accepts a latest partial scan
+with exactly one failed container when the borrowed source chest remains indexed.
+It does not make that scan trusted for new jobs or organization.
+Any source, window, cargo, or checkpoint mismatch stops the existing kit job.
+With the optional private interaction trace enabled, `stash kit cargo` also reports
+whether a click is still awaiting a full server window or an independent player
+inventory mirror. A balanced window alone is not credited as a completed transfer;
+the trace remains diagnostic and cannot authorize a checkpoint transition.
 
 #### Equipment profiles
 
@@ -648,6 +698,15 @@ or `stash debug pose export` to inspect it, then `stash debug pose off` when fin
 trace has its own bounded log, so it cannot crowd failures out of the normal `stash debug export`.
 `stash debug pose clear` clears only pose traces; tracing is off by default and resets on restart.
 
+For a kit click investigation, set `kitInteractionTraceEnabled` in the local plugin config and
+restart the proxy. The opt-in `plugins/config/stash-manager-kit-interactions.jsonl` records
+container opens/closes, click proposals, and subsequent server slot and full-window updates.
+It stores numeric item IDs, counts, and slot numbers, with no packet bodies, names, chat, or NBT.
+The file is private to the local process account and rotates at 4 MiB. A balanced chest-window
+delta is only provisional; a later full player-inventory packet must match the chest footer for
+`DUAL_VIEW_MATCH`. Neither observation alone proves which earlier stack owned a merged item.
+Tracing is passive: it does not modify packet flow or lift a kit checkpoint block.
+
 When a scan cannot reach or open a container, or organization fails while walking or opening,
 `stash debug geometry export` downloads a separate,
 bounded failure log. Each snapshot includes the bot's position and look direction, the target and
@@ -681,7 +740,8 @@ shareable construction report.
 
 ### ⚙️ Live configuration
 
-All settings can be viewed and changed at runtime via Discord. Changes are saved automatically.
+The account owner can view and change settings at runtime through the terminal, Discord, or
+in-game commands. Changes are saved automatically.
 
 | Command | Description |
 |---------|-------------|
@@ -713,12 +773,14 @@ All settings can be viewed and changed at runtime via Discord. Changes are saved
 | `stash config api start` | Start the API server |
 | `stash config api stop` | Stop the API server |
 | `stash config diagnostics <on\|off>` | Account-owner-only toggle for detailed debug commands and exports |
-| **Webhook** | |
-| `stash config webhook <url>` | Set webhook URL (use `off` to clear) |
 | **Updates** | |
 | `stash config updates` | Show updater settings and the last check result |
 | `stash config updates checkOnLoad <on\|off>` | Enable/disable startup update checks |
 | `stash config updates autoDownload <on\|off>` | Automatically stage new releases during startup checks |
+
+Set database URLs, passwords, and API keys from a private terminal session. StashManager marks
+those command inputs sensitive so ZenithProxy will not relay them to Discord, but a command
+typed directly in a Discord channel is still a message in that channel.
 
 ## ⚙️ Configuration reference
 
@@ -772,13 +834,14 @@ Saved automatically via ZenithProxy's plugin config system.
 | `apiKey` | *(empty)* | Bearer token; a nonblank key is required to start the API |
 | `apiAllowRemoteHttp` | `false` | Explicitly opt into non-loopback plain HTTP, only behind a trusted TLS proxy or isolated network |
 | `diagnosticCommandsEnabled` | `false` | Permit owner-only `stash debug` and kit probe commands and exports |
+| `kitInteractionTraceEnabled` | `false` | Write bounded, private click and server-window evidence for kit inventory investigations |
 | `webhookIncludeDetailedPayload` | `false` | Include coordinates, controller names, request names, and raw failure reasons in outbound notifications |
 
-### 🔔 Webhook
+### 🔔 Notifications
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `webhookUrl` | *(empty)* | URL that receives completed scan payloads |
+StashManager uses ZenithProxy's configured Discord connection for job notifications. It has no
+separate webhook URL setting or direct n8n POST endpoint. Detailed notification fields are
+disabled by default; set `webhookIncludeDetailedPayload` only for a private destination.
 
 ### 🔄 Plugin updates
 
@@ -995,24 +1058,6 @@ stash_proxy_control_grace_remaining_seconds 0
 Follow the [local Grafana setup guide](tools/grafana-setup.md) to start PostgreSQL, Prometheus, and Grafana,
 then import the included [coordinate-free dashboard](grafana/dashboards/stash-manager-overview.json)
 for either one bot or a fleet without mixing their database records.
-
-### 🔔 n8n and webhook integration
-
-Set a webhook URL and the plugin will POST a JSON payload when each scan completes:
-
-```
-stash config webhook https://your-n8n-instance.example.com/webhook/stash
-```
-
-Payload format:
-
-```json
-{
-  "event": "scan_complete",
-  "containersScanned": 150,
-  "timestamp": "2025-01-15T12:00:00Z"
-}
-```
 
 ## 📜 License
 

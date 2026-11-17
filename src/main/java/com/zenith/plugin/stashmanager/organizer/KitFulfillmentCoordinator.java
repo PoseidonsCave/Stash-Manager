@@ -7,21 +7,28 @@ import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.util.InventoryActionMacros;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.kit.KitCargoAudit;
+import com.zenith.plugin.stashmanager.kit.KitPartialBorrowedCargoGuard;
+import com.zenith.plugin.stashmanager.kit.KitHeldBorrowedBoxPolicy;
 import com.zenith.plugin.stashmanager.kit.KitAppleExchangePlan;
-import com.zenith.plugin.stashmanager.kit.KitAppleSourceGate;
+import com.zenith.plugin.stashmanager.kit.KitItemSourcePolicy;
 import com.zenith.plugin.stashmanager.kit.KitInventoryAppleOwnership;
 import com.zenith.plugin.stashmanager.kit.KitInventoryBaseline;
 import com.zenith.plugin.stashmanager.kit.KitEmptyShellOwnershipAudit;
 import com.zenith.plugin.stashmanager.kit.KitBaselineMismatchDiagnostic;
 import com.zenith.plugin.stashmanager.kit.KitCapacity;
+import com.zenith.plugin.stashmanager.kit.KitPhysicalSlotBudget;
+import com.zenith.plugin.stashmanager.kit.KitPackedStackCapacityRepair;
 import com.zenith.plugin.stashmanager.kit.KitFulfillmentPlan;
 import com.zenith.plugin.stashmanager.kit.KitFulfillmentJournalStore;
+import com.zenith.plugin.stashmanager.kit.KitProvenanceJournal;
 import com.zenith.plugin.stashmanager.kit.KitResumePolicy;
 import com.zenith.plugin.stashmanager.kit.KitRetainedShell;
 import com.zenith.plugin.stashmanager.kit.KitShulkerLedger;
 import com.zenith.plugin.stashmanager.kit.KitSourceReturnPolicy;
 import com.zenith.plugin.stashmanager.kit.KitVariantExchangePlan;
+import com.zenith.plugin.stashmanager.kit.KitCrystalNormalizationPlan;
 import com.zenith.plugin.stashmanager.kit.KitVariantFingerprint;
+import com.zenith.plugin.stashmanager.kit.KitAppleBudgetVariantEvidence;
 import com.zenith.plugin.stashmanager.orchestration.ContainerAccessPlanner;
 import com.zenith.plugin.stashmanager.retriever.StashRetriever;
 import com.zenith.plugin.stashmanager.util.BlockCompat;
@@ -65,6 +72,11 @@ public final class KitFulfillmentCoordinator {
     private final KitPacker packer;
     private final KitExporter exporter;
     private final KitFulfillmentJournalStore journal;
+    private final KitProvenanceJournal provenance;
+    private State lastTracedState;
+    private String lastTracedItem;
+    private int lastTracedBox;
+    private boolean provenanceFailureReported;
     private State state = State.IDLE;
     private String kitName;
     private String retrievalRequest;
@@ -75,6 +87,7 @@ public final class KitFulfillmentCoordinator {
     private final List<KitFulfillmentJournalStore.BorrowedBox> writtenOffSources = new ArrayList<>();
     private List<int[]> registeredReturnChests = List.of();
     private boolean sourceReturnStarted;
+    private boolean sourceReturnOriginalAudit;
     private int sourceReturnCloseWaitTicks;
     private List<ContainerEntry> candidates = List.of();
     private Set<Long> excludedPositions = Set.of();
@@ -92,6 +105,8 @@ public final class KitFulfillmentCoordinator {
     private int currentQuantity;
     private int auditedCargoSlot = -1;
     private Map<Integer, Integer> auditedCargoSlots = Map.of();
+    private KitFulfillmentJournalStore.ProtectedLoose protectedLoose;
+    private KitFulfillmentJournalStore.HeldBoxRebase heldBoxRebase;
     private Map<Integer, SlotSnapshot> baselineSlots = Map.of();
     private volatile String lastBaselineMismatch;
     private Set<Integer> emptyShellSlotsBefore = Set.of();
@@ -142,10 +157,17 @@ public final class KitFulfillmentCoordinator {
 
     public KitFulfillmentCoordinator(StashRetriever retriever, KitPacker packer,
                                      KitExporter exporter, KitFulfillmentJournalStore journal) {
+        this(retriever, packer, exporter, journal, KitProvenanceJournal.defaultStore());
+    }
+
+    public KitFulfillmentCoordinator(StashRetriever retriever, KitPacker packer,
+                                     KitExporter exporter, KitFulfillmentJournalStore journal,
+                                     KitProvenanceJournal provenance) {
         this.retriever = retriever;
         this.packer = packer;
         this.exporter = exporter;
         this.journal = journal;
+        this.provenance = provenance;
     }
 
     public void setEventCallback(BiConsumer<String, Map<String, Object>> events) {
@@ -214,11 +236,26 @@ public final class KitFulfillmentCoordinator {
         boolean auditedEmptyShell = KitEmptyShellOwnershipAudit.isScheduled(snapshot.blocker());
         boolean variantStart = "resume_variant_exchange".equals(snapshot.blocker());
         boolean variantReady = "resume_variant_source_cargo".equals(snapshot.blocker());
+        boolean variantStaging = "resume_variant_staging".equals(snapshot.blocker());
         boolean auditedCargo = "resume_audited_inventory_cargo".equals(snapshot.blocker())
                 || auditedKeptApples || auditedEmptyShell;
         boolean borrowedInventorySource =
-                "resume_borrowed_inventory_source".equals(snapshot.blocker());
-        boolean returningSource = "resume_source_return".equals(snapshot.blocker());
+                "resume_borrowed_inventory_source".equals(snapshot.blocker())
+                || "resume_held_box_rebase".equals(snapshot.blocker());
+        if ("resume_held_box_rebase".equals(snapshot.blocker())) {
+            Container player = playerInventory();
+            Map<Integer, ItemStack> live = new HashMap<>();
+            if (player != null) for (int raw = 9; raw <= 44; raw++)
+                live.put(raw, player.getItemStack(raw));
+            int retained = snapshot.retainedShell() == null ? -1
+                    : uniqueRetainedShellSlot(snapshot);
+            if (!KitHeldBorrowedBoxPolicy.verifiedScheduled(snapshot, live,
+                    uniqueOwnedShellSlot(snapshot), retained)) return false;
+        }
+        boolean originalUnopenedReturn = "resume_unopened_source_to_origin"
+                .equals(snapshot.blocker());
+        boolean returningSource = "resume_source_return".equals(snapshot.blocker())
+                || originalUnopenedReturn;
         boolean exactCapacityImportReturn = "resume_source_return_exact_import"
                 .equals(snapshot.blocker());
         boolean verifyCompletedReturn = "resume_audit_completed_source_return"
@@ -237,6 +274,7 @@ public final class KitFulfillmentCoordinator {
         if (variantStart && (!verifiedVariantRepairBoundary(snapshot)
                 || !verifiedVariantPendingSources(snapshot))) return false;
         if (variantReady && !verifiedVariantReadyBoundary(snapshot)) return false;
+        if (variantStaging && !verifiedVariantStagingBoundary(snapshot)) return false;
         int verifiedSingleCargoSlot = auditedCargo && snapshot.auditedCargoSlots().isEmpty()
                 ? uniqueAuditedCargoSlot(snapshot) : -1;
         if (auditedCargo && snapshot.auditedCargoSlots().isEmpty()
@@ -258,6 +296,12 @@ public final class KitFulfillmentCoordinator {
                 ? uniqueBorrowedInventorySourceSlot(snapshot) : -1;
         if (borrowedInventorySource && inventorySourceSlot < 0) return false;
         if (returningSource && uniqueSourceReturnSlot(snapshot) < 0) return false;
+        if (originalUnopenedReturn && (snapshot.sourceBoxesToReturn().size() != 1
+                || snapshot.sourceBoxesToReturn().getFirst().sourcePosition() == null
+                || !java.util.Arrays.equals(
+                        snapshot.sourceBoxesToReturn().getFirst().sourcePosition(),
+                        snapshot.sourceBoxesToReturn().getFirst().returnPosition())))
+            return false;
         if (verifyCompletedReturn && (snapshot.sourceBoxesToReturn().size() != 1
                 || uniqueSourceReturnSlot(snapshot) >= 0)) return false;
         if (verifyFailedReturn && (snapshot.sourceBoxesToReturn().size() != 1
@@ -272,6 +316,7 @@ public final class KitFulfillmentCoordinator {
         this.writtenOffSources.clear();
         this.writtenOffSources.addAll(snapshot.writtenOffSources());
         this.sourceReturnStarted = false;
+        this.sourceReturnOriginalAudit = originalUnopenedReturn;
         this.sourceReturnCloseWaitTicks = 0;
         this.requestedBoxes = snapshot.requestedBoxes();
         this.completedBoxes = snapshot.completedBoxes();
@@ -284,14 +329,19 @@ public final class KitFulfillmentCoordinator {
         this.ownedShellSlot = snapshot.ownedShellSlot();
         this.retainedShell = snapshot.retainedShell();
         this.currentItem = auditedCargo || borrowedInventorySource || variantStart || variantReady
+                || variantStaging
                 || verifyCompletedReturn
                 ? snapshot.currentItem() : null;
         this.currentQuantity = auditedCargo || borrowedInventorySource || variantStart || variantReady
+                || variantStaging
                 || verifyCompletedReturn
                 ? snapshot.currentQuantity() : 0;
         this.auditedCargoSlot = auditedCargo && verifiedSingleCargoSlot >= 0
                 ? verifiedSingleCargoSlot : auditedCargo ? snapshot.auditedCargoSlot() : -1;
-        this.auditedCargoSlots = auditedCargo ? snapshot.auditedCargoSlots() : Map.of();
+        this.auditedCargoSlots = auditedCargo || variantStart || variantReady || variantStaging
+                ? snapshot.auditedCargoSlots() : Map.of();
+        this.protectedLoose = auditedCargo ? snapshot.protectedLoose() : null;
+        this.heldBoxRebase = borrowedInventorySource ? snapshot.heldBoxRebase() : null;
         this.candidates = List.copyOf(candidates);
         this.registeredReturnChests = copyPositions(registeredReturnChests);
         this.regionPos1 = regionPos1 == null ? null : regionPos1.clone();
@@ -385,7 +435,7 @@ public final class KitFulfillmentCoordinator {
             block("kit_failed_return_target_unverified");
             return false;
         }
-        if (returningSource && !exactCapacityImportReturn
+        if (returningSource && !exactCapacityImportReturn && !originalUnopenedReturn
                 && !selectNextReturnTarget("checkpoint_" + snapshot.blocker())) {
             block("kit_source_return_no_capacity_import");
             return false;
@@ -426,13 +476,16 @@ public final class KitFulfillmentCoordinator {
     /** Read-only reason for a rejected legacy variant boundary; never re-journals hashes. */
     public static String variantRepairBoundaryFailure(
             KitFulfillmentJournalStore.Snapshot snapshot) {
+        boolean appleBudget = appleBudgetVariantRepair(snapshot);
+        boolean packedStackRepair = KitPackedStackCapacityRepair.repairCheckpoint(snapshot);
         if (snapshot == null || snapshot.variantRepair() == null
                 || !("BLOCKED".equals(snapshot.state())
                     || "VARIANT_NEED_SOURCE".equals(snapshot.state()))
-                || snapshot.currentItem() == null || snapshot.currentQuantity() != 1
+                || snapshot.currentItem() == null
+                || (!appleBudget && !packedStackRepair && snapshot.currentQuantity() != 1)
                 || snapshot.kitWorksite() != null || snapshot.borrowedSourceWorksite() != null)
             return "checkpoint_phase_or_worksite";
-        if (uniqueCurrentLooseCargoSlot(snapshot)
+        if (!appleBudget && !packedStackRepair && uniqueCurrentLooseCargoSlot(snapshot)
                 != snapshot.variantRepair().cargoRawSlot()) return "loose_task_cargo_slot";
         Container player = playerInventory();
         if (player == null) return "player_inventory_unavailable";
@@ -440,14 +493,35 @@ public final class KitFulfillmentCoordinator {
         if (!hasVerifiedOwnedShell(snapshot) || shell == null) return "owned_shell_contents";
         Map<Integer, ItemStack> slots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
         var repair = snapshot.variantRepair();
-        ItemStack cargo = player.getItemStack(repair.cargoRawSlot());
-        if (cargo == null || cargo.getAmount() != 1
-                || !snapshot.currentItem().equals(ItemIdentifier.getItemId(cargo)))
-            return "loose_task_cargo_identity";
-        if (!repair.cargoHash().equals(KitVariantFingerprint.variant(
-                cargo, repair.fingerprintVersion())))
-            return "legacy_cargo_fingerprint";
-        if (slots.size() != KitCapacity.MAX_SLOTS)
+        if (appleBudget) {
+            Map<Integer, KitCargoAudit.Stack> stacks = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack != null && stack.getAmount() > 0)
+                    stacks.put(raw, new KitCargoAudit.Stack(
+                            ItemIdentifier.getItemId(stack), stack.getAmount()));
+            }
+            if (!KitCargoAudit.verifiedBatch(stacks, snapshot.currentItem(),
+                    snapshot.currentQuantity(), snapshot.ownedShellSlot(),
+                    snapshot.auditedCargoSlots(), true)) return "audited_apple_batch_changed";
+            for (int raw : snapshot.auditedCargoSlots().keySet()) {
+                ItemStack cargo = player.getItemStack(raw);
+                if (!repair.cargoHash().equals(KitVariantFingerprint.variant(
+                        cargo, repair.fingerprintVersion())))
+                    return "audited_apple_variant_changed";
+            }
+        } else if (!packedStackRepair) {
+            ItemStack cargo = player.getItemStack(repair.cargoRawSlot());
+            if (cargo == null || cargo.getAmount() != 1
+                    || !snapshot.currentItem().equals(ItemIdentifier.getItemId(cargo)))
+                return "loose_task_cargo_identity";
+            if (!repair.cargoHash().equals(KitVariantFingerprint.variant(
+                    cargo, repair.fingerprintVersion())))
+                return "legacy_cargo_fingerprint";
+        }
+        if (slots.size() != (packedStackRepair
+                ? KitPackedStackCapacityRepair.profile(repair.itemId()).physicalSlots()
+                : appleBudget ? KitCapacity.MAX_SLOTS - 1 : KitCapacity.MAX_SLOTS))
             return "owned_shell_physical_capacity";
         if (!repair.shellHash().equals(KitVariantFingerprint.shell(
                 slots, repair.fingerprintVersion())))
@@ -455,20 +529,61 @@ public final class KitFulfillmentCoordinator {
         List<KitVariantExchangePlan.SlotStack> physical = slots.entrySet().stream()
                 .map(e -> new KitVariantExchangePlan.SlotStack(e.getKey(), e.getValue()))
                 .toList();
-        var opportunity = KitVariantExchangePlan.shellOpportunity(physical, repair.itemId(),
-                snapshot.packedContents().getOrDefault(repair.itemId(), 0),
-                KitCapacity.MAX_SLOTS - 1);
-        if (opportunity == null || opportunity.amount() != repair.amount()
-                || opportunity.outgoingSlot() != repair.outgoingSlot()
-                || opportunity.mergeTargetSlot() != repair.mergeTargetSlot())
-            return "shell_exchange_opportunity";
-        if (!repair.sourceHash().equals(KitVariantFingerprint.variant(
-                opportunity.mergeTargetStack(), repair.fingerprintVersion())))
-            return "merge_target_fingerprint";
-        if (!repair.outgoingHash().equals(KitVariantFingerprint.variant(
-                opportunity.outgoingStack(), repair.fingerprintVersion())))
-            return "outgoing_fingerprint";
+        if (packedStackRepair) {
+            var opportunity = KitPackedStackCapacityRepair.opportunity(slots,
+                    repair.itemId());
+            if (opportunity == null || opportunity.amount() != repair.amount()
+                    || opportunity.outgoingSlot() != repair.outgoingSlot()
+                    || opportunity.mergeTargetSlot() != repair.mergeTargetSlot())
+                return "packed_stack_replacement_opportunity";
+            if (!repair.sourceHash().equals(KitVariantFingerprint.variant(
+                    opportunity.mergeTargetStack(), repair.fingerprintVersion()))
+                    || !repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                    opportunity.outgoingStack(), repair.fingerprintVersion())))
+                return "packed_stack_variant_fingerprint";
+        } else if (repair.replacementOnly()) {
+            var step = KitCrystalNormalizationPlan.next(slots);
+            if (step == null || step.amount() != repair.amount()
+                    || step.outgoingSlot() != repair.outgoingSlot()
+                    || step.anchorSlot() != repair.mergeTargetSlot())
+                return "shell_replacement_opportunity";
+            if (!repair.sourceHash().equals(KitVariantFingerprint.variant(
+                    step.anchor(), repair.fingerprintVersion())))
+                return "replacement_source_fingerprint";
+            if (!repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                    step.outgoing(), repair.fingerprintVersion())))
+                return "replacement_outgoing_fingerprint";
+        } else {
+            var opportunity = KitVariantExchangePlan.shellOpportunity(physical, repair.itemId(),
+                    snapshot.packedContents().getOrDefault(repair.itemId(), 0),
+                    KitCapacity.MAX_SLOTS - (appleBudget ? 2 : 1));
+            if (opportunity == null || opportunity.amount() != repair.amount()
+                    || opportunity.outgoingSlot() != repair.outgoingSlot()
+                    || opportunity.mergeTargetSlot() != repair.mergeTargetSlot())
+                return "shell_exchange_opportunity";
+            if (!repair.sourceHash().equals(KitVariantFingerprint.variant(
+                    opportunity.mergeTargetStack(), repair.fingerprintVersion())))
+                return "merge_target_fingerprint";
+            if (!repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                    opportunity.outgoingStack(), repair.fingerprintVersion())))
+                return "outgoing_fingerprint";
+        }
         return null;
+    }
+
+    public static boolean appleBudgetVariantRepair(
+            KitFulfillmentJournalStore.Snapshot snapshot) {
+        if (snapshot == null || snapshot.variantRepair() == null) return false;
+        var repair = snapshot.variantRepair();
+        return !repair.replacementOnly() && repair.cargoRawSlot() == -1
+                && "enchanted_golden_apple".equals(snapshot.currentItem())
+                && snapshot.currentQuantity() == 128
+                && snapshot.auditedCargoSlots().size() == 2
+                && snapshot.auditedCargoSlots().values().stream()
+                    .allMatch(count -> count != null && count == 64)
+                && snapshot.packedContents().getOrDefault("end_crystal", 0) == 256
+                && "end_crystal".equals(repair.itemId())
+                && repair.amount() == 10;
     }
 
     /** A post-retrieval stop may resume only the exact already-held variant stack.
@@ -478,19 +593,106 @@ public final class KitFulfillmentCoordinator {
         return variantReadyBoundaryFailure(snapshot) == null;
     }
 
+    /** An already-held replacement shell may continue only to import its
+     * uniquely identified displaced stack. */
+    public static boolean verifiedVariantStagingBoundary(
+            KitFulfillmentJournalStore.Snapshot snapshot) {
+        boolean appleBudget = KitResumePolicy.stagedAppleBudgetVariant(snapshot);
+        if (KitPackedStackCapacityRepair.repairCheckpoint(snapshot)) {
+            var repair = snapshot.variantRepair();
+            if (repair.resultShellHash() == null || snapshot.kitWorksite() != null
+                    || snapshot.borrowedSourceWorksite() != null
+                    || snapshot.sourceBoxesToReturn().size() > 1
+                    || !hasVerifiedOwnedShell(snapshot)
+                    || variantPendingSourceSlots(snapshot).size()
+                            != snapshot.sourceBoxesToReturn().size()
+                    || repair.displacedRawSlot() < 9 || repair.displacedRawSlot() > 44)
+                return false;
+            Container player = playerInventory();
+            ItemStack shell = player == null ? null
+                    : player.getItemStack(snapshot.ownedShellSlot());
+            ItemStack displaced = player == null ? null
+                    : player.getItemStack(repair.displacedRawSlot());
+            if (shell == null || displaced == null
+                    || displaced.getAmount() != repair.amount()
+                    || !repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                            displaced, repair.fingerprintVersion()))) return false;
+            var slots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+            if (slots.size() != KitPackedStackCapacityRepair.profile(
+                    repair.itemId()).physicalSlots()
+                    || !repair.resultShellHash().equals(
+                    KitVariantFingerprint.shell(slots, repair.fingerprintVersion()))
+                    || !KitPhysicalSlotBudget.fitsAfterCompaction(slots.size(),
+                            List.copyOf(slots.values()), snapshot.recipe(),
+                            snapshot.packedContents())) return false;
+            var before = new HashMap<>(slots);
+            before.put(repair.outgoingSlot(), displaced);
+            return repair.shellHash().equals(KitVariantFingerprint.shell(
+                    before, repair.fingerprintVersion()));
+        }
+        if (snapshot == null || snapshot.variantRepair() == null
+                || !snapshot.variantRepair().replacementOnly() && !appleBudget
+                || snapshot.variantRepair().resultShellHash() == null
+                || snapshot.kitWorksite() != null
+                || snapshot.borrowedSourceWorksite() != null
+                || snapshot.sourceBoxesToReturn().size() != 2
+                || !hasVerifiedOwnedShell(snapshot)
+                || verifiedPendingSourceSlots(snapshot).size() != 2
+                || !appleBudget && uniqueCurrentLooseCargoSlot(snapshot)
+                        != snapshot.variantRepair().cargoRawSlot()) return false;
+        var repair = snapshot.variantRepair();
+        Container player = playerInventory();
+        if (player == null || repair.displacedRawSlot() < 9
+                || repair.displacedRawSlot() > 35) return false;
+        if (appleBudget) {
+            Map<Integer, ItemStack> observed = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++)
+                observed.put(raw, player.getItemStack(raw));
+            var proof = KitAppleBudgetVariantEvidence.prove(snapshot, observed);
+            return proof != null && proof.shellSlot() == snapshot.ownedShellSlot()
+                    && proof.displacedSlot() == repair.displacedRawSlot()
+                    && proof.resultShellHash().equals(repair.resultShellHash());
+        }
+        ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+        ItemStack displaced = player.getItemStack(repair.displacedRawSlot());
+        ItemStack cargo = player.getItemStack(repair.cargoRawSlot());
+        if (shell == null || displaced == null || cargo == null
+                || displaced.getAmount() != repair.amount()
+                || cargo.getAmount() != 1
+                || !repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                        displaced, repair.fingerprintVersion()))
+                || !repair.cargoHash().equals(KitVariantFingerprint.variant(
+                        cargo, repair.fingerprintVersion()))) return false;
+        var slots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+        var next = KitCrystalNormalizationPlan.next(slots);
+        if (next == null || next.number() != 2 || repair.amount() != 18
+                || !repair.resultShellHash().equals(KitVariantFingerprint.shell(
+                        slots, repair.fingerprintVersion()))) return false;
+        var before = new HashMap<>(slots);
+        before.put(repair.outgoingSlot(), displaced);
+        return repair.shellHash().equals(KitVariantFingerprint.shell(
+                before, repair.fingerprintVersion()));
+    }
+
     /** The first exact failed check, for a read-only audit preview. */
     public static String variantReadyBoundaryFailure(
             KitFulfillmentJournalStore.Snapshot snapshot) {
         if (snapshot == null || snapshot.variantRepair() == null)
             return "variant_repair_missing";
-        if (snapshot.sourceBoxesToReturn().size() != 2)
+        if (snapshot.variantRepair().replacementOnly()
+                ? snapshot.sourceBoxesToReturn().isEmpty()
+                    || snapshot.sourceBoxesToReturn().size() > 2
+                : snapshot.sourceBoxesToReturn().size() != 2)
             return "borrowed_source_box_count";
         String repairFailure = variantRepairBoundaryFailure(snapshot);
         if (repairFailure != null) return repairFailure;
         if (!verifiedVariantPendingSources(snapshot)) return "borrowed_source_box_ledger";
         var repair = snapshot.variantRepair();
         int incomingRaw = repair.auditedIncomingRawSlot();
-        if (incomingRaw < 9 || incomingRaw > 35) return "incoming_slot_invalid";
+        if (incomingRaw < 9 || incomingRaw > 44
+                || incomingRaw > 35
+                    && !KitPackedStackCapacityRepair.repairCheckpoint(snapshot))
+            return "incoming_slot_invalid";
         Container player = playerInventory();
         if (player == null) return "player_inventory_unavailable";
         int total = 0;
@@ -615,6 +817,23 @@ public final class KitFulfillmentCoordinator {
     /** A reserved empty next-kit shell is owned but is not a borrowed source return. */
     public static boolean verifiedVariantPendingSources(
             KitFulfillmentJournalStore.Snapshot snapshot) {
+        if (KitPackedStackCapacityRepair.repairCheckpoint(snapshot)
+                && snapshot.sourceBoxesToReturn().isEmpty()) {
+            return hasVerifiedOwnedShell(snapshot) && hasNoUnclaimedCurrentCargo(snapshot);
+        }
+        if (snapshot != null && snapshot.variantRepair() != null
+                && snapshot.variantRepair().replacementOnly()
+                && snapshot.sourceBoxesToReturn().isEmpty()
+                && hasVerifiedOwnedShell(snapshot)
+                && uniqueCurrentLooseCargoSlot(snapshot)
+                    == snapshot.variantRepair().cargoRawSlot()) {
+            Container player = playerInventory();
+            ItemStack shell = player == null ? null
+                    : player.getItemStack(snapshot.ownedShellSlot());
+            var next = KitCrystalNormalizationPlan.next(
+                    ItemIdentifier.readShulkerPhysicalSlotStacks(shell));
+            return next != null && next.number() == 2;
+        }
         return snapshot != null && snapshot.sourceBoxesToReturn() != null
                 && !snapshot.sourceBoxesToReturn().isEmpty()
                 && variantPendingSourceSlots(snapshot).size()
@@ -674,17 +893,23 @@ public final class KitFulfillmentCoordinator {
         Container player = playerInventory();
         if (player == null) return false;
         Map<Integer, KitCargoAudit.Stack> stacks = new HashMap<>();
+        Map<Integer, ItemStack> physical = new HashMap<>();
         for (int raw = 9; raw <= 44; raw++) {
             ItemStack stack = player.getItemStack(raw);
             if (stack != null && stack.getAmount() > 0) {
+                physical.put(raw, stack);
                 stacks.put(raw, new KitCargoAudit.Stack(
                         ItemIdentifier.getItemId(stack), stack.getAmount()));
             }
         }
+        if (snapshot.protectedLoose() != null
+                && !KitPartialBorrowedCargoGuard.verifiedScheduled(snapshot, physical))
+            return false;
         return KitCargoAudit.verifiedBatch(stacks, snapshot.currentItem(),
                 snapshot.currentQuantity(), snapshot.ownedShellSlot(), snapshot.auditedCargoSlots(),
                 "resume_audited_kept_apple_cargo".equals(snapshot.blocker())
-                        || KitEmptyShellOwnershipAudit.isScheduled(snapshot.blocker()));
+                        || KitEmptyShellOwnershipAudit.isScheduled(snapshot.blocker())
+                        || snapshot.protectedLoose() != null);
     }
 
     static Set<Integer> auditedCargoExclusions(int verifiedSingleSlot,
@@ -751,6 +976,8 @@ public final class KitFulfillmentCoordinator {
         this.currentItem = null;
         this.auditedCargoSlot = -1;
         this.auditedCargoSlots = Map.of();
+        this.protectedLoose = null;
+        this.heldBoxRebase = null;
         this.packedContents.clear();
         this.sourceBoxesToReturn.clear();
         this.writtenOffSources.clear();
@@ -796,6 +1023,7 @@ public final class KitFulfillmentCoordinator {
         if (state != State.WAIT_SHELL && state != State.WAIT_CARGO
                 && state != State.VARIANT_WAIT_SOURCE) return;
         if (retrievalRequest == null || !retrievalRequest.equals(payload.get("request_name"))) return;
+        trace(event, payload);
         if ("retrieve_borrowed_shell_placement_planned".equals(event)) {
             int[] planned = parsePosition(payload.get("placed_position"));
             String sourceId = payload.get("source_item_id") instanceof String id ? id : null;
@@ -835,7 +1063,24 @@ public final class KitFulfillmentCoordinator {
             sourceRecoveredDuringCurrentRetrieval = true;
             recoveredShulkersDuringCurrentRetrieval.merge(
                     new KitShulkerLedger.Identity(sourceId, sourceAfter), 1, Integer::sum);
-            if (origin != null) {
+            if (heldBoxRebase != null) {
+                if (sourceBoxesToReturn.size() != 1
+                        || !heldBoxRebase.sourceItemId().equals(sourceId)
+                        || !Map.of(heldBoxRebase.itemId(),
+                                heldBoxRebase.combinedSourceUnits()).equals(
+                                sourceBoxesToReturn.getFirst().contents())
+                        || !Map.of(heldBoxRebase.itemId(),
+                                heldBoxRebase.combinedSourceUnits()
+                                    - heldBoxRebase.retrievedUnits()).equals(sourceAfter)) {
+                    retriever.stop();
+                    block("held_box_recovered_balance_mismatch");
+                    return;
+                }
+                var previous = sourceBoxesToReturn.getFirst();
+                sourceBoxesToReturn.set(0, new KitFulfillmentJournalStore.BorrowedBox(
+                        previous.sourcePosition(), sourceId, sourceAfter,
+                        previous.returnPosition()));
+            } else if (origin != null) {
                 sourceBoxesToReturn.add(new KitFulfillmentJournalStore.BorrowedBox(
                         origin, sourceId, sourceAfter));
             } else {
@@ -892,8 +1137,7 @@ public final class KitFulfillmentCoordinator {
         int moved = payload.get("target_moved_stacks") instanceof Number n ? n.intValue() : -1;
         boolean openAttempted = payload.get("target_open_attempted") instanceof Boolean value
                 ? value : true;
-        return KitAppleSourceGate.maySkipInaccessibleNamedHopper(
-                KitAppleSourceGate.Phase.NAMED,
+        return KitItemSourcePolicy.NAMED_APPLES.maySkipInaccessibleSource(
                 payload.get("failure_reason") instanceof String reason ? reason : null,
                 block == null ? null : block.name(),
                 BlockCompat.isSolid(target[0], target[1] + 1, target[2]),
@@ -933,7 +1177,9 @@ public final class KitFulfillmentCoordinator {
             block("kit_variant_checkpoint_unreadable"); return;
         }
         if (variantRepair == null || !verifiedVariantRepairBoundary(snapshot)
-                || !verifiedVariantPendingSources(snapshot)) {
+                || (!verifiedVariantPendingSources(snapshot)
+                    && !(variantRepair.replacementOnly()
+                        && snapshot.sourceBoxesToReturn().isEmpty()))) {
             block("kit_variant_boundary_changed"); return;
         }
         if (freeMainSlots() < 2 || !hotbarSlotsReady()) {
@@ -958,6 +1204,9 @@ public final class KitFulfillmentCoordinator {
         retrievalCloseTicks = 0;
         state = State.VARIANT_WAIT_SOURCE;
         if (!persist()) { block("kit_checkpoint_write_failed"); return; }
+        if (!trace("kit_retrieval_baseline", Map.of())) {
+            block("kit_provenance_baseline_write_failed"); return;
+        }
         java.util.function.Predicate<ItemStack> filter = stack ->
                 variantRepair.itemId().equals(ItemIdentifier.getItemId(stack))
                         && variantRepair.sourceHash().equals(
@@ -971,6 +1220,14 @@ public final class KitFulfillmentCoordinator {
         }
     }
 
+    private boolean packedStackCapacityRepairActive() {
+        return variantRepair != null && variantRepair.replacementOnly()
+                && variantRepair.cargoRawSlot() == -1
+                && KitPackedStackCapacityRepair.matchesPackedBatch(
+                    variantRepair.itemId(), currentItem, currentQuantity, recipe,
+                    packedContents);
+    }
+
     private void tickVariantWaitSource() {
         if (retrievalSucceeded == null) return;
         if (!retrievalSucceeded) {
@@ -981,7 +1238,9 @@ public final class KitFulfillmentCoordinator {
         }
         if (!awaitRetrievalContainerClose()) return;
         int incomingRaw = uniqueVariantIncomingSlot();
-        if (incomingRaw < 9 || incomingRaw > 35) {
+        boolean packedStackCapacityRepair = packedStackCapacityRepairActive();
+        if (incomingRaw < 9 || incomingRaw > 44
+                || incomingRaw > 35 && !packedStackCapacityRepair) {
             retrievalVerifiedTicks = 0;
             if (++retrievalSettleTicks >= RETRIEVAL_SETTLE_TICKS)
                 block("kit_variant_source_cargo_unverified");
@@ -990,6 +1249,15 @@ public final class KitFulfillmentCoordinator {
         if (++retrievalVerifiedTicks < RETRIEVAL_STABLE_TICKS) return;
         if (!variantBaselinePreserved()) {
             block("kit_variant_preexisting_inventory_changed"); return;
+        }
+        int observedShellSlot = KitShulkerLedger.ownedSlot(
+                inventoryShulkerSlots(), ownedShellSlot, packedContents, null);
+        if (observedShellSlot < 9) {
+            block("kit_variant_owned_shell_not_unique"); return;
+        }
+        if (observedShellSlot != ownedShellSlot) {
+            ownedShellSlot = observedShellSlot;
+            if (!persist()) { block("kit_checkpoint_write_failed"); return; }
         }
         Container player = playerInventory();
         ItemStack shell = player == null ? null : player.getItemStack(ownedShellSlot);
@@ -1003,28 +1271,52 @@ public final class KitFulfillmentCoordinator {
         List<KitVariantExchangePlan.SlotStack> physical = shellSlots.entrySet().stream()
                 .map(e -> new KitVariantExchangePlan.SlotStack(e.getKey(), e.getValue()))
                 .toList();
-        var opportunity = KitVariantExchangePlan.shellOpportunity(physical,
-                variantRepair.itemId(), packedContents.getOrDefault(
-                        variantRepair.itemId(), 0), KitCapacity.MAX_SLOTS - 1);
+        boolean packedStackRepair = packedStackCapacityRepairActive();
+        var step = variantRepair.replacementOnly() && !packedStackRepair
+                ? KitCrystalNormalizationPlan.next(shellSlots) : null;
+        var opportunity = packedStackRepair
+                ? KitPackedStackCapacityRepair.opportunity(shellSlots,
+                        variantRepair.itemId())
+                : variantRepair.replacementOnly() ? null
+                : KitVariantExchangePlan.shellOpportunity(physical,
+                        variantRepair.itemId(), packedContents.getOrDefault(
+                                variantRepair.itemId(), 0), KitCapacity.MAX_SLOTS
+                                - (variantRepair.cargoRawSlot() == -1 ? 2 : 1));
         ItemStack incoming = player.getItemStack(incomingRaw);
-        if (opportunity == null || opportunity.amount() != variantRepair.amount()
-                || opportunity.outgoingSlot() != variantRepair.outgoingSlot()
-                || opportunity.mergeTargetSlot() != variantRepair.mergeTargetSlot()
+        if ((variantRepair.replacementOnly() && !packedStackRepair
+                    ? step == null || step.amount() != variantRepair.amount()
+                        || step.outgoingSlot() != variantRepair.outgoingSlot()
+                        || step.anchorSlot() != variantRepair.mergeTargetSlot()
+                    : opportunity == null || opportunity.amount() != variantRepair.amount()
+                        || opportunity.outgoingSlot() != variantRepair.outgoingSlot()
+                        || opportunity.mergeTargetSlot() != variantRepair.mergeTargetSlot())
                 || !variantRepair.sourceHash().equals(KitVariantFingerprint.variant(
                         incoming, variantRepair.fingerprintVersion()))) {
             block("kit_variant_source_mismatched_opportunity"); return;
         }
-        var plan = new KitVariantExchangePlan.Plan(opportunity.outgoingSlot(),
-                opportunity.outgoingStack(), opportunity.mergeTargetSlot(),
-                opportunity.mergeTargetStack(), -1, incoming, opportunity.amount(),
-                opportunity.maxStack(), opportunity.slotsAfter());
+        var plan = variantRepair.replacementOnly() && !packedStackRepair
+                ? new KitVariantExchangePlan.Plan(step.outgoingSlot(), step.outgoing(),
+                        step.anchorSlot(), step.anchor(), -1, incoming,
+                        step.amount(), 64, step.slotsAfter())
+                : new KitVariantExchangePlan.Plan(opportunity.outgoingSlot(),
+                        opportunity.outgoingStack(), opportunity.mergeTargetSlot(),
+                        opportunity.mergeTargetStack(), -1, incoming, opportunity.amount(),
+                        opportunity.maxStack(), opportunity.slotsAfter());
         Set<Integer> protectedSlots = new HashSet<>(occupiedSlots().keySet());
         protectedSlots.remove(ownedShellSlot);
         protectedSlots.remove(variantRepair.cargoRawSlot());
+        if (variantRepair.cargoRawSlot() == -1 && !packedStackRepair) {
+            if (!verifiedPinnedAppleBudgetCargo()) {
+                block("kit_variant_audited_apple_cargo_changed"); return;
+            }
+            protectedSlots.removeAll(auditedCargoSlots.keySet());
+        }
         protectedSlots.remove(incomingRaw);
-        if (!packer.start(packedContents, Map.of(currentItem, currentQuantity),
+        if (!packer.start(packedContents,
+                Map.of(currentItem, packedStackRepair ? variantRepair.amount() : currentQuantity),
                 protectedSlots, ownedShellSlot, null,
-                new KitPacker.VariantExchange(plan, incomingRaw))) {
+                new KitPacker.VariantExchange(plan, incomingRaw,
+                        variantRepair.replacementOnly()))) {
             block("kit_variant_packer_start_failed:" + packer.failureReason()); return;
         }
         kitWorksite = packer.worksite();
@@ -1052,7 +1344,30 @@ public final class KitFulfillmentCoordinator {
             found = raw;
             total += stack.getAmount();
         }
+        if (found > 35 && !packedStackCapacityRepairActive())
+            return -1;
         return total == variantRepair.amount() ? found : -1;
+    }
+
+    private boolean verifiedPinnedAppleBudgetCargo() {
+        if (variantRepair == null || variantRepair.cargoRawSlot() != -1
+                || auditedCargoSlots.size() != 2) return false;
+        Container player = playerInventory();
+        if (player == null) return false;
+        Map<Integer, KitCargoAudit.Stack> stacks = new HashMap<>();
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack != null && stack.getAmount() > 0)
+                stacks.put(raw, new KitCargoAudit.Stack(
+                        ItemIdentifier.getItemId(stack), stack.getAmount()));
+        }
+        if (!KitCargoAudit.verifiedBatch(stacks, currentItem, currentQuantity,
+                ownedShellSlot, auditedCargoSlots, true)) return false;
+        for (int raw : auditedCargoSlots.keySet()) {
+            if (!variantRepair.cargoHash().equals(KitVariantFingerprint.variant(
+                    player.getItemStack(raw), variantRepair.fingerprintVersion()))) return false;
+        }
+        return true;
     }
 
     private boolean variantBaselinePreserved() {
@@ -1095,12 +1410,44 @@ public final class KitFulfillmentCoordinator {
                 : player.getItemStack(recovered);
         ItemStack liveDisplaced = player == null || raw < 9 ? null
                 : player.getItemStack(raw);
+        ItemStack liveCargo = variantRepair == null || player == null ? null
+                : player.getItemStack(variantRepair.cargoRawSlot());
+        if (variantRepair != null && player != null
+                && packedStackCapacityRepairActive()
+                && (liveDisplaced == null
+                    || !variantRepair.outgoingHash().equals(
+                            KitVariantFingerprint.variant(liveDisplaced,
+                                    variantRepair.fingerprintVersion())))) {
+            // InventoryBehavior may move the displaced stack into the hotbar
+            // after the shell GUI closes. Only a unique exact stack can replace
+            // the packer's original destination as import evidence.
+            int unique = -1;
+            for (int candidate = 9; candidate <= 44; candidate++) {
+                ItemStack stack = player.getItemStack(candidate);
+                if (stack == null || stack.getAmount() != variantRepair.amount()
+                        || !variantRepair.itemId().equals(ItemIdentifier.getItemId(stack))
+                        || !variantRepair.outgoingHash().equals(
+                                KitVariantFingerprint.variant(stack,
+                                        variantRepair.fingerprintVersion()))) continue;
+                if (unique >= 0) { unique = -1; break; }
+                unique = candidate;
+            }
+            if (unique >= 9) {
+                raw = unique;
+                liveDisplaced = player.getItemStack(unique);
+            }
+        }
         if (variantRepair == null || !packer.variantRecoveredExact()
                 || shell == null || !variantRepair.outgoingHash().equals(
                         KitVariantFingerprint.variant(liveDisplaced,
                                 variantRepair.fingerprintVersion()))
                 || displaced == null || liveDisplaced == null
                 || liveDisplaced.getAmount() != variantRepair.amount()
+                || (variantRepair.replacementOnly()
+                    && !packedStackCapacityRepairActive()
+                    && (liveCargo == null || liveCargo.getAmount() != 1
+                        || !variantRepair.cargoHash().equals(KitVariantFingerprint.variant(
+                                liveCargo, variantRepair.fingerprintVersion()))))
                 || !variantRepair.outgoingHash().equals(
                         KitVariantFingerprint.variant(displaced,
                                 variantRepair.fingerprintVersion()))) {
@@ -1108,7 +1455,10 @@ public final class KitFulfillmentCoordinator {
         }
         ownedShellSlot = recovered;
         kitWorksite = null;
-        packedContents.merge(currentItem, currentQuantity, Integer::sum);
+        if (!variantRepair.replacementOnly()) {
+            packedContents.merge(currentItem, currentQuantity, Integer::sum);
+            if (variantRepair.cargoRawSlot() == -1) auditedCargoSlots = Map.of();
+        }
         variantRepair = variantRepair.withResult(raw,
                 KitVariantFingerprint.variant(liveDisplaced,
                         variantRepair.fingerprintVersion()),
@@ -1166,7 +1516,45 @@ public final class KitFulfillmentCoordinator {
         }
         var finished = variantRepair;
         variantRepair = null;
-        state = sourceBoxesToReturn.isEmpty() ? State.NEED_CARGO : State.RETURNING_SOURCE;
+        if (finished.replacementOnly()) {
+            ItemStack liveShell = player == null ? null : player.getItemStack(ownedShellSlot);
+            Map<Integer, ItemStack> slots = ItemIdentifier.readShulkerPhysicalSlotStacks(liveShell);
+            boolean packedStackRepair = finished.cargoRawSlot() == -1
+                    && KitPackedStackCapacityRepair.matchesPackedBatch(
+                        finished.itemId(), currentItem, currentQuantity, recipe,
+                        packedContents);
+            if (packedStackRepair) {
+                if (slots.size() != KitPackedStackCapacityRepair.profile(
+                        finished.itemId()).physicalSlots()
+                        || !KitPhysicalSlotBudget.fitsAfterCompaction(
+                        slots.size(), List.copyOf(slots.values()), recipe, packedContents)) {
+                    variantRepair = finished;
+                    block("kit_packed_stack_normalization_result_unverified"); return;
+                }
+            } else {
+            var next = KitCrystalNormalizationPlan.next(slots);
+            if (next != null && next.number() == 2 && finished.amount() == 18) {
+                String shellHash = KitVariantFingerprint.canonicalShell(slots);
+                String sourceHash = KitVariantFingerprint.canonicalVariant(next.anchor());
+                String outgoingHash = KitVariantFingerprint.canonicalVariant(next.outgoing());
+                if (shellHash == null || sourceHash == null || outgoingHash == null) {
+                    block("kit_crystal_next_exchange_fingerprint_unavailable"); return;
+                }
+                variantRepair = new KitFulfillmentJournalStore.VariantRepair(
+                        finished.importPosition(), finished.expectedImportSlots(),
+                        finished.cargoRawSlot(), finished.cargoHash(), "end_crystal",
+                        next.amount(), next.outgoingSlot(), next.anchorSlot(),
+                        sourceHash, outgoingHash, shellHash, -1, null, null,
+                        0, 2, true);
+            } else if (!KitCrystalNormalizationPlan.normalized(slots)
+                    || finished.amount() != 60) {
+                block("kit_crystal_normalization_result_unverified"); return;
+            }
+            }
+        }
+        state = sourceBoxesToReturn.isEmpty()
+                ? variantRepair == null ? State.NEED_CARGO : State.VARIANT_NEED_SOURCE
+                : State.RETURNING_SOURCE;
         if (!persist()) {
             variantRepair = finished;
             block("kit_checkpoint_write_failed");
@@ -1203,6 +1591,9 @@ public final class KitFulfillmentCoordinator {
         retrievalCloseTicks = 0;
         state = State.WAIT_SHELL;
         if (!persist()) { block("kit_checkpoint_write_failed"); return; }
+        if (!trace("kit_retrieval_baseline", Map.of())) {
+            block("kit_provenance_baseline_write_failed"); return;
+        }
         if (!startRetrieval(Map.of(StashRetriever.EMPTY_SHELL_REQUEST, 1))) {
             block("empty_shell_retrieval_start_failed"); return;
         }
@@ -1258,6 +1649,22 @@ public final class KitFulfillmentCoordinator {
                 || !packedContents.equals(ItemIdentifier.readShulkerContents(owned))) {
             block("kit_owned_shell_identity_ambiguous"); return;
         }
+        int physicalSlots = ItemIdentifier.readShulkerOccupiedSlots(owned);
+        boolean fitsNow = KitPhysicalSlotBudget.fits(physicalSlots, recipe, packedContents);
+        if (!KitPhysicalSlotBudget.fitsAfterCompaction(physicalSlots,
+                ItemIdentifier.readShulkerPhysicalStacks(owned), recipe, packedContents)) {
+            emit("kit_physical_slot_budget_exceeded", Map.of(
+                    "physical_slots", physicalSlots,
+                    "minimum_remaining_slots",
+                    KitPhysicalSlotBudget.minimumRemaining(recipe, packedContents),
+                    "kit", kitName, "box", deliveredBoxes() + 1));
+            block("kit_physical_slot_budget_exceeded"); return;
+        }
+        if (!fitsNow) emit("kit_physical_slot_budget_compactable", Map.of(
+                "physical_slots", physicalSlots,
+                "minimum_remaining_slots",
+                KitPhysicalSlotBudget.minimumRemaining(recipe, packedContents),
+                "kit", kitName, "box", deliveredBoxes() + 1));
         Set<Integer> ownedSlots = new HashSet<>();
         ownedSlots.add(ownedShellSlot);
         if (recoveryInventorySourceSlot >= 0) {
@@ -1274,13 +1681,22 @@ public final class KitFulfillmentCoordinator {
             }
             state = State.EXPORTING;
             if (!persist()) { block("kit_checkpoint_write_failed"); return; }
-            if (!exporter.start(exportPosition, packedContents, ownedShellSlot)) {
+            boolean workingStockRepack = kitName != null
+                    && kitName.startsWith("@stash-working-repack:");
+            boolean exportStarted = workingStockRepack
+                    ? exporter.start(exportPosition, packedContents, ownedShellSlot,
+                            null, true, 54, true)
+                    : exporter.start(exportPosition, packedContents, ownedShellSlot);
+            if (!exportStarted) {
                 block("kit_export_start_failed"); return;
             }
             return;
         }
-        String nextItem = nextUnpackedItem();
-        if (nextItem == null) {
+        // A witnessed carried-box recovery must finish its already selected task.
+        // Map iteration order is not a stable way to reconstruct that task after
+        // a restart, and selecting another recipe item would strand the source.
+        String nextItem = heldBoxRebase == null ? nextUnpackedItem() : currentItem;
+        if (nextItem == null || !recipe.containsKey(nextItem)) {
             if (appleStockExhaustedForBox && markCurrentBoxIncomplete()) return;
             block("kit_recipe_progress_mismatch"); return;
         }
@@ -1355,6 +1771,9 @@ public final class KitFulfillmentCoordinator {
         appleNamedInaccessibleTargetSkipped = false;
         state = State.WAIT_CARGO;
         if (!persist()) { block("kit_checkpoint_write_failed"); return; }
+        if (!trace("kit_retrieval_baseline", Map.of())) {
+            block("kit_provenance_baseline_write_failed"); return;
+        }
         if (!startRetrieval(Map.of(currentItem, currentQuantity))) {
             if (appleStockExhaustedWithoutCargo()) return;
             block("kit_cargo_retrieval_start_failed"); return;
@@ -1590,7 +2009,8 @@ public final class KitFulfillmentCoordinator {
         }
         if (borrowedSourceWorksite != null) { block("borrowed_source_shell_not_recovered"); return; }
         if (!awaitRetrievalContainerClose()) return;
-        int received = unownedUnitsOf(currentItem, baselineSlots.keySet());
+        var incoming = incomingCargo(currentItem, baselineSlots);
+        int received = incoming.units();
         if (received != currentQuantity) {
             retrievalVerifiedTicks = 0;
             if (++retrievalSettleTicks >= RETRIEVAL_SETTLE_TICKS) {
@@ -1606,6 +2026,16 @@ public final class KitFulfillmentCoordinator {
             return;
         }
         if (++retrievalVerifiedTicks < RETRIEVAL_STABLE_TICKS) return;
+        if (protectedLoose != null) {
+            Container player = playerInventory();
+            Map<Integer, ItemStack> live = new HashMap<>();
+            if (player != null) for (int raw = 9; raw <= 44; raw++)
+                live.put(raw, player.getItemStack(raw));
+            if (!KitPartialBorrowedCargoGuard.verifiedActive(
+                    protectedLoose, auditedCargoSlots, live)) {
+                block("kit_protected_loose_changed"); return;
+            }
+        }
         if (!baselineStillPresent()) { block("kit_preexisting_inventory_changed"); return; }
         for (KitShulkerLedger.Identity source : recoveredShulkersDuringCurrentRetrieval.keySet()) {
             if (source.contents().equals(packedContents)) {
@@ -1619,7 +2049,20 @@ public final class KitFulfillmentCoordinator {
                 ownedShellSlot, packedContents, recovered);
         if (verifiedShellSlot < 0) { block("kit_owned_shell_identity_ambiguous"); return; }
         ownedShellSlot = verifiedShellSlot;
+        if (heldBoxRebase != null) {
+            Container player = playerInventory();
+            Map<Integer, ItemStack> live = new HashMap<>();
+            if (player != null) for (int raw = 9; raw <= 44; raw++)
+                live.put(raw, player.getItemStack(raw));
+            if (KitHeldBorrowedBoxPolicy.observe(
+                    KitHeldBorrowedBoxPolicy.fromWitness(heldBoxRebase, packedContents), live,
+                    ownedShellSlot) != KitHeldBorrowedBoxPolicy.Phase.TASK_EXTRACTED) {
+                block("held_box_task_extraction_unverified"); return;
+            }
+        }
         Set<Integer> protectedSlots = new HashSet<>(baselineSlots.keySet());
+        protectedSlots.addAll(incoming.relocatedBaselineSlots());
+        protectedSlots.removeAll(incoming.slots());
         protectedSlots.remove(ownedShellSlot);
         protectedSlots.addAll(inventoryShulkerSlots().keySet());
         protectedSlots.remove(ownedShellSlot);
@@ -1632,7 +2075,7 @@ public final class KitFulfillmentCoordinator {
         }
         if (ENCHANTED_APPLE.equals(currentItem)
                 && !(auditedKeptAppleCargo ? exactAuditedKeptAppleCargo()
-                        : exactUnownedAppleCargo(baselineSlots.keySet(), appleCargoExemplar,
+                        : exactUnownedAppleCargo(protectedSlots, appleCargoExemplar,
                                 currentQuantity))) {
             block("kit_apple_cargo_components_unverified"); return;
         }
@@ -1694,6 +2137,8 @@ public final class KitFulfillmentCoordinator {
             auditedKeptAppleCargo = false;
             auditedCargoSlot = -1;
             auditedCargoSlots = Map.of();
+            protectedLoose = null;
+            heldBoxRebase = null;
             ownedShellSlot = packer.recoveredSlot();
             if (ownedShellSlot < 0) { block("packed_kit_shell_slot_unverified"); return; }
             kitWorksite = null;
@@ -1748,8 +2193,15 @@ public final class KitFulfillmentCoordinator {
             if (!persist()) { block("kit_checkpoint_write_failed"); return; }
         }
         if (sourceBoxesToReturn.isEmpty()) {
-            state = State.NEED_CARGO;
-            if (!persist()) block("kit_checkpoint_write_failed");
+            if (variantRepair != null && variantRepair.replacementOnly()) {
+                state = State.VARIANT_NEED_SOURCE;
+                if (!persist()) block("kit_checkpoint_write_failed");
+            } else if (crystalCargoReadyForAudit()) {
+                block("recovered_box_requires_cargo_audit");
+            } else {
+                state = State.NEED_CARGO;
+                if (!persist()) block("kit_checkpoint_write_failed");
+            }
             return;
         }
         var source = sourceBoxesToReturn.getFirst();
@@ -1766,7 +2218,8 @@ public final class KitFulfillmentCoordinator {
             sourceReturnCloseWaitTicks = 0;
             int sourceSlot = findBorrowedSourceSlot(source);
             if (sourceSlot < 0) { block("kit_source_return_identity_unverified"); return; }
-            boolean requireImportCapacity = source.returnPosition() != null
+            boolean requireImportCapacity = sourceReturnOriginalAudit
+                    || source.returnPosition() != null
                     && !java.util.Arrays.equals(source.returnPosition(), source.sourcePosition());
             int expectedReturnSlots = 0;
             if (requireImportCapacity) {
@@ -1792,6 +2245,10 @@ public final class KitFulfillmentCoordinator {
         }
         exporter.tick();
         if (exporter.state() == KitExporter.State.FAILED) {
+            if (sourceReturnOriginalAudit) {
+                block("kit_original_source_return_failed:" + exporter.failureReason());
+                return;
+            }
             if ("export_chest_full".equals(exporter.failureReason())
                     || "export_target_footprint_changed".equals(exporter.failureReason())
                     || "wrong_export_container_opened".equals(exporter.failureReason())) {
@@ -1806,8 +2263,18 @@ public final class KitFulfillmentCoordinator {
                 block("kit_source_return_failed:" + exporter.failureReason());
             }
         } else if (exporter.state() == KitExporter.State.DONE) {
+            int[] returnedTo = source.targetPosition();
+            trace("kit_source_return_box_verified", Map.of(
+                    "source_item_id", source.itemId(),
+                    "source_contents_after", source.contents(),
+                    "source_position", source.sourcePosition() == null ? "inventory"
+                            : source.sourcePosition()[0] + ", " + source.sourcePosition()[1]
+                                + ", " + source.sourcePosition()[2],
+                    "return_position", returnedTo == null ? "unknown"
+                            : returnedTo[0] + ", " + returnedTo[1] + ", " + returnedTo[2]));
             sourceBoxesToReturn.removeFirst();
             sourceReturnStarted = false;
+            sourceReturnOriginalAudit = false;
             emit("kit_source_return_verified", Map.of("item_id", source.itemId(),
                     "empty", source.contents().isEmpty(),
                     "remaining_returns", sourceBoxesToReturn.size()));
@@ -1815,9 +2282,27 @@ public final class KitFulfillmentCoordinator {
                 recoveredSourceItemId = null;
                 recoveredSourceContents = Map.of();
             }
-            state = sourceBoxesToReturn.isEmpty() ? State.NEED_CARGO : State.RETURNING_SOURCE;
+            state = sourceBoxesToReturn.isEmpty()
+                    ? variantRepair != null && variantRepair.replacementOnly()
+                        ? State.VARIANT_NEED_SOURCE
+                        : crystalCargoReadyForAudit()
+                            ? State.RETURNING_SOURCE : State.NEED_CARGO
+                    : State.RETURNING_SOURCE;
             if (!persist()) block("kit_checkpoint_write_failed");
         }
+    }
+
+    private boolean crystalCargoReadyForAudit() {
+        if (variantRepair != null || !sourceBoxesToReturn.isEmpty()
+                || currentItem == null
+                || !"diamond_chestplate".equals(ItemIdentifier.baseItemId(currentItem))
+                || currentQuantity != 1 || packedContents.containsKey(currentItem)
+                || packedContents.getOrDefault("end_crystal", 0) != 256)
+            return false;
+        Container player = playerInventory();
+        ItemStack shell = player == null ? null : player.getItemStack(ownedShellSlot);
+        return shell != null && KitCrystalNormalizationPlan.normalized(
+                ItemIdentifier.readShulkerPhysicalSlotStacks(shell));
     }
 
     /** A submitted click did not move the box. Reopen the original source twice,
@@ -2073,32 +2558,58 @@ public final class KitFulfillmentCoordinator {
         java.util.function.Predicate<ItemStack> physicalFilter = null;
         java.util.function.Consumer<List<ItemStack>> physicalSurvey = null;
         if (wanted.containsKey(ENCHANTED_APPLE)) {
-            KitAppleSourceGate.Phase phase = tryUnnamedApples
-                    ? KitAppleSourceGate.Phase.REGULAR : KitAppleSourceGate.Phase.NAMED;
+            KitItemSourcePolicy sourcePolicy = tryUnnamedApples
+                    ? KitItemSourcePolicy.REGULAR_APPLES
+                    : KitItemSourcePolicy.NAMED_APPLES;
+            String phaseName = tryUnnamedApples ? "regular" : "named";
             boolean[] surveyed = {false};
             physicalFilter = stack -> {
-                if (!KitAppleSourceGate.inPhase(stack, phase)) return false;
+                if (!sourcePolicy.acceptsCandidate(stack)) return false;
                 // A checkpoint-verified inventory source is inspected before any GUI is open.
                 // Opened containers instead select from the complete live physical survey.
                 if (appleCargoExemplar == null && !surveyed[0]) appleCargoExemplar = stack;
-                return KitAppleSourceGate.accepts(stack, phase, appleCargoExemplar);
+                return sourcePolicy.accepts(stack, appleCargoExemplar);
             };
             physicalSurvey = observed -> {
                 surveyed[0] = true;
                 if (appleCargoExemplar == null) {
-                    appleCargoExemplar = KitAppleSourceGate.choose(
-                            observed, phase, wanted.get(ENCHANTED_APPLE));
+                    appleCargoExemplar = sourcePolicy.choose(
+                            observed, wanted.get(ENCHANTED_APPLE));
                     if (appleCargoExemplar != null) {
                         ItemStack chosen = appleCargoExemplar;
                         emit("kit_apple_source_variant_selected", Map.of(
-                                "phase", phase.name().toLowerCase(),
+                                "phase", phaseName,
                                 "request_units", wanted.get(ENCHANTED_APPLE),
                                 "observed_group_units", observed.stream()
-                                        .filter(stack -> KitAppleSourceGate.accepts(
-                                                stack, phase, chosen))
+                                        .filter(stack -> sourcePolicy.accepts(stack, chosen))
                                         .mapToInt(ItemStack::getAmount).sum()));
                     }
                 }
+            };
+        } else if (wanted.containsKey("end_crystal")) {
+            int requested = wanted.get("end_crystal");
+            Container player = playerInventory();
+            ItemStack shell = player == null || ownedShellSlot < 9 || ownedShellSlot > 44
+                    ? null : player.getItemStack(ownedShellSlot);
+            List<ItemStack> shellStacks = shell == null ? List.of()
+                    : ItemIdentifier.readShulkerPhysicalStacks(shell);
+            KitItemSourcePolicy sourcePolicy = KitItemSourcePolicy.CRYSTALS;
+            boolean alreadyPackedCrystals = shellStacks.stream()
+                    .anyMatch(sourcePolicy::acceptsCandidate);
+            ItemStack anchored = sourcePolicy.partialShellVariant(shellStacks, requested);
+            if (alreadyPackedCrystals && anchored == null) return false;
+            ItemStack[] selected = {anchored};
+            physicalFilter = stack -> {
+                if (!sourcePolicy.acceptsCandidate(stack)) return false;
+                return selected[0] == null || sourcePolicy.accepts(stack, selected[0]);
+            };
+            physicalSurvey = observed -> {
+                if (selected[0] == null) selected[0] = sourcePolicy.choose(observed, requested);
+                if (selected[0] != null) emit("kit_crystal_source_variant_selected", Map.of(
+                        "request_units", requested,
+                        "observed_group_units", observed.stream()
+                                .filter(stack -> sourcePolicy.accepts(stack, selected[0]))
+                                .mapToInt(ItemStack::getAmount).sum()));
             };
         }
         return retriever.startKit(retrievalRequest, wanted, candidates,
@@ -2184,7 +2695,17 @@ public final class KitFulfillmentCoordinator {
                     System.currentTimeMillis(), resumeState, resumeNotBeforeEpochMilli,
                     sourceBoxesToReturn, auditedCargoSlot, writtenOffSources, auditedCargoSlots,
                     incompleteBoxes, missingTotals, currentBoxMissing,
-                    displacedAppleSlots, retainedShell).withVariantRepair(variantRepair));
+                    displacedAppleSlots, retainedShell).withVariantRepair(variantRepair)
+                    .withProtectedLoose(protectedLoose)
+                    .withHeldBoxRebase(heldBoxRebase));
+            if (state != lastTracedState || !java.util.Objects.equals(currentItem, lastTracedItem)
+                    || deliveredBoxes() != lastTracedBox) {
+                if (trace("kit_checkpoint_transition", Map.of())) {
+                    lastTracedState = state;
+                    lastTracedItem = currentItem;
+                    lastTracedBox = deliveredBoxes();
+                }
+            }
             return true;
         } catch (IOException e) {
             emit("kit_checkpoint_save_failed", Map.of(
@@ -2504,6 +3025,24 @@ public final class KitFulfillmentCoordinator {
         return count;
     }
 
+    private static KitInventoryBaseline.IncomingCargo incomingCargo(
+            String itemId, Map<Integer, SlotSnapshot> baselineSlots) {
+        Container player = playerInventory();
+        if (player == null) return new KitInventoryBaseline.IncomingCargo(Set.of(), 0);
+        Map<Integer, KitInventoryBaseline.Stack> before = new HashMap<>();
+        baselineSlots.forEach((raw, stack) -> before.put(raw,
+                new KitInventoryBaseline.Stack(stack.itemId(), stack.amount())));
+        Map<Integer, KitInventoryBaseline.Stack> after = new HashMap<>();
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack != null && stack.getAmount() > 0) {
+                after.put(raw, new KitInventoryBaseline.Stack(
+                        ItemIdentifier.getItemId(stack), stack.getAmount()));
+            }
+        }
+        return KitInventoryBaseline.incomingCargo(before, after, itemId);
+    }
+
     private static String itemSlotCounts(String itemId, Map<Integer, SlotSnapshot> slots) {
         Map<Integer, Integer> matching = new java.util.TreeMap<>();
         for (var entry : slots.entrySet()) {
@@ -2544,11 +3083,84 @@ public final class KitFulfillmentCoordinator {
     }
 
     private static boolean isShulker(ItemStack stack) {
-        return stack != null && stack.getAmount() > 0
-                && ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack)).contains("shulker_box");
+        return ItemIdentifier.isShulkerBox(stack);
     }
 
     private void emit(String event, Map<String, Object> fields) {
+        trace(event, fields);
         if (events != null) events.accept(event, fields);
+    }
+
+    private boolean trace(String event, Map<String, Object> payload) {
+        if (kitName == null || (!event.startsWith("kit_")
+                && !event.startsWith("retrieve_"))) return false;
+        Map<Integer, Integer> itemSlots = new LinkedHashMap<>();
+        List<Integer> occupiedSlots = new ArrayList<>();
+        Container player = playerInventory();
+        if (player != null) {
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack == null || stack.getAmount() <= 0) continue;
+                occupiedSlots.add(raw);
+                if (currentItem != null
+                        && currentItem.equals(ItemIdentifier.getItemId(stack))) {
+                    itemSlots.put(raw, stack.getAmount());
+                }
+            }
+        }
+        Map<String, Integer> contents = parseContents(payload.get("source_contents"));
+        if (contents == null) contents = parseContents(payload.get("source_contents_after"));
+        String sourceId = payload.get("source_item_id") instanceof String id ? id
+                : payload.get("item_id") instanceof String id ? id : null;
+        KitProvenanceJournal.Source source = sourceId == null ? null
+                : new KitProvenanceJournal.Source(
+                        ItemIdentifier.baseItemId(sourceId),
+                        contents == null
+                                ? payload.get("source_contents_hash") instanceof String hash
+                                    ? hash : null
+                                : KitProvenanceJournal.contentsHash(contents),
+                        payload.get("requested_item_count") instanceof Number count
+                                ? count.intValue()
+                                : currentItem == null || contents == null ? null
+                                    : contents.getOrDefault(currentItem, 0),
+                        payload.get("source_position") instanceof String position
+                                ? position : payload.get("target_position") instanceof String target
+                                    ? target : null,
+                        payload.get("placed_position") instanceof String worksite
+                                ? worksite : null,
+                        payload.get("return_position") instanceof String destination
+                                ? destination : null);
+        String result = payload.get("reason") instanceof String reason ? reason
+                : payload.get("failure_reason") instanceof String failure ? failure : null;
+        KitProvenanceJournal.Step step = payload.get("retriever_state") instanceof String
+                || payload.get("target_position") instanceof String
+                ? new KitProvenanceJournal.Step(
+                        payload.get("retriever_state") instanceof String retrieverState
+                                ? retrieverState : null,
+                        payload.get("target_position") instanceof String target ? target : null,
+                        payload.get("remaining_total") instanceof Number remaining
+                                ? remaining.intValue() : null,
+                        payload.get("moved_stacks") instanceof Number moved
+                                ? moved.intValue() : null,
+                        payload.get("target_moved_stacks") instanceof Number moved
+                                ? moved.intValue() : null,
+                        payload.get("target_open_attempted") instanceof Boolean opened
+                                ? opened : null) : null;
+        try {
+            provenance.record(kitName, "kit_fulfillment_box_delivered".equals(event)
+                            ? deliveredBoxes() : deliveredBoxes() + 1, retrievalRequest,
+                    state.name(), event, currentItem == null ? null
+                            : ItemIdentifier.baseItemId(currentItem), currentQuantity,
+                    itemSlots, occupiedSlots, source, step, result);
+            provenanceFailureReported = false;
+            return true;
+        } catch (IOException | ArithmeticException e) {
+            if (!provenanceFailureReported && events != null) {
+                events.accept("kit_provenance_write_failed",
+                        Map.of("error", e.getClass().getSimpleName(), "event", event));
+            }
+            provenanceFailureReported = true;
+            return false;
+        }
     }
 }

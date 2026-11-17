@@ -72,6 +72,11 @@ class ApiExposurePolicyTest {
                         URI.create(base + "/api/v1/" + path)).GET().build(),
                         HttpResponse.BodyHandlers.ofString());
                 assertEquals(401, response.statusCode(), path);
+                var wrongKey = client.send(HttpRequest.newBuilder(
+                        URI.create(base + "/api/v1/" + path))
+                        .header("Authorization", "Bearer wrong-key").GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertEquals(401, wrongKey.statusCode(), path + " wrong key");
             }
             var webhook = client.send(HttpRequest.newBuilder(
                     URI.create(base + "/api/v1/webhook/test"))

@@ -19,6 +19,53 @@ class KitFulfillmentJournalStoreTest {
     @TempDir Path temporary;
 
     @Test
+    void recoveredPackedStackWorksiteKeepsBorrowedSourceAndVariantRepair()
+            throws IOException {
+        var store = new KitFulfillmentJournalStore(
+                temporary.resolve("packed-stack-recovery.json"));
+        var source = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{5, 130, 6}, "pink_shulker_box",
+                Map.of("ender_chest", 48, "experience_bottle", 192));
+        var repair = new KitFulfillmentJournalStore.VariantRepair(
+                new int[]{3, 132, 4}, 54, -1, "a".repeat(64),
+                "ender_chest", 6, 17, 18, "a".repeat(64),
+                "b".repeat(64), "c".repeat(64), -1, null, null,
+                9, 2, true);
+        var before = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "cpvp", "BLOCKED",
+                Map.of("ender_chest", 16, "experience_bottle", 128),
+                Map.of("ender_chest", 16), 54, 39, "ender_chest", 16, 36,
+                new int[]{1, 131, 2}, new int[]{7, 130, 8}, null, null,
+                Map.of(), "kit_variant_pack_failed:variant_exchange_live_preflight_mismatch",
+                100L, null, 0L, List.of(source), -1, List.of(), Map.of(),
+                0, Map.of(), Map.of(), Map.of(), null, repair);
+        store.save(before);
+        var recovered = new KitFulfillmentJournalStore.Snapshot(
+                before.schemaVersion(), before.kitName(), "BLOCKED",
+                before.recipe(), before.packedContents(), before.requestedBoxes(),
+                before.completedBoxes(), before.currentItem(),
+                before.currentQuantity(), before.ownedShellSlot(),
+                before.exportPosition(), null, null, null, Map.of(),
+                "kit_variant_source_cargo_unverified", 101L, null, 0L,
+                before.sourceBoxesToReturn(), before.auditedCargoSlot(),
+                before.writtenOffSources(), before.auditedCargoSlots(),
+                before.incompleteBoxes(), before.missingTotals(),
+                before.currentBoxMissing(), before.displacedAppleSlots(),
+                before.retainedShell(), before.variantRepair());
+        store.save(recovered);
+        var loaded = store.load().orElseThrow();
+        assertEquals(39, loaded.completedBoxes());
+        assertEquals(null, loaded.kitWorksite());
+        assertEquals(1, loaded.sourceBoxesToReturn().size());
+        assertEquals(source.itemId(), loaded.sourceBoxesToReturn().getFirst().itemId());
+        assertEquals(source.contents(), loaded.sourceBoxesToReturn().getFirst().contents());
+        assertEquals(repair.itemId(), loaded.variantRepair().itemId());
+        assertEquals(repair.shellHash(), loaded.variantRepair().shellHash());
+        assertEquals(repair.auditedIncomingRawSlot(),
+                loaded.variantRepair().auditedIncomingRawSlot());
+    }
+
+    @Test
     void variantRepairSurvivesRestartAndCannotBeSilentlyDropped() throws IOException {
         var path = temporary.resolve("variant-repair.json");
         var store = new KitFulfillmentJournalStore(path);
@@ -40,7 +87,7 @@ class KitFulfillmentJournalStoreTest {
         assertEquals(repair.importPosition()[0], loaded.variantRepair().importPosition()[0]);
         assertEquals("VARIANT_NEED_SOURCE", loaded.resumeState());
         Files.writeString(path, Files.readString(path).replace(
-                "\"schemaVersion\":12", "\"schemaVersion\":11"));
+                "\"schemaVersion\":14", "\"schemaVersion\":13"));
         assertEquals(KitFulfillmentJournalStore.SCHEMA_VERSION,
                 store.load().orElseThrow().schemaVersion());
         store.save(base.withVariantRepair(repair.withAuditedIncoming(14)));
@@ -52,7 +99,118 @@ class KitFulfillmentJournalStoreTest {
         assertEquals(2, restoredCanonical.fingerprintVersion());
         assertEquals(canonical.cargoHash(), restoredCanonical.cargoHash());
         assertEquals(14, restoredCanonical.auditedIncomingRawSlot());
+        var replacement = new KitFulfillmentJournalStore.VariantRepair(
+                repair.importPosition(), 54, 13, "a".repeat(64), "end_crystal", 18,
+                21, 22, "b".repeat(64), "c".repeat(64), "d".repeat(64),
+                -1, null, null, 0, 2, true);
+        store.save(base.withVariantRepair(replacement));
+        assertEquals(true, store.load().orElseThrow().variantRepair().replacementOnly());
+        Files.writeString(path, Files.readString(path).replace(
+                ",\"replacementOnly\":true", ""));
+        assertFalse(store.load().orElseThrow().variantRepair().replacementOnly());
         assertThrows(IOException.class, () -> store.save(base));
+    }
+
+    @Test
+    void pinnedAppleBudgetRepairSurvivesRestartWithoutAdmittingOtherMissingCargo()
+            throws IOException {
+        var store = new KitFulfillmentJournalStore(temporary.resolve("apple-budget.json"));
+        var source = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{5, 64, 6}, "shulker_box",
+                Map.of("enchanted_golden_apple", 960), new int[]{5, 64, 6});
+        var repair = new KitFulfillmentJournalStore.VariantRepair(
+                new int[]{3, 64, 4}, 54, -1, "a".repeat(64),
+                "end_crystal", 10, 16, 13, "b".repeat(64),
+                "c".repeat(64), "d".repeat(64), -1, null, null,
+                0, 2, false);
+        var checkpoint = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "cpvp", "BLOCKED",
+                Map.of("enchanted_golden_apple", 128, "end_crystal", 256),
+                Map.of("end_crystal", 256), 54, 18,
+                "enchanted_golden_apple", 128, 40, new int[]{1, 64, 2},
+                null, null, null, Map.of(), "resume_variant_exchange",
+                100L, "VARIANT_NEED_SOURCE", 300_000L,
+                List.of(source), -1, List.of(), Map.of(9, 64, 11, 64),
+                0, Map.of(), Map.of(), Map.of(), null, repair);
+        store.save(checkpoint);
+        assertEquals(-1, store.load().orElseThrow().variantRepair().cargoRawSlot());
+        var crystalSource = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{7, 64, 8}, "pink_shulker_box",
+                Map.of("end_crystal", 1656));
+        var recovered = new KitFulfillmentJournalStore.Snapshot(
+                checkpoint.schemaVersion(), checkpoint.kitName(), "BLOCKED",
+                checkpoint.recipe(), checkpoint.packedContents(), checkpoint.requestedBoxes(),
+                checkpoint.completedBoxes(), checkpoint.currentItem(),
+                checkpoint.currentQuantity(), checkpoint.ownedShellSlot(),
+                checkpoint.exportPosition(), null, null, null, Map.of(),
+                "resume_variant_source_cargo", 101L, "VARIANT_WAIT_SOURCE", 300_000L,
+                List.of(source, crystalSource), -1, checkpoint.writtenOffSources(),
+                checkpoint.auditedCargoSlots(), checkpoint.incompleteBoxes(),
+                checkpoint.missingTotals(), checkpoint.currentBoxMissing(),
+                checkpoint.displacedAppleSlots(), checkpoint.retainedShell(),
+                repair.withAuditedIncoming(16));
+        store.save(new KitFulfillmentJournalStore.Snapshot(
+                checkpoint.schemaVersion(), checkpoint.kitName(), "VARIANT_WAIT_SOURCE",
+                checkpoint.recipe(), checkpoint.packedContents(), checkpoint.requestedBoxes(),
+                checkpoint.completedBoxes(), checkpoint.currentItem(),
+                checkpoint.currentQuantity(), checkpoint.ownedShellSlot(),
+                checkpoint.exportPosition(), null, null, null, Map.of(), null, 101L,
+                null, 0L, List.of(source, crystalSource), -1,
+                checkpoint.writtenOffSources(), checkpoint.auditedCargoSlots(),
+                checkpoint.incompleteBoxes(), checkpoint.missingTotals(),
+                checkpoint.currentBoxMissing(), checkpoint.displacedAppleSlots(),
+                checkpoint.retainedShell(), repair));
+        store.save(recovered);
+        assertEquals(2, store.load().orElseThrow().sourceBoxesToReturn().size());
+        var packed = new java.util.HashMap<>(recovered.packedContents());
+        packed.put("enchanted_golden_apple", 128);
+        var staged = new KitFulfillmentJournalStore.Snapshot(
+                recovered.schemaVersion(), recovered.kitName(), "BLOCKED",
+                recovered.recipe(), packed, recovered.requestedBoxes(),
+                recovered.completedBoxes(), recovered.currentItem(),
+                recovered.currentQuantity(), recovered.ownedShellSlot(),
+                recovered.exportPosition(), null, null, null, Map.of(),
+                "resume_variant_staging", 103L, "VARIANT_STAGING", 300_000L,
+                recovered.sourceBoxesToReturn(), -1, recovered.writtenOffSources(),
+                Map.of(), recovered.incompleteBoxes(), recovered.missingTotals(),
+                recovered.currentBoxMissing(), recovered.displacedAppleSlots(),
+                recovered.retainedShell(), repair.withAuditedIncoming(16)
+                    .withResult(26, repair.outgoingHash(), "e".repeat(64)));
+        store.save(staged);
+        assertEquals(128, store.load().orElseThrow().packedContents()
+                .get("enchanted_golden_apple"));
+        assertThrows(IOException.class, () -> store.save(new KitFulfillmentJournalStore.Snapshot(
+                staged.schemaVersion(), staged.kitName(), staged.state(), staged.recipe(),
+                recovered.packedContents(), staged.requestedBoxes(), staged.completedBoxes(),
+                staged.currentItem(), staged.currentQuantity(), staged.ownedShellSlot(),
+                staged.exportPosition(), null, null, null, Map.of(), staged.blocker(),
+                staged.updatedAtEpochMilli(), staged.resumeState(),
+                staged.resumeNotBeforeEpochMilli(), staged.sourceBoxesToReturn(), -1,
+                staged.writtenOffSources(), Map.of(), staged.incompleteBoxes(),
+                staged.missingTotals(), staged.currentBoxMissing(),
+                staged.displacedAppleSlots(), staged.retainedShell(),
+                staged.variantRepair())));
+        assertThrows(IOException.class, () -> store.save(new KitFulfillmentJournalStore.Snapshot(
+                checkpoint.schemaVersion(), checkpoint.kitName(), "BLOCKED",
+                checkpoint.recipe(), checkpoint.packedContents(), checkpoint.requestedBoxes(),
+                checkpoint.completedBoxes(), checkpoint.currentItem(),
+                checkpoint.currentQuantity(), checkpoint.ownedShellSlot(),
+                checkpoint.exportPosition(), null, null, null, Map.of(),
+                "resume_variant_source_cargo", 102L, "VARIANT_WAIT_SOURCE", 300_000L,
+                List.of(source, new KitFulfillmentJournalStore.BorrowedBox(
+                        new int[]{7, 64, 8}, "pink_shulker_box",
+                        Map.of("enchanted_golden_apple", 1656))), -1,
+                checkpoint.writtenOffSources(), checkpoint.auditedCargoSlots(),
+                checkpoint.incompleteBoxes(), checkpoint.missingTotals(),
+                checkpoint.currentBoxMissing(), checkpoint.displacedAppleSlots(),
+                checkpoint.retainedShell(), repair.withAuditedIncoming(16))));
+        var unrelated = new KitFulfillmentJournalStore.VariantRepair(
+                repair.importPosition(), 54, -1, repair.cargoHash(),
+                "end_crystal", 11, 16, 13, repair.sourceHash(),
+                repair.outgoingHash(), repair.shellHash(), -1, null, null,
+                0, 2, false);
+        assertThrows(IOException.class, () -> store.save(
+                checkpoint.withVariantRepair(unrelated)));
     }
 
     @Test

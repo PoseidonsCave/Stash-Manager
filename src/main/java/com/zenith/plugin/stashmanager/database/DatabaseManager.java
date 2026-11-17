@@ -5,6 +5,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import com.zenith.plugin.stashmanager.StashManagerConfig;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.kit.KitCapacity;
+import com.zenith.plugin.stashmanager.kit.KitWorkingManifestPlan;
 import com.zenith.plugin.stashmanager.profile.ItemProfile;
 import com.zenith.plugin.stashmanager.profile.ItemProfiles;
 import com.zenith.plugin.stashmanager.travel.tunnel.storage.TunnelRepository;
@@ -190,6 +191,35 @@ public class DatabaseManager implements AutoCloseable {
                     PRIMARY KEY (x, y, z)
                 )
                 """);
+
+            // Dedicated kit working stock is separate from ordinary item lanes and exports.
+            // Both blocks of a double chest are registered; slot ownership is held by the
+            // kit-bank manifest rather than inferred from shulker color.
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS kit_working_chests (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z)
+                )
+                """);
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS kit_working_slots (
+                    x INTEGER NOT NULL,
+                    y INTEGER NOT NULL,
+                    z INTEGER NOT NULL,
+                    slot INTEGER NOT NULL CHECK (slot BETWEEN 0 AND 53),
+                    kit_name VARCHAR(128) NOT NULL,
+                    item_id VARCHAR(128) NOT NULL,
+                    planned_units INTEGER NOT NULL CHECK (planned_units > 0),
+                    status VARCHAR(16) NOT NULL DEFAULT 'pending',
+                    box_fingerprint CHAR(64),
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (x, y, z, slot)
+                )
+                """);
+            stmt.execute("ALTER TABLE kit_working_slots ADD COLUMN IF NOT EXISTS box_fingerprint CHAR(64)");
 
             // Workstations are configuration, not scan results; keep them across rescans.
             stmt.execute("""
@@ -538,39 +568,34 @@ public class DatabaseManager implements AutoCloseable {
         if (!initialized) return Collections.emptyList();
 
         String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known, double_chest_axis FROM containers ORDER BY scan_timestamp DESC";
-        List<ContainerEntry> results = new ArrayList<>();
-
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql);
              ResultSet rs = ps.executeQuery()) {
-
+            Map<Long, ContainerEntry> baseRows = new LinkedHashMap<>();
             while (rs.next()) {
-                long id = rs.getLong("id");
-                results.add(buildContainerEntry(conn, rs, id));
+                baseRows.put(rs.getLong("id"), readContainerBase(rs));
             }
+            return loadContainerDetails(conn, baseRows);
         }
-        return results;
     }
 
     public List<ContainerEntry> getContainersPage(int page, int pageSize) throws SQLException {
         if (!initialized) return Collections.emptyList();
 
         String sql = "SELECT id, x, y, z, block_type, is_double, shulker_count, scan_timestamp, label, hopper_facing, inventory_x, inventory_y, inventory_z, inventory_identity_known, double_chest_axis FROM containers ORDER BY scan_timestamp DESC LIMIT ? OFFSET ?";
-        List<ContainerEntry> results = new ArrayList<>();
-
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setInt(1, pageSize);
             ps.setInt(2, (page - 1) * pageSize);
 
             try (ResultSet rs = ps.executeQuery()) {
+                Map<Long, ContainerEntry> baseRows = new LinkedHashMap<>();
                 while (rs.next()) {
-                    long id = rs.getLong("id");
-                    results.add(buildContainerEntry(conn, rs, id));
+                    baseRows.put(rs.getLong("id"), readContainerBase(rs));
                 }
+                return loadContainerDetails(conn, baseRows);
             }
         }
-        return results;
     }
 
     public List<ContainerEntry> searchContainers(String itemSearch) throws SQLException {
@@ -592,20 +617,19 @@ public class DatabaseManager implements AutoCloseable {
             LIMIT ?
             """;
 
-        List<ContainerEntry> results = new ArrayList<>();
         try (Connection conn = dataSource.getConnection();
              PreparedStatement ps = conn.prepareStatement(sql)) {
             ps.setString(1, "%" + itemSearch.toLowerCase() + "%");
             ps.setInt(2, limit);
 
             try (ResultSet rs = ps.executeQuery()) {
+                Map<Long, ContainerEntry> baseRows = new LinkedHashMap<>();
                 while (rs.next()) {
-                    long id = rs.getLong("id");
-                    results.add(buildContainerEntry(conn, rs, id));
+                    baseRows.put(rs.getLong("id"), readContainerBase(rs));
                 }
+                return loadContainerDetails(conn, baseRows);
             }
         }
-        return results;
     }
 
     public int getContainerCount() throws SQLException {
@@ -1011,6 +1035,380 @@ public class DatabaseManager implements AutoCloseable {
 
     public List<int[]> loadExportChests() throws SQLException {
         return loadChestPositions("export_chests");
+    }
+
+    public List<int[]> loadKitWorkingChests() throws SQLException {
+        return loadChestPositions("kit_working_chests");
+    }
+
+    public record KitWorkingSlotRow(int x, int y, int z, int slot,
+                                    String kitName, String itemId, int plannedUnits,
+                                    String status, String boxFingerprint) { }
+
+    public List<KitWorkingSlotRow> loadKitWorkingSlots() throws SQLException {
+        if (!initialized) return List.of();
+        List<KitWorkingSlotRow> rows = new ArrayList<>();
+        try (Connection conn = dataSource.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery("""
+                     SELECT x,y,z,slot,kit_name,item_id,planned_units,status,box_fingerprint
+                     FROM kit_working_slots ORDER BY x,y,z,slot
+                     """)) {
+            while (rs.next()) rows.add(new KitWorkingSlotRow(rs.getInt(1), rs.getInt(2),
+                    rs.getInt(3), rs.getInt(4), rs.getString(5), rs.getString(6),
+                    rs.getInt(7), rs.getString(8), rs.getString(9)));
+        }
+        return List.copyOf(rows);
+    }
+
+    /** Idempotent after a crash between live deposit verification and job-index advancement. */
+    public boolean activateVerifiedKitWorkingSlot(
+            com.zenith.plugin.stashmanager.kit.KitWorkingTransferJournal.Ticket ticket)
+            throws SQLException {
+        if (!initialized) return false;
+        com.zenith.plugin.stashmanager.kit.KitWorkingTransferJournal.validate(ticket);
+        if (ticket.phase() != com.zenith.plugin.stashmanager.kit.KitWorkingTransferJournal.Phase.COMPLETE)
+            return false;
+        int[] destination = ticket.destination();
+        try (Connection conn = dataSource.getConnection()) {
+            try (PreparedStatement update = conn.prepareStatement("""
+                    UPDATE kit_working_slots SET status='active',box_fingerprint=?,
+                           updated_at=CURRENT_TIMESTAMP
+                    WHERE x=? AND y=? AND z=? AND slot=? AND kit_name=? AND item_id=?
+                      AND planned_units=? AND status='pending'
+                      AND EXISTS(SELECT 1 FROM kit_working_chests c
+                                 WHERE c.x=? AND c.y=? AND c.z=?)
+                    """)) {
+                update.setString(1, ticket.boxFingerprint());
+                update.setInt(2, destination[0]); update.setInt(3, destination[1]);
+                update.setInt(4, destination[2]); update.setInt(5, ticket.destinationSlot());
+                update.setString(6, ticket.kitName()); update.setString(7, ticket.itemId());
+                update.setInt(8, ticket.units());
+                update.setInt(9, destination[0]); update.setInt(10, destination[1]);
+                update.setInt(11, destination[2]);
+                if (update.executeUpdate() == 1) return true;
+            }
+            try (PreparedStatement read = conn.prepareStatement("""
+                    SELECT 1 FROM kit_working_slots
+                    WHERE x=? AND y=? AND z=? AND slot=? AND kit_name=? AND item_id=?
+                      AND planned_units=? AND status='active' AND box_fingerprint=?
+                    """)) {
+                read.setInt(1, destination[0]); read.setInt(2, destination[1]);
+                read.setInt(3, destination[2]); read.setInt(4, ticket.destinationSlot());
+                read.setString(5, ticket.kitName()); read.setString(6, ticket.itemId());
+                read.setInt(7, ticket.units()); read.setString(8, ticket.boxFingerprint());
+                try (ResultSet rs = read.executeQuery()) { return rs.next(); }
+            }
+        }
+    }
+
+    /** Reserve a pending manifest; physical stock is not moved by this transaction. */
+    public void reserveKitWorkingManifest(KitWorkingManifestPlan.Report plan,
+                                          int[] regionPos1, int[] regionPos2,
+                                          ScanSummary scan, long liveVerifiedAt,
+                                          Map<String, Long> expectedExistingClaims)
+            throws SQLException {
+        if (!initialized || plan == null || !plan.ready() || scan == null
+                || regionPos1 == null || regionPos1.length != 3
+                || regionPos2 == null || regionPos2.length != 3
+                || !scan.completed() || scan.failed() != 0
+                || scan.indexed() != scan.found()
+                || liveVerifiedAt <= scan.startedAtEpochMilli()
+                || Math.abs(System.currentTimeMillis() - liveVerifiedAt) > 60_000L) {
+            throw new SQLException("complete current scan and fresh live empty-chest audit required");
+        }
+        if (expectedExistingClaims == null)
+            throw new SQLException("existing working-stock claims were not audited");
+        Set<String> canonical = new LinkedHashSet<>();
+        for (var slot : plan.slots()) {
+            if (slot.chest() == null || !slot.chest().footprintKnown()
+                    || !slot.chest().verifiedEmpty() || !slot.chest().roleFree()
+                    || slot.kit() == null || slot.kit().isBlank() || slot.kit().length() > 128
+                    || slot.itemId() == null || slot.itemId().isBlank()
+                    || slot.itemId().length() > 128 || slot.units() < 1) {
+                throw new SQLException("invalid kit working slot manifest");
+            }
+            canonical.add(slot.chest().x() + ":" + slot.chest().y() + ":"
+                    + slot.chest().z());
+        }
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+            try {
+                Map<String, Long> liveClaims = new LinkedHashMap<>();
+                try (Statement stmt = conn.createStatement();
+                     ResultSet rs = stmt.executeQuery("""
+                             SELECT item_id,COALESCE(SUM(planned_units),0)
+                             FROM kit_working_slots WHERE status IN ('pending','active')
+                             GROUP BY item_id ORDER BY item_id
+                             """)) {
+                    while (rs.next()) liveClaims.put(rs.getString(1), rs.getLong(2));
+                }
+                if (!liveClaims.equals(expectedExistingClaims))
+                    throw new SQLException("working-stock claims changed before reservation");
+                try (PreparedStatement latest = conn.prepareStatement("""
+                             SELECT completion_status,containers_found,containers_indexed,
+                                    containers_failed,identity_version,
+                                    (EXTRACT(EPOCH FROM started_at AT TIME ZONE 'UTC') * 1000)::bigint
+                             FROM scan_history
+                             WHERE LEAST(region_pos1_x,region_pos2_x)=?
+                               AND LEAST(region_pos1_y,region_pos2_y)=?
+                               AND LEAST(region_pos1_z,region_pos2_z)=?
+                               AND GREATEST(region_pos1_x,region_pos2_x)=?
+                               AND GREATEST(region_pos1_y,region_pos2_y)=?
+                               AND GREATEST(region_pos1_z,region_pos2_z)=?
+                             ORDER BY id DESC LIMIT 1
+                             """)) {
+                    for (int i = 0; i < 3; i++) {
+                        latest.setInt(i + 1, Math.min(regionPos1[i], regionPos2[i]));
+                        latest.setInt(i + 4, Math.max(regionPos1[i], regionPos2[i]));
+                    }
+                    try (ResultSet rs = latest.executeQuery()) {
+                        if (!rs.next() || !"complete".equalsIgnoreCase(rs.getString(1))
+                                || rs.getInt(2) != scan.found()
+                                || rs.getInt(3) != scan.indexed()
+                                || rs.getInt(4) != 0
+                                || rs.getInt(5) < ITEM_IDENTITY_VERSION
+                                || rs.getLong(6) != scan.startedAtEpochMilli()) {
+                            throw new SQLException("scan changed before kit working reservation");
+                        }
+                    }
+                }
+                List<int[]> blocks = new ArrayList<>();
+                for (var range : plan.allocation().ranges()) {
+                    var chest = range.chest();
+                    String key = chest.x() + ":" + chest.y() + ":" + chest.z();
+                    if (!canonical.remove(key)) continue;
+                    String axis;
+                    try (PreparedStatement ps = conn.prepareStatement("""
+                            SELECT double_chest_axis FROM containers
+                            WHERE x=? AND y=? AND z=? AND is_double
+                              AND inventory_identity_known
+                              AND inventory_x=x AND inventory_y=y AND inventory_z=z
+                              AND scan_timestamp>=? AND total_items=0 AND shulker_count=0
+                            FOR UPDATE
+                            """)) {
+                        ps.setInt(1, chest.x()); ps.setInt(2, chest.y());
+                        ps.setInt(3, chest.z());
+                        ps.setLong(4, scan.startedAtEpochMilli());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (!rs.next()) throw new SQLException("candidate chest is not freshly indexed empty");
+                            axis = rs.getString(1);
+                        }
+                    }
+                    if (!"X".equals(axis) && !"Z".equals(axis)) {
+                        throw new SQLException("candidate double-chest axis is unknown");
+                    }
+                    int otherX = chest.x() + ("X".equals(axis) ? 1 : 0);
+                    int otherZ = chest.z() + ("Z".equals(axis) ? 1 : 0);
+                    if (chest.x() < Math.min(regionPos1[0], regionPos2[0])
+                            || otherX > Math.max(regionPos1[0], regionPos2[0])
+                            || chest.y() < Math.min(regionPos1[1], regionPos2[1])
+                            || chest.y() > Math.max(regionPos1[1], regionPos2[1])
+                            || chest.z() < Math.min(regionPos1[2], regionPos2[2])
+                            || otherZ > Math.max(regionPos1[2], regionPos2[2])) {
+                        throw new SQLException("kit working chest extends beyond scanned region");
+                    }
+                    // Current scans persist one canonical row for a double chest.
+                    // A separate partner row is optional; if one exists, reject any
+                    // conflicting or stale observation before reserving either block.
+                    boolean partnerIndexed = false;
+                    try (PreparedStatement ps = conn.prepareStatement("""
+                            SELECT inventory_x,inventory_y,inventory_z,is_double,
+                                   inventory_identity_known,double_chest_axis,
+                                   scan_timestamp,total_items,shulker_count
+                            FROM containers WHERE x=? AND y=? AND z=? FOR UPDATE
+                            """)) {
+                        ps.setInt(1, otherX); ps.setInt(2, chest.y());
+                        ps.setInt(3, otherZ);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (rs.next()) {
+                                partnerIndexed = true;
+                                if (rs.getInt(1) != chest.x()
+                                        || rs.getInt(2) != chest.y()
+                                        || rs.getInt(3) != chest.z()
+                                        || !rs.getBoolean(4) || !rs.getBoolean(5)
+                                        || !axis.equals(rs.getString(6))
+                                        || rs.getLong(7) < scan.startedAtEpochMilli()
+                                        || rs.getInt(8) != 0 || rs.getInt(9) != 0) {
+                                    throw new SQLException("partner chest half conflicts with the fresh empty inventory");
+                                }
+                            }
+                        }
+                    }
+                    try (PreparedStatement ps = conn.prepareStatement("""
+                            SELECT count(*) FROM containers
+                            WHERE inventory_x=? AND inventory_y=? AND inventory_z=?
+                              AND is_double AND inventory_identity_known
+                              AND double_chest_axis=? AND scan_timestamp>=?
+                              AND total_items=0 AND shulker_count=0
+                            """)) {
+                        ps.setInt(1, chest.x()); ps.setInt(2, chest.y());
+                        ps.setInt(3, chest.z()); ps.setString(4, axis);
+                        ps.setLong(5, scan.startedAtEpochMilli());
+                        try (ResultSet rs = ps.executeQuery()) {
+                            rs.next();
+                            if (rs.getInt(1) != (partnerIndexed ? 2 : 1))
+                                throw new SQLException("double chest has an ambiguous indexed footprint");
+                        }
+                    }
+                    blocks.add(new int[]{chest.x(), chest.y(), chest.z()});
+                    blocks.add(new int[]{otherX, chest.y(), otherZ});
+                }
+                if (!canonical.isEmpty()) throw new SQLException("manifest chest lacks an allocation range");
+                try (PreparedStatement conflict = conn.prepareStatement("""
+                        SELECT EXISTS(SELECT 1 FROM import_chests WHERE x=? AND y=? AND z=?)
+                          OR EXISTS(SELECT 1 FROM export_chests WHERE x=? AND y=? AND z=?)
+                          OR EXISTS(SELECT 1 FROM blacklisted_chests WHERE x=? AND y=? AND z=?)
+                          OR EXISTS(SELECT 1 FROM storage_chests WHERE x=? AND y=? AND z=?)
+                          OR EXISTS(SELECT 1 FROM kit_working_chests WHERE x=? AND y=? AND z=?)
+                          OR EXISTS(SELECT 1 FROM column_assignments WHERE col_x=? AND col_z=?)
+                        """)) {
+                    for (int[] block : blocks) {
+                        for (int offset = 0; offset < 5; offset++) {
+                            conflict.setInt(offset * 3 + 1, block[0]);
+                            conflict.setInt(offset * 3 + 2, block[1]);
+                            conflict.setInt(offset * 3 + 3, block[2]);
+                        }
+                        conflict.setInt(16, block[0]);
+                        conflict.setInt(17, block[2]);
+                        try (ResultSet rs = conflict.executeQuery()) {
+                            rs.next();
+                            if (rs.getBoolean(1)) throw new SQLException("kit working chest has an existing role or lane");
+                        }
+                    }
+                }
+                try (PreparedStatement addChest = conn.prepareStatement(
+                        "INSERT INTO kit_working_chests(x,y,z) VALUES(?,?,?)");
+                     PreparedStatement addSlot = conn.prepareStatement("""
+                             INSERT INTO kit_working_slots
+                             (x,y,z,slot,kit_name,item_id,planned_units)
+                             VALUES(?,?,?,?,?,?,?)
+                             """)) {
+                    for (int[] block : blocks) {
+                        addChest.setInt(1, block[0]); addChest.setInt(2, block[1]);
+                        addChest.setInt(3, block[2]); addChest.addBatch();
+                    }
+                    addChest.executeBatch();
+                    for (var slot : plan.slots()) {
+                        addSlot.setInt(1, slot.chest().x());
+                        addSlot.setInt(2, slot.chest().y());
+                        addSlot.setInt(3, slot.chest().z());
+                        addSlot.setInt(4, slot.chestSlot());
+                        addSlot.setString(5, slot.kit());
+                        addSlot.setString(6, slot.itemId());
+                        addSlot.setInt(7, slot.units());
+                        addSlot.addBatch();
+                    }
+                    addSlot.executeBatch();
+                }
+                conn.commit();
+            } catch (Exception e) {
+                conn.rollback();
+                if (e instanceof SQLException sql) throw sql;
+                throw new SQLException("kit working reservation failed", e);
+            }
+        }
+    }
+
+    /** Release only an entirely pending manifest after its chest was proved empty live. */
+    public int releasePendingKitWorkingChest(int[] canonical, long liveVerifiedAt)
+            throws SQLException {
+        if (!initialized || canonical == null || canonical.length != 3
+                || liveVerifiedAt <= 0
+                || Math.abs(System.currentTimeMillis() - liveVerifiedAt) > 60_000L)
+            throw new SQLException("fresh live empty-chest audit required");
+        try (Connection conn = dataSource.getConnection()) {
+            conn.setAutoCommit(false);
+            conn.setTransactionIsolation(Connection.TRANSACTION_SERIALIZABLE);
+            try {
+                String axis;
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        SELECT double_chest_axis FROM containers
+                        WHERE x=? AND y=? AND z=? AND is_double AND inventory_identity_known
+                          AND inventory_x=x AND inventory_y=y AND inventory_z=z
+                        FOR UPDATE
+                        """)) {
+                    ps.setInt(1, canonical[0]); ps.setInt(2, canonical[1]);
+                    ps.setInt(3, canonical[2]);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (!rs.next()) throw new SQLException("canonical double chest not indexed");
+                        axis = rs.getString(1);
+                    }
+                }
+                if (!"X".equals(axis) && !"Z".equals(axis))
+                    throw new SQLException("double-chest footprint is unknown");
+                int otherX = canonical[0] + ("X".equals(axis) ? 1 : 0);
+                int otherZ = canonical[2] + ("Z".equals(axis) ? 1 : 0);
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        SELECT count(*) FROM kit_working_chests
+                        WHERE (x=? AND y=? AND z=?) OR (x=? AND y=? AND z=?)
+                        """)) {
+                    ps.setInt(1, canonical[0]); ps.setInt(2, canonical[1]);
+                    ps.setInt(3, canonical[2]); ps.setInt(4, otherX);
+                    ps.setInt(5, canonical[1]); ps.setInt(6, otherZ);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        rs.next();
+                        if (rs.getInt(1) != 2)
+                            throw new SQLException("working double-chest role is incomplete");
+                    }
+                }
+                int pending = 0;
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        SELECT status,box_fingerprint FROM kit_working_slots
+                        WHERE x=? AND y=? AND z=? FOR UPDATE
+                        """)) {
+                    ps.setInt(1, canonical[0]); ps.setInt(2, canonical[1]);
+                    ps.setInt(3, canonical[2]);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            if (!"pending".equals(rs.getString(1))
+                                    || rs.getString(2) != null)
+                                throw new SQLException("working chest has active or changed slots");
+                            pending++;
+                        }
+                    }
+                }
+                if (pending == 0) throw new SQLException("working chest has no pending slots");
+                try (PreparedStatement ps = conn.prepareStatement("""
+                        SELECT count(*) FROM kit_working_slots WHERE x=? AND y=? AND z=?
+                        """)) {
+                    ps.setInt(1, otherX); ps.setInt(2, canonical[1]);
+                    ps.setInt(3, otherZ);
+                    try (ResultSet rs = ps.executeQuery()) {
+                        rs.next();
+                        if (rs.getInt(1) != 0)
+                            throw new SQLException("partner half unexpectedly owns working slots");
+                    }
+                }
+                try (PreparedStatement deleteSlots = conn.prepareStatement("""
+                        DELETE FROM kit_working_slots WHERE x=? AND y=? AND z=?
+                          AND status='pending' AND box_fingerprint IS NULL
+                        """)) {
+                    deleteSlots.setInt(1, canonical[0]);
+                    deleteSlots.setInt(2, canonical[1]);
+                    deleteSlots.setInt(3, canonical[2]);
+                    if (deleteSlots.executeUpdate() != pending)
+                        throw new SQLException("working slots changed during release");
+                }
+                try (PreparedStatement deleteRoles = conn.prepareStatement("""
+                        DELETE FROM kit_working_chests WHERE (x=? AND y=? AND z=?)
+                            OR (x=? AND y=? AND z=?)
+                        """)) {
+                    deleteRoles.setInt(1, canonical[0]); deleteRoles.setInt(2, canonical[1]);
+                    deleteRoles.setInt(3, canonical[2]); deleteRoles.setInt(4, otherX);
+                    deleteRoles.setInt(5, canonical[1]); deleteRoles.setInt(6, otherZ);
+                    if (deleteRoles.executeUpdate() != 2)
+                        throw new SQLException("working chest role changed during release");
+                }
+                conn.commit();
+                return pending;
+            } catch (Exception e) {
+                conn.rollback();
+                if (e instanceof SQLException sql) throw sql;
+                throw new SQLException("working reservation release failed", e);
+            }
+        }
     }
 
     public int clearExportChests() throws SQLException {
@@ -1888,7 +2286,7 @@ public class DatabaseManager implements AutoCloseable {
     }
 
     // Helpers
-    private ContainerEntry buildContainerEntry(Connection conn, ResultSet rs, long containerId) throws SQLException {
+    private ContainerEntry readContainerBase(ResultSet rs) throws SQLException {
         int x = rs.getInt("x");
         int y = rs.getInt("y");
         int z = rs.getInt("z");
@@ -1927,82 +2325,113 @@ public class DatabaseManager implements AutoCloseable {
             doubleChestAxis = null;
         }
 
-        // Load items
-        Map<String, Integer> items = new LinkedHashMap<>();
-        Map<String, Integer> directStackSlots = new LinkedHashMap<>();
-        List<ContainerEntry.ShulkerDetail> shulkerDetails = new ArrayList<>();
-        Map<Integer, String> physicalShulkerColors = new LinkedHashMap<>();
-        Map<Integer, Map<String, Integer>> physicalShulkerItems = new LinkedHashMap<>();
-        Map<Integer, Map<String, Integer>> physicalShulkerStackSlots = new LinkedHashMap<>();
-        Map<String, Map<String, Integer>> legacyShulkerItemsByColor = new LinkedHashMap<>();
-        Map<String, Map<String, Integer>> legacyShulkerStackSlotsByColor = new LinkedHashMap<>();
-
-        try (PreparedStatement shulkerPs = conn.prepareStatement(
-                "SELECT slot, color FROM container_shulkers WHERE container_id = ? ORDER BY slot")) {
-            shulkerPs.setLong(1, containerId);
-            try (ResultSet shulkerRs = shulkerPs.executeQuery()) {
-                while (shulkerRs.next()) {
-                    int slot = shulkerRs.getInt("slot");
-                    physicalShulkerColors.put(slot, shulkerRs.getString("color"));
-                    physicalShulkerItems.put(slot, new LinkedHashMap<>());
-                    physicalShulkerStackSlots.put(slot, new LinkedHashMap<>());
-                }
-            }
-        }
-
-        try (PreparedStatement itemPs = conn.prepareStatement(
-                 "SELECT item_id, quantity, in_shulker, shulker_color, shulker_instance, observed_stack_slots FROM container_items WHERE container_id = ?")) {
-            itemPs.setLong(1, containerId);
-
-            try (ResultSet itemRs = itemPs.executeQuery()) {
-                while (itemRs.next()) {
-                    String itemId = ItemIdentifier.normalizeItemId(itemRs.getString("item_id"));
-                    int quantity = itemRs.getInt("quantity");
-                    boolean inShulker = itemRs.getBoolean("in_shulker");
-                    String shulkerColor = itemRs.getString("shulker_color");
-                    int shulkerInstance = itemRs.getInt("shulker_instance");
-                    boolean physicalInstance = !itemRs.wasNull();
-                    int observedSlots = itemRs.getInt("observed_stack_slots");
-                    boolean slotsKnown = !itemRs.wasNull();
-
-                    if (inShulker && shulkerColor != null) {
-                        if (physicalInstance) {
-                            physicalShulkerColors.putIfAbsent(shulkerInstance, shulkerColor);
-                            physicalShulkerItems.computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
-                                    .merge(itemId, quantity, Integer::sum);
-                            if (slotsKnown) physicalShulkerStackSlots
-                                    .computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
-                                    .merge(itemId, observedSlots, Integer::sum);
-                        } else {
-                            legacyShulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
-                                    .merge(itemId, quantity, Integer::sum);
-                            if (slotsKnown) legacyShulkerStackSlotsByColor
-                                    .computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
-                                    .merge(itemId, observedSlots, Integer::sum);
-                        }
-                    } else if (!inShulker && slotsKnown) {
-                        directStackSlots.merge(itemId, observedSlots, Integer::sum);
-                    }
-                    // All items go into the main map (same as the in-memory behavior)
-                    items.merge(itemId, quantity, Integer::sum);
-                }
-            }
-        }
-
-        for (var entry : physicalShulkerItems.entrySet()) {
-            shulkerDetails.add(new ContainerEntry.ShulkerDetail(
-                    entry.getKey(), physicalShulkerColors.get(entry.getKey()), entry.getValue(),
-                    physicalShulkerStackSlots.getOrDefault(entry.getKey(), Map.of())));
-        }
-        for (var entry : legacyShulkerItemsByColor.entrySet()) {
-            shulkerDetails.add(new ContainerEntry.ShulkerDetail(-1, entry.getKey(), entry.getValue(),
-                    legacyShulkerStackSlotsByColor.getOrDefault(entry.getKey(), Map.of())));
-        }
-
-        return new ContainerEntry(x, y, z, blockType, isDouble, items, shulkerCount,
-                shulkerDetails, scanTimestamp, label, hopperFacing,
+        return new ContainerEntry(x, y, z, blockType, isDouble, Map.of(), shulkerCount,
+                List.of(), scanTimestamp, label, hopperFacing,
                 inventoryX, inventoryY, inventoryZ, inventoryIdentityKnown, doubleChestAxis,
-                directStackSlots);
+                Map.of());
+    }
+
+    private List<ContainerEntry> loadContainerDetails(Connection conn, Map<Long, ContainerEntry> baseRows)
+            throws SQLException {
+        if (baseRows.isEmpty()) return List.of();
+
+        Map<Long, ContainerDetails> details = new LinkedHashMap<>();
+        baseRows.keySet().forEach(id -> details.put(id, new ContainerDetails()));
+        java.sql.Array ids = conn.createArrayOf("bigint", baseRows.keySet().toArray(Long[]::new));
+        try {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT container_id, slot, color FROM container_shulkers "
+                            + "WHERE container_id = ANY (?) ORDER BY container_id, slot")) {
+                ps.setArray(1, ids);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) details.get(rs.getLong("container_id"))
+                            .addShulker(rs.getInt("slot"), rs.getString("color"));
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT container_id, item_id, quantity, in_shulker, shulker_color, "
+                            + "shulker_instance, observed_stack_slots FROM container_items "
+                            + "WHERE container_id = ANY (?)")) {
+                ps.setArray(1, ids);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        int instance = rs.getInt("shulker_instance");
+                        boolean physicalInstance = !rs.wasNull();
+                        int observedSlots = rs.getInt("observed_stack_slots");
+                        boolean slotsKnown = !rs.wasNull();
+                        details.get(rs.getLong("container_id")).addItem(
+                                ItemIdentifier.normalizeItemId(rs.getString("item_id")),
+                                rs.getInt("quantity"), rs.getBoolean("in_shulker"),
+                                rs.getString("shulker_color"), instance, physicalInstance,
+                                observedSlots, slotsKnown);
+                    }
+                }
+            }
+        } finally {
+            ids.free();
+        }
+        List<ContainerEntry> result = new ArrayList<>(baseRows.size());
+        baseRows.forEach((id, base) -> result.add(details.get(id).finish(base)));
+        return result;
+    }
+
+    static final class ContainerDetails {
+        private final Map<String, Integer> items = new LinkedHashMap<>();
+        private final Map<String, Integer> directStackSlots = new LinkedHashMap<>();
+        private final Map<Integer, String> physicalShulkerColors = new LinkedHashMap<>();
+        private final Map<Integer, Map<String, Integer>> physicalShulkerItems = new LinkedHashMap<>();
+        private final Map<Integer, Map<String, Integer>> physicalShulkerStackSlots = new LinkedHashMap<>();
+        private final Map<String, Map<String, Integer>> legacyShulkerItemsByColor = new LinkedHashMap<>();
+        private final Map<String, Map<String, Integer>> legacyShulkerStackSlotsByColor = new LinkedHashMap<>();
+
+        void addShulker(int slot, String color) {
+            physicalShulkerColors.put(slot, color);
+            physicalShulkerItems.put(slot, new LinkedHashMap<>());
+            physicalShulkerStackSlots.put(slot, new LinkedHashMap<>());
+        }
+
+        void addItem(String itemId, int quantity, boolean inShulker, String shulkerColor,
+                     int shulkerInstance, boolean physicalInstance, int observedSlots,
+                     boolean slotsKnown) {
+            if (inShulker && shulkerColor != null) {
+                if (physicalInstance) {
+                    physicalShulkerColors.putIfAbsent(shulkerInstance, shulkerColor);
+                    physicalShulkerItems.computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
+                            .merge(itemId, quantity, Integer::sum);
+                    if (slotsKnown) physicalShulkerStackSlots
+                            .computeIfAbsent(shulkerInstance, k -> new LinkedHashMap<>())
+                            .merge(itemId, observedSlots, Integer::sum);
+                } else {
+                    legacyShulkerItemsByColor.computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
+                            .merge(itemId, quantity, Integer::sum);
+                    if (slotsKnown) legacyShulkerStackSlotsByColor
+                            .computeIfAbsent(shulkerColor, k -> new LinkedHashMap<>())
+                            .merge(itemId, observedSlots, Integer::sum);
+                }
+            } else if (!inShulker && slotsKnown) {
+                directStackSlots.merge(itemId, observedSlots, Integer::sum);
+            }
+            // Aggregate direct and nested stock as in the in-memory index.
+            items.merge(itemId, quantity, Integer::sum);
+        }
+
+        ContainerEntry finish(ContainerEntry base) {
+            List<ContainerEntry.ShulkerDetail> shulkerDetails = new ArrayList<>();
+            for (var entry : physicalShulkerItems.entrySet()) {
+                shulkerDetails.add(new ContainerEntry.ShulkerDetail(
+                        entry.getKey(), physicalShulkerColors.get(entry.getKey()), entry.getValue(),
+                        physicalShulkerStackSlots.getOrDefault(entry.getKey(), Map.of())));
+            }
+            for (var entry : legacyShulkerItemsByColor.entrySet()) {
+                shulkerDetails.add(new ContainerEntry.ShulkerDetail(-1, entry.getKey(), entry.getValue(),
+                        legacyShulkerStackSlotsByColor.getOrDefault(entry.getKey(), Map.of())));
+            }
+
+            return new ContainerEntry(base.x(), base.y(), base.z(), base.blockType(), base.isDouble(),
+                    items, base.shulkerCount(), shulkerDetails, base.timestamp(), base.label(),
+                    base.hopperFacing(), base.inventoryX(), base.inventoryY(), base.inventoryZ(),
+                    base.inventoryIdentityKnown(), base.doubleChestAxis(), directStackSlots);
+        }
     }
 
     @Override

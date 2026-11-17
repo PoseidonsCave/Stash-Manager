@@ -156,14 +156,17 @@ public final class ItemIdentifier {
             DataComponents components = shulkerStack.getDataComponents();
             if (components == null) return Map.of();
             Object value = components.get(DataComponentTypes.CONTAINER);
-            if (!(value instanceof List<?> entries) || entries.size() != 27) return Map.of();
+            // The container component can omit trailing empty slots. List indices
+            // still identify physical slots; only indices 0..26 are valid.
+            if (!(value instanceof List<?> entries) || entries.size() > 27) return Map.of();
             Map<Integer, ItemStack> stacks = new LinkedHashMap<>();
             for (int slot = 0; slot < entries.size(); slot++) {
                 Object entry = entries.get(slot);
                 Object unwrapped = entry instanceof Optional<?> optional ? optional.orElse(null) : entry;
                 if (unwrapped == null) continue;
-                if (!(unwrapped instanceof ItemStack stack) || stack.getId() == 0
-                        || stack.getAmount() < 1) return Map.of();
+                if (!(unwrapped instanceof ItemStack stack)) return Map.of();
+                if (stack.getId() == 0 && stack.getAmount() == 0) continue;
+                if (stack.getId() == 0 || stack.getAmount() < 1) return Map.of();
                 stacks.put(slot, new ItemStack(stack.getId(), stack.getAmount(),
                         stack.getDataComponents()));
             }
@@ -243,6 +246,17 @@ public final class ItemIdentifier {
         int bracket = normalized.indexOf('[');
         String base = bracket >= 0 ? normalized.substring(0, bracket) : normalized;
         return base.replace(' ', '_');
+    }
+
+    /** Recognize a shulker item ID, including its semantic variant suffix. */
+    public static boolean isShulkerBoxItem(String itemId) {
+        return itemId != null && itemId.contains("shulker_box");
+    }
+
+    /** Recognize a physical shulker item stack. */
+    public static boolean isShulkerBox(ItemStack stack) {
+        return stack != null && stack.getAmount() > 0
+                && isShulkerBoxItem(baseItemId(getItemId(stack)));
     }
 
     /** Canonical internal key: unprefixed base ID plus an optional sorted semantic variant. */

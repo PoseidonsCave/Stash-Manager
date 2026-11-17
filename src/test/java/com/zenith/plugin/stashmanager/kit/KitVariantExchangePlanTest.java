@@ -62,6 +62,28 @@ class KitVariantExchangePlanTest {
                         crystal(64, "matching"))), "end_crystal", 271, 26));
     }
 
+    @Test
+    void tenCrystalExchangeMakesRoomForTwoAppleStacks() {
+        var shell = new ArrayList<KitVariantExchangePlan.SlotStack>();
+        shell.add(new KitVariantExchangePlan.SlotStack(12, crystal(64, "matching")));
+        shell.add(new KitVariantExchangePlan.SlotStack(13, crystal(54, "matching")));
+        shell.add(new KitVariantExchangePlan.SlotStack(14, crystal(64, "other")));
+        shell.add(new KitVariantExchangePlan.SlotStack(15, crystal(64, "other")));
+        shell.add(new KitVariantExchangePlan.SlotStack(16, crystal(10, "other")));
+        for (int slot = 0; shell.size() < 26; slot++) {
+            if (slot >= 12 && slot <= 16) continue;
+            shell.add(new KitVariantExchangePlan.SlotStack(slot,
+                    new ItemStack(ItemRegistry.REGISTRY.get("diamond_sword").id(), 1)));
+        }
+        var opportunity = KitVariantExchangePlan.shellOpportunity(
+                shell, "end_crystal", 256, 25);
+        assertNotNull(opportunity);
+        assertEquals(10, opportunity.amount());
+        assertEquals(16, opportunity.outgoingSlot());
+        assertEquals(13, opportunity.mergeTargetSlot());
+        assertEquals(25, opportunity.slotsAfter());
+    }
+
     private static List<KitVariantExchangePlan.SlotStack> fullShell() {
         var shell = new ArrayList<KitVariantExchangePlan.SlotStack>();
         shell.add(new KitVariantExchangePlan.SlotStack(0, crystal(64, "matching")));

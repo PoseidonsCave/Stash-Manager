@@ -1105,6 +1105,141 @@ public class StashCommand extends Command {
                             StringArgumentType.getString(c, "name")))))
             )
             .then(literal("kit")
+                .then(literal("consolidate").requires(Command::validateAccountOwner)
+                    .then(literal("preview")
+                        .then(literal("all")
+                            .then(argument("count", integer(1, 64)).executes(c -> {
+                                int count = IntegerArgumentType.getInteger(c, "count");
+                                try {
+                                    Map<String, Integer> targets = new LinkedHashMap<>();
+                                    for (var kit : database.listKitDefinitions()) {
+                                        if (!kit.items().isEmpty()) targets.put(kit.name(), count);
+                                    }
+                                    c.getSource().getEmbed().title("Kit Consolidation Preview")
+                                            .description(module.previewKitConsolidation(targets))
+                                            .primaryColor();
+                                } catch (Exception e) {
+                                    c.getSource().getEmbed().title("Kit Consolidation Preview")
+                                            .description("Saved kit catalogue is unavailable.").errorColor();
+                                }
+                                return OK;
+                            })))
+                        .then(literal("one")
+                            .then(argument("name", string())
+                                .then(argument("count", integer(1, 64)).executes(c -> {
+                                    String name = StringArgumentType.getString(c, "name");
+                                    int count = IntegerArgumentType.getInteger(c, "count");
+                                    c.getSource().getEmbed().title("Kit Consolidation Preview")
+                                            .description(module.previewKitConsolidation(
+                                                    Map.of(name, count))).primaryColor();
+                                    return OK;
+                                }))))))
+                .then(literal("laneplan").requires(Command::validateAccountOwner)
+                    .then(argument("name", string())
+                        .then(argument("count", integer(1, 64)).executes(c -> {
+                            String name = StringArgumentType.getString(c, "name");
+                            int count = IntegerArgumentType.getInteger(c, "count");
+                            c.getSource().getEmbed().title("Kit Working-Stock Plan")
+                                    .description(module.previewKitWorkingLane(name, count)).primaryColor();
+                            return OK;
+                        }))))
+                .then(literal("working").requires(Command::validateAccountOwner)
+                    .then(literal("status").executes(c -> {
+                        c.getSource().getEmbed().title("Kit Working-Stock Fill")
+                                .description(module.kitWorkingFillStatus()).primaryColor();
+                        return OK;
+                    }))
+                    .then(literal("fill").then(argument("name", string()).executes(c -> {
+                        String name = StringArgumentType.getString(c, "name");
+                        String blocker = module.prepareKitWorkingFill(name);
+                        var embed = c.getSource().getEmbed().title("Kit Working-Stock Fill");
+                        if (blocker == null) embed.description("Started live source verification for **"
+                                + name + "**. Run `/stash kit working status` for progress.")
+                                .primaryColor();
+                        else embed.description("Could not start: " + blocker).errorColor();
+                        return OK;
+                    })))
+                    .then(literal("repack")
+                        .then(argument("name", string())
+                            .then(argument("item", string())
+                                .then(argument("units", integer(1))
+                                    .then(argument("x", integer())
+                                        .then(argument("y", integer())
+                                            .then(argument("z", integer()).executes(c -> {
+                                                String name = StringArgumentType.getString(c, "name");
+                                                String item = StringArgumentType.getString(c, "item");
+                                                int units = IntegerArgumentType.getInteger(c, "units");
+                                                int[] pos = new int[]{
+                                                        IntegerArgumentType.getInteger(c, "x"),
+                                                        IntegerArgumentType.getInteger(c, "y"),
+                                                        IntegerArgumentType.getInteger(c, "z")};
+                                                String blocker = module.startKitWorkingRepack(
+                                                        name, item, units, pos);
+                                                var embed = c.getSource().getEmbed()
+                                                        .title("Kit Working-Stock Repack");
+                                                if (blocker == null) embed.description(
+                                                        "Started one checkpointed stock-box repack for **"
+                                                        + name + "**. Check `/stash kit job`; scan the "
+                                                        + "staging chest before working-stock fill.")
+                                                        .primaryColor();
+                                                else embed.description("Could not repack: " + blocker)
+                                                        .errorColor();
+                                                return OK;
+                                            }))))))))
+                    .then(literal("recover").executes(c -> {
+                        String blocker = module.prepareKitWorkingRecovery();
+                        var embed = c.getSource().getEmbed().title("Kit Working-Stock Recovery");
+                        if (blocker == null) embed.description(
+                                "Started guarded recovery of the reviewed fill. "
+                                + "Check `/stash kit working status` for the outcome.")
+                                .primaryColor();
+                        else embed.description("Could not recover: " + blocker).errorColor();
+                        return OK;
+                    }))
+                    .then(literal("reserve")
+                        .then(argument("name", string())
+                            .then(argument("copies", integer(1, 64))
+                                .then(argument("x", integer())
+                                    .then(argument("y", integer())
+                                        .then(argument("z", integer()).executes(c -> {
+                                            String name = StringArgumentType.getString(c, "name");
+                                            int copies = IntegerArgumentType.getInteger(c, "copies");
+                                            int[] pos = new int[]{
+                                                    IntegerArgumentType.getInteger(c, "x"),
+                                                    IntegerArgumentType.getInteger(c, "y"),
+                                                    IntegerArgumentType.getInteger(c, "z")};
+                                            String blocker = module.prepareKitWorkingReservation(
+                                                    name, copies, pos);
+                                            var embed = c.getSource().getEmbed()
+                                                    .title("Kit Working-Stock Reservation");
+                                            if (blocker == null) embed.description(
+                                                    "Started a live empty-chest audit for **" + name
+                                                    + "** at " + formatPos(pos)
+                                                    + ". Check `/stash kit working status` before filling.")
+                                                    .primaryColor();
+                                            else embed.description("Could not reserve: " + blocker)
+                                                    .errorColor();
+                                            return OK;
+                                        })))))))
+                    .then(literal("release")
+                        .then(argument("x", integer())
+                            .then(argument("y", integer())
+                                .then(argument("z", integer()).executes(c -> {
+                                    int[] pos = new int[]{
+                                            IntegerArgumentType.getInteger(c, "x"),
+                                            IntegerArgumentType.getInteger(c, "y"),
+                                            IntegerArgumentType.getInteger(c, "z")};
+                                    String blocker = module.prepareKitWorkingRelease(pos);
+                                    var embed = c.getSource().getEmbed()
+                                            .title("Kit Working-Stock Release");
+                                    if (blocker == null) embed.description(
+                                            "Started a live empty-chest audit at "
+                                            + formatPos(pos) + ". Check `/stash kit working status`.")
+                                            .primaryColor();
+                                    else embed.description("Could not release: " + blocker)
+                                            .errorColor();
+                                    return OK;
+                                }))))))
                 .then(literal("stop").executes(c -> {
                     boolean stopped = module.stopKitFulfillment();
                     var embed = c.getSource().getEmbed().title("Kit Build");
@@ -1135,6 +1270,12 @@ public class StashCommand extends Command {
                             .description(module.kitFulfillmentStatus()).primaryColor();
                     return OK;
                 }))
+                .then(literal("return").requires(Command::validateAccountOwner)
+                    .then(literal("preview").executes(c -> {
+                        c.getSource().getEmbed().title("Kit Return Preview")
+                                .description(module.previewKitReturn()).primaryColor();
+                        return OK;
+                    })))
                 .then(literal("diagnose").requires(c -> config.diagnosticCommandsEnabled
                         && validateAccountOwner(c))
                     .executes(c -> {
@@ -1303,6 +1444,28 @@ public class StashCommand extends Command {
                             .description(module.diagnoseKitCargo()).primaryColor();
                     return OK;
                 }))
+                .then(literal("rebasecheck").requires(Command::validateAccountOwner)
+                    .then(argument("keptCount", integer(1, 64)).executes(c -> {
+                        int count = IntegerArgumentType.getInteger(c, "keptCount");
+                        c.getSource().getEmbed().title("Kit Held-Box Preflight")
+                                .description(module.diagnoseKitHeldBoxRebase(count))
+                                .primaryColor();
+                        return OK;
+                    })))
+                .then(literal("rebase").requires(Command::validateAccountOwner)
+                    .then(argument("keptCount", integer(1, 64)).executes(c -> {
+                        int count = IntegerArgumentType.getInteger(c, "keptCount");
+                        String blocker = module.scheduleKitHeldBoxRebase(count);
+                        var embed = c.getSource().getEmbed().title("Kit Held-Box Recovery");
+                        if (blocker == null) embed.description(
+                                "Journaled the exact carried-box balance. After cooldown, "
+                                + "the existing checkpoint will retrieve only the observed "
+                                + "task units; older stock remains inside the returned source box. "
+                                + "Each uncertain move stops for review.").primaryColor();
+                        else embed.description("No checkpoint change: " + blocker)
+                                .errorColor();
+                        return OK;
+                    })))
                 .then(literal("reconcileinventory")
                     .executes(c -> {
                         String blocker = module.startKitInventoryReconciliation();
@@ -1386,6 +1549,25 @@ public class StashCommand extends Command {
                         return OK;
                     })))
                 .then(literal("auditcargo")
+                    .then(literal("partial").requires(Command::validateAccountOwner)
+                        .then(argument("keptSlot", integer(9, 44))
+                            .then(argument("keptCount", integer(1, 64))
+                                .then(argument("cargoSlots", greedyString()).executes(c -> {
+                                    int keptSlot = IntegerArgumentType.getInteger(c, "keptSlot");
+                                    int keptCount = IntegerArgumentType.getInteger(c, "keptCount");
+                                    String cargoSlots = StringArgumentType.getString(c, "cargoSlots");
+                                    String blocker = module.scheduleKitPartialBorrowedCargoAudit(
+                                            keptSlot, keptCount, cargoSlots);
+                                    var embed = c.getSource().getEmbed()
+                                            .title("Kit Partial Borrowed Cargo Audit");
+                                    if (blocker == null) embed.description(
+                                            "Verified the exact borrowed box, partial task cargo, "
+                                            + "and protected kept stack. The existing checkpoint "
+                                            + "will resume after cooldown.").primaryColor();
+                                    else embed.description("No checkpoint change: " + blocker)
+                                            .errorColor();
+                                    return OK;
+                                })))))
                     .then(literal("batch")
                         .then(argument("slots", greedyString()).executes(c -> {
                             String slots = StringArgumentType.getString(c, "slots");
@@ -2537,7 +2719,7 @@ public class StashCommand extends Command {
 
     // Config Subtree
     private LiteralArgumentBuilder<CommandContext> buildConfigSubtree() {
-        return literal("config")
+        return literal("config").requires(Command::validateAccountOwner)
             // Show all config
             .executes(c -> {
                 var embed = c.getSource().getEmbed()
@@ -2730,6 +2912,7 @@ public class StashCommand extends Command {
                 .then(literal("url")
                     .then(argument("jdbc_url", greedyString())
                         .executes(c -> {
+                            c.getSource().setSensitiveInput(true);
                             config.databaseUrl = StringArgumentType.getString(c, "jdbc_url");
                             c.getSource().getEmbed()
                                 .title("Config Updated")
@@ -2754,6 +2937,7 @@ public class StashCommand extends Command {
                 .then(literal("password")
                     .then(argument("password", string())
                         .executes(c -> {
+                            c.getSource().setSensitiveInput(true);
                             config.databasePassword = StringArgumentType.getString(c, "password");
                             c.getSource().getEmbed()
                                 .title("Config Updated")
@@ -2883,6 +3067,7 @@ public class StashCommand extends Command {
                 .then(literal("key")
                     .then(argument("api_key", string())
                         .executes(c -> {
+                            c.getSource().setSensitiveInput(true);
                             config.apiKey = StringArgumentType.getString(c, "api_key");
                             c.getSource().getEmbed()
                                 .title("Config Updated")

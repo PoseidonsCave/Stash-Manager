@@ -40,6 +40,19 @@ class KitInventoryReconciliationBoundaryTest {
         assertFalse(KitInventoryReconciliationBoundary.matchesActive(active, Set.of()));
     }
 
+    @Test void completedKitWithUnmappedDisplacedApplesCannotStartGenericLaneHandoff() {
+        var terminal = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "cpvp", "BLOCKED",
+                Map.of("enchanted_golden_apple", 128), Map.of(),
+                25, 25, null, 0, -1, new int[]{1, 64, 2}, null,
+                null, null, Map.of(), "kit_displaced_apples_require_reconciliation",
+                100, null, 0, List.of(), -1, List.of(), Map.of(),
+                0, Map.of(), Map.of(),
+                Map.of(16, new KitInventoryAppleOwnership.Slot(64, true, "a".repeat(64))));
+        assertNull(KitInventoryReconciliationBoundary.select(terminal));
+        assertFalse(KitInventoryReconciliationBoundary.matchesActive(terminal, Set.of(16)));
+    }
+
     private static KitFulfillmentJournalStore.Snapshot checkpoint(String resumeState) {
         var loss = new KitFulfillmentJournalStore.BorrowedBox(
                 new int[]{3, 64, 4}, "black_shulker_box", Map.of("obsidian", 64));

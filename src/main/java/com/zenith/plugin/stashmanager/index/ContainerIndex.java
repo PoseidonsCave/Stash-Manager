@@ -20,6 +20,7 @@ public class ContainerIndex {
     private final ConcurrentHashMap<Long, int[]> importChests = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, int[]> blacklistedChests = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, int[]> exportChests = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, int[]> kitWorkingChests = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Long, int[]> craftingTables = new ConcurrentHashMap<>();
     private final AtomicLong databaseWriteFailures = new AtomicLong();
     private volatile long lastScanTimestamp = 0;
@@ -187,6 +188,25 @@ public class ContainerIndex {
         return entry != null && isExportChest(entry.x(), entry.y(), entry.z());
     }
 
+    public boolean isKitWorkingChest(int x, int y, int z) {
+        return kitWorkingChests.containsKey(positionKey(x, y, z));
+    }
+
+    public boolean isKitWorkingChest(ContainerEntry entry) {
+        return entry != null && isKitWorkingChest(entry.x(), entry.y(), entry.z());
+    }
+
+    public List<int[]> getKitWorkingChests() {
+        return sortedPositions(kitWorkingChests);
+    }
+
+    public void refreshKitWorkingChests() throws Exception {
+        requireDatabase();
+        List<int[]> positions = database.loadKitWorkingChests();
+        kitWorkingChests.clear();
+        cachePositions(kitWorkingChests, positions, true);
+    }
+
     public int getExportChestBlockCount() {
         return exportChests.size();
     }
@@ -235,11 +255,13 @@ public class ContainerIndex {
     }
 
     public boolean isOrganizerExcluded(ContainerEntry entry) {
-        return entry != null && (isBlacklistedChest(entry) || isExportChest(entry));
+        return entry != null && (isBlacklistedChest(entry) || isExportChest(entry)
+                || isKitWorkingChest(entry));
     }
 
     public boolean hasAnyRole(int x, int y, int z) {
-        return isImportChest(x, y, z) || isBlacklistedChest(x, y, z) || isExportChest(x, y, z);
+        return isImportChest(x, y, z) || isBlacklistedChest(x, y, z)
+                || isExportChest(x, y, z) || isKitWorkingChest(x, y, z);
     }
 
     private void requireDatabase() {
@@ -345,6 +367,8 @@ public class ContainerIndex {
             cachePositions(blacklistedChests, database.loadBlacklistedChests(), true);
             exportChests.clear();
             cachePositions(exportChests, database.loadExportChests(), true);
+            kitWorkingChests.clear();
+            cachePositions(kitWorkingChests, database.loadKitWorkingChests(), true);
             craftingTables.clear();
             cachePositions(craftingTables, database.loadCraftingTables(), true);
             return all.size();

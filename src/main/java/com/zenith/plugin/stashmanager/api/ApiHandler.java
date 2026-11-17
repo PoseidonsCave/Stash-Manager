@@ -30,6 +30,10 @@ public class ApiHandler {
     private final StashManagerModule module;
     private final ContainerIndex index;
     private final DatabaseManager database;
+    private final ExpiringSnapshot<LaneCapacityReport> laneCapacitySnapshot =
+            new ExpiringSnapshot<>(java.util.concurrent.TimeUnit.SECONDS.toNanos(5), System::nanoTime);
+    private final ExpiringSnapshot<Map<String, Object>> statisticsSnapshot =
+            new ExpiringSnapshot<>(java.util.concurrent.TimeUnit.SECONDS.toNanos(5), System::nanoTime);
 
     public ApiHandler(StashManagerConfig config, StashManagerModule module,
                       ContainerIndex index, DatabaseManager database) {
@@ -190,7 +194,7 @@ public class ApiHandler {
 
         if (database != null && database.isInitialized()) {
             try {
-                body.putAll(database.getStatistics());
+                body.putAll(readCachedStatistics());
             } catch (Exception e) {
                 sendError(exchange, 500, "Database query failed");
                 return;
@@ -356,7 +360,7 @@ public class ApiHandler {
 
         if (database != null && database.isInitialized()) {
             try {
-                Map<String, Object> stats = database.getStatistics();
+                Map<String, Object> stats = readCachedStatistics();
                 if (stats.containsKey("total_items")) {
                     sb.append("# HELP stash_items_total Total number of items across all containers\n");
                     sb.append("# TYPE stash_items_total gauge\n");
@@ -414,7 +418,7 @@ public class ApiHandler {
                     organizer.getPermanentLaneGaps());
         }
 
-        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        LaneCapacityReport capacity = laneCapacitySnapshot.get(module::getLaneCapacityReport);
         boolean importStagingAvailable = module.hasLaneCapacityImportStaging();
         sb.append("# HELP stash_lane_capacity_ready Whether the latest scan is trusted and has enough dedicated lanes\n");
         sb.append("# TYPE stash_lane_capacity_ready gauge\n");
@@ -478,6 +482,18 @@ public class ApiHandler {
         sendText(exchange, 200, sb.toString());
     }
 
+    private Map<String, Object> readCachedStatistics() throws java.sql.SQLException {
+        Map<String, Object> stats = statisticsSnapshot.get(() -> {
+            try {
+                return database.getStatistics();
+            } catch (java.sql.SQLException ignored) {
+                return null;
+            }
+        });
+        if (stats == null) throw new java.sql.SQLException("statistics unavailable");
+        return stats;
+    }
+
     private static void appendGauge(StringBuilder output, String name, String help, Number value) {
         output.append("# HELP ").append(name).append(' ').append(help).append('\n');
         output.append("# TYPE ").append(name).append(" gauge\n");
@@ -536,7 +552,7 @@ public class ApiHandler {
                     module.getProxyControlGraceRemainingSeconds());
             body.put("status", organizer.getStatus());
         }
-        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        LaneCapacityReport capacity = laneCapacitySnapshot.get(module::getLaneCapacityReport);
         body.put("lane_capacity_region", module.getLaneCapacityRegionName());
         body.put("import_chest_blocks", index.getImportChestBlockCount());
         body.put("import_chests", index.getImportChests().stream()

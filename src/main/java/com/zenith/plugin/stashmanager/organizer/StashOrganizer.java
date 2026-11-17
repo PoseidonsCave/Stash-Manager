@@ -2999,7 +2999,9 @@ public final class StashOrganizer {
                     }
                     MoveTask task = new MoveTask(
                             currentPos, staging, itemId, EMPTY_SHULKER_STAGING_FILTER, true);
-                    if (prioritize) task = task.requireInventoryDeposit();
+                    // An inventory-only handoff must account for this exact box. A later
+                    // packing step may prefer partial stock and leave the empty shell aboard.
+                    if (prioritize || inventoryRecoveryOnly) task = task.requireInventoryDeposit();
                     String key = inventoryTaskKey(task);
                     MoveTask existing = alreadyQueued.get(key);
                     if (existing != null) {
@@ -12665,7 +12667,7 @@ public final class StashOrganizer {
     }
 
     private static boolean isShulkerBoxItem(String itemId) {
-        return itemId != null && itemId.contains("shulker_box");
+        return ItemIdentifier.isShulkerBoxItem(itemId);
     }
 
     // ShulkerDetail.color() reports "unknown" for a plain undyed shulker box, whose real
@@ -14750,7 +14752,8 @@ public final class StashOrganizer {
     private boolean isOrganizerExcludedPosition(int[] position) {
         return position != null && position.length >= 3
                 && (index.isBlacklistedChest(position[0], position[1], position[2])
-                    || index.isExportChest(position[0], position[1], position[2]));
+                    || index.isExportChest(position[0], position[1], position[2])
+                    || index.isKitWorkingChest(position[0], position[1], position[2]));
     }
 
     private int countItemInInventory(String itemId) {

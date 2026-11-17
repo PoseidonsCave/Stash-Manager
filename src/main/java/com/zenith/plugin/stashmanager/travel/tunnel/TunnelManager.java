@@ -84,6 +84,8 @@ public final class TunnelManager {
     }
 
     public boolean isIdle()        { return state == State.IDLE;       }
+    public boolean hasActiveWork() { return state == State.SCANNING
+            || state == State.ROUTING || state == State.BUILDING; }
     public boolean isReady()       { return state == State.DONE;       }
     public boolean isBuilding()    { return state == State.BUILDING;   }
     public boolean isBuildFailed() { return state == State.FAILED;     }

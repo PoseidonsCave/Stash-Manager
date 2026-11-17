@@ -9,6 +9,33 @@ public final class KitResumePolicy {
                 < checkpoint.requestedBoxes();
     }
 
+    private static boolean appleBudgetVariant(KitFulfillmentJournalStore.Snapshot checkpoint) {
+        return checkpoint != null && checkpoint.variantRepair() != null
+                && !checkpoint.variantRepair().replacementOnly()
+                && checkpoint.variantRepair().cargoRawSlot() == -1
+                && "enchanted_golden_apple".equals(checkpoint.currentItem())
+                && checkpoint.currentQuantity() == 128
+                && checkpoint.auditedCargoSlots().size() == 2
+                && checkpoint.auditedCargoSlots().values().stream()
+                    .allMatch(n -> n != null && n == 64);
+    }
+
+    public static boolean stagedAppleBudgetVariant(
+            KitFulfillmentJournalStore.Snapshot checkpoint) {
+        if (checkpoint == null || checkpoint.variantRepair() == null) return false;
+        var repair = checkpoint.variantRepair();
+        return !repair.replacementOnly() && repair.cargoRawSlot() == -1
+                && repair.fingerprintVersion() == 2
+                && "enchanted_golden_apple".equals(checkpoint.currentItem())
+                && checkpoint.currentQuantity() == 128
+                && checkpoint.packedContents().getOrDefault("enchanted_golden_apple", 0) == 128
+                && checkpoint.packedContents().getOrDefault("end_crystal", 0) == 256
+                && checkpoint.auditedCargoSlots().isEmpty()
+                && repair.itemId().equals("end_crystal") && repair.amount() == 10
+                && repair.displacedRawSlot() >= 9 && repair.displacedRawSlot() <= 35
+                && repair.outgoingHash().equals(repair.displacedHash());
+    }
+
     /** A packed apple batch was verified, but displaced custom stacks exceeded the keep quota. */
     public static boolean canAuditAppleOverflow(KitFulfillmentJournalStore.Snapshot checkpoint) {
         return checkpoint != null && "BLOCKED".equals(checkpoint.state())
@@ -45,6 +72,30 @@ public final class KitResumePolicy {
                 && checkpoint.writtenOffSources().isEmpty()
                 && checkpoint.auditedCargoSlot() < 0
                 && checkpoint.auditedCargoSlots().isEmpty();
+    }
+
+    /** The last batch is committed and all borrowed boxes are returned; only
+     * physical shell compaction remains before the next recipe item. */
+    public static boolean canRetryCompactedPhysicalBudget(
+            KitFulfillmentJournalStore.Snapshot checkpoint) {
+        return checkpoint != null && "BLOCKED".equals(checkpoint.state())
+                && "kit_physical_slot_budget_exceeded".equals(checkpoint.blocker())
+                && checkpoint.resumeState() == null && hasRemainingBox(checkpoint)
+                && checkpoint.kitWorksite() == null
+                && checkpoint.borrowedSourceWorksite() == null
+                && checkpoint.sourceBoxesToReturn().isEmpty()
+                && checkpoint.variantRepair() == null
+                && checkpoint.protectedLoose() == null
+                && checkpoint.heldBoxRebase() == null
+                && checkpoint.auditedCargoSlot() == -1
+                && checkpoint.auditedCargoSlots().isEmpty()
+                && checkpoint.currentItem() != null
+                && checkpoint.currentQuantity() > 0
+                && checkpoint.packedContents().getOrDefault(checkpoint.currentItem(), 0)
+                    .intValue() == checkpoint.recipe()
+                        .getOrDefault(checkpoint.currentItem(), -1).intValue()
+                && checkpoint.ownedShellSlot() >= 9
+                && checkpoint.ownedShellSlot() <= 44;
     }
 
     public static boolean canRetryUnverifiedCargo(KitFulfillmentJournalStore.Snapshot checkpoint) {
@@ -394,6 +445,23 @@ public final class KitResumePolicy {
                 && !checkpoint.sourceBoxesToReturn().isEmpty();
     }
 
+    /** An interrupted borrow was audited before the source box was ever opened. */
+    public static boolean canAuditUnopenedSourceReturn(
+            KitFulfillmentJournalStore.Snapshot checkpoint) {
+        return checkpoint != null && "BLOCKED".equals(checkpoint.state())
+                && "WAIT_CARGO".equals(checkpoint.resumeState())
+                && ("interrupted:bot_ticks_stopped".equals(checkpoint.blocker())
+                    || "interrupted:proxy_control".equals(checkpoint.blocker())
+                    || "uncertain_wait_cargo".equals(checkpoint.blocker()))
+                && checkpoint.kitWorksite() == null
+                && checkpoint.borrowedSourceWorksite() == null
+                && checkpoint.sourceBoxesToReturn().isEmpty()
+                && checkpoint.currentItem() != null && checkpoint.currentQuantity() > 0
+                && checkpoint.currentQuantity() <= remainingForCurrentItem(checkpoint)
+                && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
+                && hasRemainingBox(checkpoint);
+    }
+
     /** The transfer was observed, but the reopened return window was judged too early.
      * This boundary may only be resumed by a read-only live-chest audit, never by
      * replaying the source-box deposit. */
@@ -510,7 +578,8 @@ public final class KitResumePolicy {
                     && checkpoint.currentItem() != null && checkpoint.currentQuantity() > 0
                     ? null : "uncertain_wait_cargo";
             case "RETURNING_SOURCE" -> ("resume_source_return".equals(checkpoint.blocker())
-                    || "resume_source_return_exact_import".equals(checkpoint.blocker()))
+                    || "resume_source_return_exact_import".equals(checkpoint.blocker())
+                    || "resume_unopened_source_to_origin".equals(checkpoint.blocker()))
                     && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
                     && checkpoint.sourceBoxesToReturn() != null
                     && !checkpoint.sourceBoxesToReturn().isEmpty()
@@ -533,15 +602,36 @@ public final class KitResumePolicy {
             case "VARIANT_NEED_SOURCE" -> "resume_variant_exchange".equals(checkpoint.blocker())
                     && checkpoint.variantRepair() != null
                     && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
-                    && checkpoint.currentItem() != null && checkpoint.currentQuantity() == 1
+                    && checkpoint.currentItem() != null
+                    && (checkpoint.currentQuantity() == 1 || appleBudgetVariant(checkpoint)
+                        || KitPackedStackCapacityRepair.repairCheckpoint(checkpoint))
                     ? null : "uncertain_variant_exchange";
             case "VARIANT_WAIT_SOURCE" -> "resume_variant_source_cargo".equals(checkpoint.blocker())
                     && checkpoint.variantRepair() != null
                     && checkpoint.variantRepair().auditedIncomingRawSlot() >= 9
-                    && checkpoint.variantRepair().auditedIncomingRawSlot() <= 35
+                    && (checkpoint.variantRepair().auditedIncomingRawSlot() <= 35
+                        || checkpoint.variantRepair().auditedIncomingRawSlot() <= 44
+                            && KitPackedStackCapacityRepair.repairCheckpoint(checkpoint))
                     && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
-                    && checkpoint.currentItem() != null && checkpoint.currentQuantity() == 1
+                    && checkpoint.currentItem() != null
+                    && (checkpoint.currentQuantity() == 1 || appleBudgetVariant(checkpoint)
+                        || KitPackedStackCapacityRepair.repairCheckpoint(checkpoint))
                     ? null : "uncertain_variant_source_cargo";
+            case "VARIANT_STAGING" -> "resume_variant_staging".equals(checkpoint.blocker())
+                    && checkpoint.variantRepair() != null
+                    && (checkpoint.variantRepair().replacementOnly()
+                        || stagedAppleBudgetVariant(checkpoint))
+                    && checkpoint.variantRepair().displacedRawSlot() >= 9
+                    && (checkpoint.variantRepair().displacedRawSlot() <= 35
+                        || checkpoint.variantRepair().displacedRawSlot() <= 44
+                            && KitPackedStackCapacityRepair.repairCheckpoint(checkpoint))
+                    && checkpoint.variantRepair().resultShellHash() != null
+                    && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
+                    && checkpoint.currentItem() != null
+                    && (checkpoint.currentQuantity() == 1
+                        || stagedAppleBudgetVariant(checkpoint)
+                        || KitPackedStackCapacityRepair.repairCheckpoint(checkpoint))
+                    ? null : "uncertain_variant_staging";
             default -> "uncertain_" + resumeState.toLowerCase();
         };
     }

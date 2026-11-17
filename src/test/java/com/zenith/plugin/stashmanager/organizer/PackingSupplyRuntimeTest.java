@@ -240,6 +240,27 @@ class PackingSupplyRuntimeTest {
                 .findFirst().orElseThrow().mandatoryInventoryDeposit());
     }
 
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    @Test
+    void inventoryBulkShulkerUsesSavedContentLaneRegardlessOfBoxColor() throws Exception {
+        var components = new DataComponents(new HashMap<>());
+        components.put(DataComponentTypes.CONTAINER,
+                (List) List.of(InventoryTransferEvidenceTest.item("obsidian", 64)));
+        var pinkBox = new ItemStack(ItemRegistry.REGISTRY.get("pink_shulker_box").id(),
+                1, components);
+        putPlayer(44, pinkBox);
+
+        assertTrue(queueDeposits());
+        var task = normal().stream()
+                .filter(candidate -> "pink_shulker_box".equals(candidate.itemId()))
+                .findFirst().orElseThrow();
+        assertArrayEquals(lane, task.destination());
+        assertEquals("obsidian", task.shulkerContentFilter());
+        assertTrue(task.alreadyInInventory());
+        assertTrue(StashOrganizer.matchesShulkerTaskFilter(task,
+                ShulkerClassification.classify(ItemIdentifier.readShulkerContents(pinkBox))));
+    }
+
     @Test
     void resumedOptionalShellTaskBecomesCleanupWithoutAddingAnotherTask() throws Exception {
         var optional = new StashOrganizer.MoveTask(staging,staging,"yellow_shulker_box","@empty",true);
@@ -276,6 +297,27 @@ class PackingSupplyRuntimeTest {
         assertSame(source,get(organizer,"currentTask"));
         assertNotNull(raw.getItemStack(44));
         assertTrue(events.containsKey("organize_empty_shulker_reused"));
+    }
+
+    @Test
+    void inventoryOnlyHandoffCannotCountAnUnmovedEmptyShellAsReused() throws Exception {
+        set(organizer, "inventoryRecoveryOnly", true);
+        putPlayer(9, InventoryTransferEvidenceTest.item("light_gray_shulker_box", 1));
+        var queue = StashOrganizer.class.getDeclaredMethod("queueInventoryDepositTasks", boolean.class);
+        queue.setAccessible(true);
+
+        assertTrue((boolean) queue.invoke(organizer, false));
+        var shellTask = normal().stream()
+                .filter(task -> "light_gray_shulker_box".equals(task.itemId()))
+                .findFirst().orElseThrow();
+        assertTrue(shellTask.mandatoryInventoryDeposit());
+
+        set(organizer, "currentTask", shellTask);
+        consolidation().add(StashOrganizer.MoveTask.mixedBatch(staging, staging, "lead"));
+        assertFalse((boolean) call("reuseEmptyShulkerForDeferredPacking"));
+        assertEquals(0, organizer.getCompletedTasks());
+        assertNotNull(raw.getItemStack(9));
+        assertFalse(events.containsKey("organize_empty_shulker_reused"));
     }
 
     @Test

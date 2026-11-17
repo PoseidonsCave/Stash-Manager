@@ -21,6 +21,7 @@ import com.zenith.plugin.stashmanager.kit.KitCapacity;
 import com.zenith.plugin.stashmanager.kit.KitAppleExchangePlan;
 import com.zenith.plugin.stashmanager.kit.KitInventoryAppleOwnership;
 import com.zenith.plugin.stashmanager.kit.KitPackingWorksitePlanner;
+import com.zenith.plugin.stashmanager.kit.KitPackedStackCapacityRepair;
 import com.zenith.plugin.stashmanager.kit.KitVariantExchangeEvidence;
 import com.zenith.plugin.stashmanager.kit.KitVariantExchangePlan;
 import com.zenith.plugin.stashmanager.kit.KitWindowOpenPolicy;
@@ -87,6 +88,7 @@ public final class KitPacker {
 
     private final SneakReleaseGate openGate = new SneakReleaseGate();
     private State state = State.IDLE;
+    private long phaseStartedAtNanos;
     private Map<String, Integer> expectedBefore = Map.of();
     private Map<String, Integer> expectedAfter = Map.of();
     private Set<Integer> protectedSlots = Set.of();
@@ -150,7 +152,7 @@ public final class KitPacker {
     private int variantTicks;
     private int variantDisplacedRaw = -1;
     private ItemStack variantDisplacedStack;
-    private ItemStack variantCargoStack;
+    private List<ItemStack> variantCargoStacks = List.of();
     private String failureReason;
     private BiConsumer<String, Map<String, Object>> events;
 
@@ -172,16 +174,41 @@ public final class KitPacker {
     public ItemStack variantDisplacedStack() { return variantDisplacedStack; }
     public boolean variantRecoveredExact() {
         return variantExchange != null && variantEvidence != null && recoveredSlot >= 9
-                && variantEvidence.matchesRecoveredWithCargo(
-                        playerStack(recoveredSlot), variantCargoStack);
+                && (variantExchange.replacementOnly()
+                    ? variantEvidence.matchesRecoveredShell(playerStack(recoveredSlot))
+                    : variantEvidence.matchesRecoveredWithCargo(
+                            playerStack(recoveredSlot), variantCargoStacks));
     }
 
     /** One live-source-verified replacement stack and its pinned player slot. */
-    public record VariantExchange(KitVariantExchangePlan.Plan plan, int incomingRawSlot) {
+    public record VariantExchange(KitVariantExchangePlan.Plan plan, int incomingRawSlot,
+                                  boolean replacementOnly) {
+        public VariantExchange(KitVariantExchangePlan.Plan plan, int incomingRawSlot) {
+            this(plan, incomingRawSlot, false);
+        }
         public VariantExchange {
-            if (plan == null || incomingRawSlot < 9 || incomingRawSlot > 35)
+            if (plan == null || incomingRawSlot < 9 || incomingRawSlot > 44
+                    || (incomingRawSlot > 35 && (!replacementOnly
+                        || !packedStackRepairShape(plan))))
                 throw new IllegalArgumentException("invalid variant exchange");
         }
+    }
+
+    private static boolean packedStackRepairShape(KitVariantExchangePlan.Plan plan) {
+        if (plan == null || plan.replacementExemplar() == null) return false;
+        var profile = KitPackedStackCapacityRepair.profile(
+                ItemIdentifier.getItemId(plan.replacementExemplar()));
+        return profile != null && plan.slotsAfter() == profile.allowedSlots()
+                && plan.amount() > 0 && plan.amount() < 64;
+    }
+
+    static boolean packedStackRepairBoundary(Map<String, Integer> before,
+            int shellSlots, int cargoStacks, KitVariantExchangePlan.Plan plan) {
+        if (!packedStackRepairShape(plan) || before == null) return false;
+        var profile = KitPackedStackCapacityRepair.profile(
+                ItemIdentifier.getItemId(plan.replacementExemplar()));
+        return shellSlots == profile.physicalSlots() && cargoStacks == 1
+                && before.getOrDefault(profile.itemId(), 0) == profile.quantity();
     }
 
     /** Audited incompatible apple stacks may be displaced before packing replacement cargo. */
@@ -249,7 +276,8 @@ public final class KitPacker {
         if (batch.isEmpty()) return rejectStart("empty_cargo_batch");
         Map<String, Integer> before = positiveCopy(contentsBefore);
         Map<String, Integer> after = new LinkedHashMap<>(before);
-        batch.forEach((id, amount) -> after.merge(id, amount, Integer::sum));
+        if (variant == null || !variant.replacementOnly())
+            batch.forEach((id, amount) -> after.merge(id, amount, Integer::sum));
         if (exchange != null && variant != null) return rejectStart("multiple_exchanges_unavailable");
         if (exchange != null) {
             int apples = after.getOrDefault("enchanted_golden_apple", 0);
@@ -286,7 +314,15 @@ public final class KitPacker {
             ItemStack incoming = player.getItemStack(variant.incomingRawSlot());
             ItemStack outgoing = variantBefore.get(plan.outgoingSlot());
             ItemStack mergeTarget = variantBefore.get(plan.mergeTargetSlot());
-            if (variantBefore.size() != BOX_SLOTS || physicalCargo.size() != 1
+            boolean fullShellSingleCargo = variantBefore.size() == BOX_SLOTS
+                    && physicalCargo.size() == 1;
+            boolean packedStackNormalization = variant.replacementOnly()
+                    && packedStackRepairBoundary(before, variantBefore.size(),
+                            physicalCargo.size(), plan);
+            boolean budgetRepairBatch = !variant.replacementOnly()
+                    && variantBefore.size() == BOX_SLOTS - 1
+                    && physicalCargo.size() == 2 && plan.slotsAfter() == BOX_SLOTS - 2;
+            if ((!fullShellSingleCargo && !budgetRepairBatch && !packedStackNormalization)
                     || guarded.contains(variant.incomingRawSlot())
                     || !sameStack(outgoing, plan.outgoingStack())
                     || outgoing.getAmount() != plan.amount()
@@ -294,7 +330,10 @@ public final class KitPacker {
                     || mergeTarget.getAmount() != plan.mergeTargetStack().getAmount()
                     || !sameStack(incoming, plan.replacementExemplar())
                     || incoming.getAmount() != plan.amount()
-                    || plan.slotsAfter() + KitCapacity.requiredSlots(batch) > BOX_SLOTS
+                    || (variant.replacementOnly() ? plan.slotsAfter() > BOX_SLOTS
+                        : plan.slotsAfter() + KitCapacity.requiredSlots(batch) > BOX_SLOTS)
+                    || (variant.replacementOnly() && !sameStack(mergeTarget,
+                            plan.replacementExemplar()))
                     || firstEmptyRawPlayerSlot(player, guarded) < 0) {
                 return rejectStart("variant_exchange_preflight_mismatch");
             }
@@ -385,7 +424,7 @@ public final class KitPacker {
         this.variantTicks = 0;
         this.variantDisplacedRaw = -1;
         this.variantDisplacedStack = null;
-        this.variantCargoStack = variant == null ? null : physicalCargo.getFirst();
+        this.variantCargoStacks = variant == null ? List.of() : List.copyOf(physicalCargo);
         this.openGate.reset();
         this.savedAllowBreak = CONFIG.client.extra.pathfinder.allowBreak;
         this.breakingGuard = true;
@@ -848,7 +887,8 @@ public final class KitPacker {
             if (destination < 0) { fail("variant_displacement_headroom_lost"); return; }
             var evidence = KitVariantExchangeEvidence.capture(plan, variantShellBefore,
                     physicalShellSlots(open), physicalPlayerSlots(open),
-                    variantExchange.incomingRawSlot(), destination);
+                    variantExchange.incomingRawSlot(), destination,
+                    variantExchange.replacementOnly());
             if (evidence == null) { fail("variant_exchange_live_preflight_mismatch"); return; }
             try {
                 variantEvidence = evidence;
@@ -895,7 +935,9 @@ public final class KitPacker {
                                 new GuardedClickItem(openContainerId,
                                         rawToWindow(variantExchange.incomingRawSlot()),
                                         ClickItemAction.LEFT_CLICK),
-                                new GuardedClickItem(openContainerId, plan.mergeTargetSlot(),
+                                new GuardedClickItem(openContainerId,
+                                        variantExchange.replacementOnly()
+                                                ? plan.outgoingSlot() : plan.mergeTargetSlot(),
                                         ClickItemAction.LEFT_CLICK))
                         .build());
                 variantPhase = 3;
@@ -1013,12 +1055,21 @@ public final class KitPacker {
         Set<Integer> matching = matchingBoxSlots(expectedAfter);
         Set<Integer> newlyMatching = new HashSet<>(matching);
         newlyMatching.removeAll(matchingBoxSlotsBefore);
-        int candidate = matching.size() == matchingBoxCountBefore + 1
-                && newlyMatching.size() == 1
-                && inventoryCache.getOpenContainerId() == 0
+        boolean settled = inventoryCache.getOpenContainerId() == 0
                 && (cursor == null || cursor.getAmount() <= 0)
-                && !isShulkerAtWorksite()
-                ? newlyMatching.iterator().next() : -1;
+                && !isShulkerAtWorksite();
+        int candidate = -1;
+        if (settled && variantExchange != null && variantExchange.replacementOnly()
+                && variantEvidence != null) {
+            // Replacement preserves aggregate contents. The broken box can return
+            // to its original raw slot, so aggregate new-slot detection is invalid.
+            Map<Integer, ItemStack> held = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) held.put(raw, playerStack(raw));
+            candidate = variantEvidence.uniqueRecoveredSlot(held);
+        } else if (settled && matching.size() == matchingBoxCountBefore + 1
+                && newlyMatching.size() == 1) {
+            candidate = newlyMatching.iterator().next();
+        }
         if (candidate >= 0) {
             if (candidate != pickupCandidateSlot) {
                 pickupCandidateSlot = candidate;
@@ -1127,6 +1178,11 @@ public final class KitPacker {
     }
 
     private void advance(State next) {
+        long now = System.nanoTime();
+        long elapsed = phaseStartedAtNanos == 0 || state == State.IDLE
+                ? 0 : (now - phaseStartedAtNanos) / 1_000_000;
+        phaseStartedAtNanos = now;
+        State previous = state;
         state = next;
         phaseTicks = 0;
         if (next == State.BREAKING) {
@@ -1145,7 +1201,8 @@ public final class KitPacker {
             BARITONE.stop();
             closeClearTicks = 0;
         }
-        emit("kit_pack_phase", Map.of("phase", next.name()));
+        emit("kit_pack_phase", Map.of("phase", next.name(),
+                "previous_phase", previous.name(), "previous_phase_ms", elapsed));
     }
 
     private void setSneak(boolean sneak) {
@@ -1351,8 +1408,7 @@ public final class KitPacker {
     }
 
     private static boolean isShulker(ItemStack stack) {
-        return stack != null && stack.getAmount() > 0
-                && ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack)).contains("shulker_box");
+        return ItemIdentifier.isShulkerBox(stack);
     }
 
     private static ItemStack playerStack(int raw) {

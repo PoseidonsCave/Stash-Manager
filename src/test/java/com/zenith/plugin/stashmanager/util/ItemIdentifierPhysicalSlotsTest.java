@@ -33,13 +33,52 @@ class ItemIdentifierPhysicalSlotsTest {
     }
 
     @Test
-    void rejectsMalformedContainerLength() {
+    void acceptsTrimmedTrailingEmptySlots() {
         DataComponents components = new DataComponents(new HashMap<>());
         putContainer(components,
                 List.of(new ItemStack(ItemRegistry.REGISTRY.get("stone").id(), 1)));
         var box = new ItemStack(ItemRegistry.REGISTRY.get("white_shulker_box").id(),
                 1, components);
+        assertEquals(1, ItemIdentifier.readShulkerPhysicalSlotStacks(box).size());
+    }
+
+    @Test
+    void readsTwentySixOccupiedSlotsWithTrailingSlotOmitted() {
+        DataComponents components = new DataComponents(new HashMap<>());
+        var slots = new ArrayList<ItemStack>();
+        for (int i = 0; i < 26; i++)
+            slots.add(new ItemStack(ItemRegistry.REGISTRY.get("stone").id(), 1));
+        slots.set(16, new ItemStack(ItemRegistry.REGISTRY.get("end_crystal").id(), 10));
+        putContainer(components, slots);
+        var box = new ItemStack(ItemRegistry.REGISTRY.get("white_shulker_box").id(),
+                1, components);
+        var physical = ItemIdentifier.readShulkerPhysicalSlotStacks(box);
+        assertEquals(26, physical.size());
+        assertEquals(10, physical.get(16).getAmount());
+    }
+
+    @Test
+    void rejectsOutOfBoundsContainerLength() {
+        DataComponents components = new DataComponents(new HashMap<>());
+        var slots = new ArrayList<ItemStack>();
+        for (int i = 0; i < 28; i++) slots.add(null);
+        putContainer(components, slots);
+        var box = new ItemStack(ItemRegistry.REGISTRY.get("white_shulker_box").id(),
+                1, components);
         assertTrue(ItemIdentifier.readShulkerPhysicalSlotStacks(box).isEmpty());
+    }
+
+    @Test
+    void treatsCanonicalEmptyStackAsEmptySlot() {
+        DataComponents components = new DataComponents(new HashMap<>());
+        var slots = new ArrayList<ItemStack>();
+        for (int i = 0; i < 27; i++) slots.add(null);
+        slots.set(0, new ItemStack(ItemRegistry.REGISTRY.get("stone").id(), 1));
+        slots.set(26, new ItemStack(0, 0));
+        putContainer(components, slots);
+        var box = new ItemStack(ItemRegistry.REGISTRY.get("white_shulker_box").id(),
+                1, components);
+        assertEquals(1, ItemIdentifier.readShulkerPhysicalSlotStacks(box).size());
     }
 
     @Test

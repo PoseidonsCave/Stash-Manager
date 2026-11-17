@@ -13,23 +13,34 @@ public final class KitLostSourceIndexPolicy {
     public static ContainerEntry withoutLostBox(ContainerEntry entry,
                                                  KitFulfillmentJournalStore.BorrowedBox lost,
                                                  String withdrawnItem, int withdrawnQuantity) {
-        if (entry == null || lost == null || withdrawnItem == null
-                || withdrawnQuantity <= 0 || !entry.inventoryFootprintKnown()) return null;
-        Map<String, Integer> before = new LinkedHashMap<>(lost.contents());
-        before.merge(withdrawnItem, withdrawnQuantity, Integer::sum);
+        if (entry == null || lost == null || !entry.inventoryFootprintKnown()) return null;
+        // Some write-offs happened before any cargo was withdrawn. Older checkpoints do not
+        // record the item withdrawn when the loss occurred, so the current task may differ.
+        // Match either the unchanged box or the legacy reconstructed pre-withdrawal box,
+        // but reject the whole inventory if more than one physical box matches either form.
+        Map<String, Integer> after = lost.contents();
+        Map<String, Integer> before = null;
+        if (withdrawnItem != null && withdrawnQuantity > 0) {
+            before = new LinkedHashMap<>(after);
+            before.merge(withdrawnItem, withdrawnQuantity, Integer::sum);
+        }
         var details = entry.shulkerDetails();
         int matchingIndex = -1;
+        Map<String, Integer> matchedContents = null;
         for (int i = 0; i < details.size(); i++) {
             var detail = details.get(i);
-            if (!detail.isPhysicalInstance() || !before.equals(detail.items())
-                    || !matchesBoxItem(detail.color(), lost.itemId())) continue;
+            if (!detail.isPhysicalInstance()
+                    || !matchesBoxItem(detail.color(), lost.itemId())
+                    || (!after.equals(detail.items())
+                        && (before == null || !before.equals(detail.items())))) continue;
             if (matchingIndex >= 0) return null;
             matchingIndex = i;
+            matchedContents = detail.items();
         }
         if (matchingIndex < 0 || entry.shulkerCount() < 1) return null;
         Map<String, Integer> items = new LinkedHashMap<>(entry.items());
         if (!subtract(items, lost.itemId(), 1)) return null;
-        for (var item : before.entrySet()) {
+        for (var item : matchedContents.entrySet()) {
             if (!subtract(items, item.getKey(), item.getValue())) return null;
         }
         var remaining = new ArrayList<>(details);

@@ -4,6 +4,7 @@ import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -39,8 +40,23 @@ public final class KitVariantExchangeEvidence {
                                                       Map<Integer, ItemStack> player,
                                                       int incomingRawSlot,
                                                       int displacedRawSlot) {
+        return capture(plan, expectedShell, liveShell, player, incomingRawSlot,
+                displacedRawSlot, false);
+    }
+
+    public static KitVariantExchangeEvidence capture(KitVariantExchangePlan.Plan plan,
+                                                      Map<Integer, ItemStack> expectedShell,
+                                                      Map<Integer, ItemStack> liveShell,
+                                                      Map<Integer, ItemStack> player,
+                                                      int incomingRawSlot,
+                                                      int displacedRawSlot,
+                                                      boolean replacementOnly) {
         if (plan == null || expectedShell == null || liveShell == null || player == null
-                || expectedShell.size() != 27 || !validShell(expectedShell)
+                || (expectedShell.size() != 27
+                    && !(expectedShell.size() == 26 && !replacementOnly
+                        && plan.slotsAfter() == 25)
+                    && !(replacementOnly && packedStackRepairShape(plan, expectedShell.size())))
+                || !validShell(expectedShell)
                 || !sameSlots(expectedShell, liveShell) || !validPlayer(player)
                 || incomingRawSlot < 9 || incomingRawSlot > 44
                 || displacedRawSlot < 9 || displacedRawSlot > 35
@@ -51,8 +67,8 @@ public final class KitVariantExchangeEvidence {
                 || !sameVariant(player.get(incomingRawSlot), plan.replacementExemplar())
                 || !valid(player.get(incomingRawSlot))
                 || player.get(incomingRawSlot).getAmount() != plan.amount()
-                || plan.mergeTargetStack().getAmount() + plan.amount()
-                        > plan.maxStack()) return null;
+                || (!replacementOnly && plan.mergeTargetStack().getAmount()
+                        + plan.amount() > plan.maxStack())) return null;
 
         Map<Integer, ItemStack> removedShell = new HashMap<>(liveShell);
         removedShell.remove(plan.outgoingSlot());
@@ -60,14 +76,29 @@ public final class KitVariantExchangeEvidence {
         removedPlayer.put(displacedRawSlot, plan.outgoingStack());
 
         Map<Integer, ItemStack> addedShell = new HashMap<>(removedShell);
-        addedShell.put(plan.mergeTargetSlot(), new ItemStack(
-                plan.mergeTargetStack().getId(),
-                plan.mergeTargetStack().getAmount() + plan.amount(),
-                plan.mergeTargetStack().getDataComponents()));
+        if (replacementOnly) {
+            addedShell.put(plan.outgoingSlot(), new ItemStack(
+                    plan.replacementExemplar().getId(), plan.amount(),
+                    plan.replacementExemplar().getDataComponents()));
+        } else {
+            addedShell.put(plan.mergeTargetSlot(), new ItemStack(
+                    plan.mergeTargetStack().getId(),
+                    plan.mergeTargetStack().getAmount() + plan.amount(),
+                    plan.mergeTargetStack().getDataComponents()));
+        }
         Map<Integer, ItemStack> addedPlayer = new HashMap<>(removedPlayer);
         addedPlayer.remove(incomingRawSlot);
         return new KitVariantExchangeEvidence(liveShell, player, removedShell,
                 removedPlayer, addedShell, addedPlayer);
+    }
+
+    private static boolean packedStackRepairShape(KitVariantExchangePlan.Plan plan,
+            int physicalSlots) {
+        if (plan.replacementExemplar() == null) return false;
+        var profile = KitPackedStackCapacityRepair.profile(
+                ItemIdentifier.getItemId(plan.replacementExemplar()));
+        return profile != null && physicalSlots == profile.physicalSlots()
+                && plan.slotsAfter() == profile.allowedSlots();
     }
 
     public boolean matchesBefore(Map<Integer, ItemStack> shell,
@@ -94,23 +125,47 @@ public final class KitVariantExchangeEvidence {
                         ItemIdentifier.readShulkerPhysicalSlotStacks(shulker));
     }
 
+    /** Physical identity, independent of whether pickup reuses the old raw slot. */
+    public int uniqueRecoveredSlot(Map<Integer, ItemStack> player) {
+        if (player == null) return -1;
+        int found = -1;
+        for (var entry : player.entrySet()) {
+            int raw = entry.getKey();
+            if (raw < 9 || raw > 44 || !matchesRecoveredShell(entry.getValue())) continue;
+            if (found >= 0) return -1;
+            found = raw;
+        }
+        return found;
+    }
+
     /** The exchange's 26 exact stacks plus the separately audited cargo stack. */
     public boolean matchesRecoveredWithCargo(ItemStack shulker, ItemStack cargo) {
-        if (shulker == null || shulker.getAmount() != 1 || !valid(cargo)) return false;
+        if (cargo == null) return false;
+        return matchesRecoveredWithCargo(shulker, List.of(cargo));
+    }
+
+    /** Every added cargo stack must be present exactly once outside the exchanged shell. */
+    public boolean matchesRecoveredWithCargo(ItemStack shulker, List<ItemStack> cargo) {
+        if (shulker == null || shulker.getAmount() != 1 || cargo == null
+                || cargo.isEmpty() || cargo.stream().anyMatch(stack -> !valid(stack))) return false;
         Map<Integer, ItemStack> observed =
                 ItemIdentifier.readShulkerPhysicalSlotStacks(shulker);
-        if (observed.size() != shellAfterAddition.size() + 1) return false;
+        if (observed.size() != shellAfterAddition.size() + cargo.size()) return false;
         for (var entry : shellAfterAddition.entrySet()) {
             if (!same(entry.getValue(), observed.get(entry.getKey()))) return false;
         }
-        int extra = 0;
+        List<ItemStack> unmatched = new java.util.ArrayList<>(cargo);
         for (var entry : observed.entrySet()) {
             if (!shellAfterAddition.containsKey(entry.getKey())) {
-                if (!same(cargo, entry.getValue())) return false;
-                extra++;
+                int match = -1;
+                for (int i = 0; i < unmatched.size(); i++) {
+                    if (same(unmatched.get(i), entry.getValue())) { match = i; break; }
+                }
+                if (match < 0) return false;
+                unmatched.remove(match);
             }
         }
-        return extra == 1;
+        return unmatched.isEmpty();
     }
 
     private static boolean validShell(Map<Integer, ItemStack> slots) {

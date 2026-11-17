@@ -19,6 +19,7 @@ import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
 import com.zenith.plugin.stashmanager.index.ContainerEntry;
 import com.zenith.plugin.stashmanager.kit.KitPackingWorksitePlanner;
+import com.zenith.plugin.stashmanager.kit.KitProvenanceJournal;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
 import com.zenith.plugin.stashmanager.orchestration.ContainerAccessPlanner;
 import com.zenith.plugin.stashmanager.orchestration.SneakReleaseGate;
@@ -148,6 +149,9 @@ public final class StashRetriever {
     private StartFailureReason lastStartFailureReason = StartFailureReason.NONE;
 
     private final Deque<int[]> targetQueue = new ArrayDeque<>();
+    private static final long EXHAUSTED_OBSERVATION_NANOS =
+            java.util.concurrent.TimeUnit.MINUTES.toNanos(10);
+    private final Map<String, Map<Long, Long>> exhaustedSourceObservations = new HashMap<>();
     private final Map<Long, int[]> doubleChestPartners = new HashMap<>();
     private int[] currentTarget;
     private int[] openingClickTarget;
@@ -178,6 +182,9 @@ public final class StashRetriever {
     private int initialRequestedTotal;
     private int successfulTransfers;
     private int transfersAtTargetStart;
+    private long targetSelectedAtNanos;
+    private long openingStartedAtNanos;
+    private long guiOpenedAtNanos;
     private boolean targetOpenAttempted;
     private final SneakReleaseGate containerOpenGate = new SneakReleaseGate();
 
@@ -466,7 +473,23 @@ public final class StashRetriever {
                     .thenComparingDouble(e -> distanceTo(e.x(), e.y(), e.z()))
                     .thenComparing(normalOrder));
         } else {
-            sorted.sort(normalOrder);
+            var player = CACHE.getPlayerCache();
+            long now = System.nanoTime();
+            Set<Long> recentlyExhausted = new HashSet<>();
+            for (ContainerEntry entry : sorted) {
+                if (matchScore(entry) <= 0) continue;
+                for (String request : remaining.keySet()) {
+                    Long observedAt = exhaustedSourceObservations
+                            .getOrDefault(request, Map.of()).get(entry.posKey());
+                    if (observedAt != null && now - observedAt < EXHAUSTED_OBSERVATION_NANOS) {
+                        recentlyExhausted.add(entry.posKey());
+                        break;
+                    }
+                }
+            }
+            sorted = SourceRoutePlanner.order(sorted, player.getX(), player.getY(), player.getZ(),
+                    this::matchScore, this::directMatchScore, laneOutputKeys,
+                    recentlyExhausted);
         }
 
         for (ContainerEntry entry : sorted) {
@@ -650,6 +673,7 @@ public final class StashRetriever {
 
     private void beginOpeningTarget() {
         BARITONE.stop();
+        openingStartedAtNanos = System.nanoTime();
         targetOpenAttempted = true;
         state = State.OPENING;
         containerOpenGate.reset();
@@ -678,7 +702,10 @@ public final class StashRetriever {
             state = State.TAKING;
             actionSlotIndex = 0;
             actionCooldown = 0;
-            emit("retrieve_target_opened", Map.of());
+            guiOpenedAtNanos = System.nanoTime();
+            emit("retrieve_target_opened", Map.of(
+                    "navigation_ms", elapsedMillis(targetSelectedAtNanos, openingStartedAtNanos),
+                    "open_wait_ms", elapsedMillis(openingStartedAtNanos, guiOpenedAtNanos)));
             return;
         }
         if (opening == RetrievalOpenPolicy.Opening.WAIT_FOR_CONTENTS) return;
@@ -764,7 +791,11 @@ public final class StashRetriever {
                         return;
                     }
 
-                    if (!quickMoveSlot(actionSlotIndex)) {
+                    boolean finalDirectTransfer = wantedDirectly && !wantedForContents
+                            && completesDirectRequest(remaining, requestKey, stack.getAmount());
+                    if (!((wantedForContents || finalDirectTransfer)
+                            ? quickMoveFinalSlotAndClose(actionSlotIndex)
+                            : quickMoveSlot(actionSlotIndex))) {
                         actionCooldown = CLICK_COOLDOWN_TICKS;
                         return;
                     }
@@ -778,12 +809,24 @@ public final class StashRetriever {
                         
                         int[] revisitTarget = currentTarget == null ? null : currentTarget.clone();
                         int sourceContainerId = openContainerId;
-                        closeCurrentContainer();
+                        // The close is in the same inventory request as the click. A
+                        // separate immediate request can be rejected while Zenith is
+                        // still executing the click, leaving this GUI open until the
+                        // server's idle timeout.
+                        containerDataReceived = false;
+                        openContainerId = -1;
+                        containerSlots = null;
                         if (revisitTarget != null) {
                             targetQueue.addFirst(revisitTarget);
                         }
                         beginShulkerUnload(actionSlotIndex - 1, stack, sourceContainerId);
                         return;
+                    }
+
+                    if (finalDirectTransfer) {
+                        containerDataReceived = false;
+                        openContainerId = -1;
+                        containerSlots = null;
                     }
 
                     if (needed != null && needed > 0) {
@@ -842,10 +885,25 @@ public final class StashRetriever {
         worksiteFallbackAttempted = false;
         rejectedShulkerPlacePositions.clear();
         state = State.UNLOADING_SHULKER;
-        emit("retrieve_shulker_unload_started", Map.of(
-            "source_container_slot", chestSlot,
-            "shulker_item_id", itemIdFromStack(shulkerStack)
-        ));
+        if (activeRequestName != null && activeRequestName.startsWith("kit_fulfillment:")) {
+            Map<String, Object> sourceEvidence = new LinkedHashMap<>();
+            sourceEvidence.put("source_container_slot", chestSlot);
+            sourceEvidence.put("shulker_item_id", itemIdFromStack(shulkerStack));
+            sourceEvidence.put("source_item_id", borrowedBoxItemId);
+            sourceEvidence.put("source_position", borrowedSourceOrigin == null
+                    ? "inventory" : posString(borrowedSourceOrigin));
+            sourceEvidence.put("source_contents_hash",
+                    KitProvenanceJournal.contentsHash(borrowedBoxContentsBefore));
+            if (borrowedRequestItem != null) {
+                sourceEvidence.put("requested_item_count",
+                        borrowedBoxContentsBefore.getOrDefault(borrowedRequestItem, 0));
+            }
+            emit("retrieve_shulker_unload_started", sourceEvidence);
+        } else {
+            emit("retrieve_shulker_unload_started", Map.of(
+                    "source_container_slot", chestSlot,
+                    "shulker_item_id", itemIdFromStack(shulkerStack)));
+        }
     }
 
     private void tickUnloadingShulker() {
@@ -1002,7 +1060,17 @@ public final class StashRetriever {
 
         // The source chest close follows the shift-click. Do not navigate or select a
         // player-inventory hotbar slot until Zenith observes that close.
-        if (CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() > 0) return;
+        int liveContainerId = CACHE.getPlayerCache().getInventoryCache().getOpenContainerId();
+        if (liveContainerId > 0) {
+            // Retry only the borrowed source GUI if the queued close was skipped.
+            // Never close a different GUI opened by a controller or another task.
+            if (liveContainerId == unloadSourceContainerId && !INVENTORY.hasActiveRequest()) {
+                INVENTORY.submit(InventoryActionRequest.builder()
+                    .owner(this).priority(5000)
+                    .actions(new CloseContainer(liveContainerId)).build());
+            }
+            return;
+        }
 
         resolvePendingOwnedShulker();
 
@@ -1781,9 +1849,11 @@ public final class StashRetriever {
     private void advanceToNextTarget(String reason) {
         if (currentTarget != null && !isComplete() && reason != null) {
             if ("container_exhausted".equals(reason)) {
+                rememberObservedEmptySource();
                 emit("retrieve_target_exhausted", Map.of(
                     "moved_stacks", successfulTransfers,
-                    "obtained_total", Math.max(0, initialRequestedTotal - getRemainingTotal())
+                    "obtained_total", Math.max(0, initialRequestedTotal - getRemainingTotal()),
+                    "gui_ms", elapsedMillis(guiOpenedAtNanos, System.nanoTime())
                 ));
             } else {
                 emit("retrieve_target_failed", Map.of("failure_reason", reason));
@@ -1808,6 +1878,9 @@ public final class StashRetriever {
         }
 
         currentTarget = nextTarget;
+        targetSelectedAtNanos = System.nanoTime();
+        openingStartedAtNanos = 0;
+        guiOpenedAtNanos = 0;
         transfersAtTargetStart = successfulTransfers;
         targetOpenAttempted = false;
         openingClickTarget = nextTarget;
@@ -1846,7 +1919,28 @@ public final class StashRetriever {
         }
     }
 
+    private void rememberObservedEmptySource() {
+        if (currentTarget == null || containerSlots == null) return;
+        for (int slot = 0; slot < getOpenContainerSlotCount(); slot++) {
+            ItemStack stack = containerSlots[slot];
+            if (stack == null || stack.getAmount() <= 0) continue;
+            if (matchingRequestKey(itemIdFromStack(stack)) != null
+                    && physicalStackAllowed(stack)) return;
+            if (!directContentsOnly && containsWantedContents(stack)) return;
+        }
+        long key = posKey(currentTarget[0], currentTarget[1], currentTarget[2]);
+        long now = System.nanoTime();
+        for (String request : remaining.keySet()) {
+            Map<Long, Long> byPosition = exhaustedSourceObservations
+                    .computeIfAbsent(request, ignored -> new HashMap<>());
+            if (byPosition.size() >= 4096) byPosition.clear();
+            byPosition.put(key, now);
+        }
+    }
+
     private void finish(boolean completed, String reason) {
+        long guiMillis = state == State.TAKING
+                ? elapsedMillis(guiOpenedAtNanos, System.nanoTime()) : 0;
         BARITONE.stop();
         restoreWorksiteNavigation();
         closeCurrentContainer();
@@ -1856,7 +1950,8 @@ public final class StashRetriever {
         if (completed) {
             emit("retrieve_completed", Map.of(
                 "moved_stacks", successfulTransfers,
-                "obtained_total", Math.max(0, initialRequestedTotal - getRemainingTotal())
+                "obtained_total", Math.max(0, initialRequestedTotal - getRemainingTotal()),
+                "gui_ms", guiMillis
             ));
         } else {
             emit("retrieve_incomplete", Map.of(
@@ -1869,6 +1964,9 @@ public final class StashRetriever {
 
     private void resetState() {
         restoreWorksiteNavigation();
+        targetSelectedAtNanos = 0;
+        openingStartedAtNanos = 0;
+        guiOpenedAtNanos = 0;
         targetQueue.clear();
         doubleChestPartners.clear();
         currentTarget = null;
@@ -2354,6 +2452,32 @@ public final class StashRetriever {
         }
     }
 
+    static boolean completesDirectRequest(Map<String, Integer> remaining,
+                                          String requestKey, int available) {
+        if (requestKey == null || available < remaining.getOrDefault(requestKey, 0))
+            return false;
+        for (var need : remaining.entrySet()) {
+            if (!need.getKey().equals(requestKey) && need.getValue() > 0) return false;
+        }
+        return true;
+    }
+
+    private boolean quickMoveFinalSlotAndClose(int slot) {
+        if (openContainerId < 0) return false;
+        try {
+            int containerId = openContainerId;
+            var future = INVENTORY.submit(InventoryActionRequest.builder()
+                .owner(this)
+                .priority(6000)
+                .actions(new ShiftClick(containerId, slot, ShiftClickItemAction.LEFT_CLICK),
+                    new CloseContainer(containerId))
+                .build());
+            return !(future.isDone() && !future.isAccepted());
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
 
     private boolean hasInventoryRoom(ItemStack incoming) {
         var invCache = CACHE.getPlayerCache().getInventoryCache();
@@ -2448,7 +2572,7 @@ public final class StashRetriever {
                 builder.actions(new SetHeldItem(slot - 36));
             } else {
                 int hotbarIndex = strictBorrowedPickup()
-                        ? firstEmptyHotbarIndex() : SHULKER_HOTBAR_SLOT;
+                        ? borrowedHotbarIndex() : SHULKER_HOTBAR_SLOT;
                 if (hotbarIndex < 0) return false;
                 unloadHotbarRawSlot = 36 + hotbarIndex;
                 builder.actions(
@@ -2472,6 +2596,47 @@ public final class StashRetriever {
         for (int raw = 36; raw <= 44; raw++) {
             ItemStack stack = player.getItemStack(raw);
             if (stack == null || stack.getAmount() <= 0) return raw - 36;
+        }
+        return -1;
+    }
+
+    /** Use an empty slot, one task stack, or an already tracked borrowed box.
+     * The swap keeps the displaced stack in the new source box's main slot. */
+    private int borrowedHotbarIndex() {
+        int empty = firstEmptyHotbarIndex();
+        if (empty >= 0) return empty;
+        Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (player == null || borrowedRequestItem == null) return -1;
+        int taskCargo = uniqueTaskCargoHotbarIndex(raw -> {
+            ItemStack stack = player.getItemStack(raw);
+            return stack != null && stack.getAmount() > 0
+                    && borrowedRequestItem.equals(ItemIdentifier.getItemId(stack));
+        });
+        if (taskCargo >= 0) return taskCargo;
+        return firstTrackedBorrowedHotbarIndex(raw -> {
+            if (!ownedShulkerSlots.contains(raw)) return false;
+            ItemStack stack = player.getItemStack(raw);
+            return stack != null && stack.getAmount() == 1
+                    && isShulkerBoxItem(ItemIdentifier.getItemId(stack))
+                    && !matchesBorrowedSource(stack)
+                    && ItemIdentifier.readShulkerContents(stack)
+                            .getOrDefault(borrowedRequestItem, 0) > 0;
+        });
+    }
+
+    static int uniqueTaskCargoHotbarIndex(IntPredicate taskCargo) {
+        int found = -1;
+        for (int raw = 36; raw <= 44; raw++) {
+            if (!taskCargo.test(raw)) continue;
+            if (found >= 0) return -1;
+            found = raw - 36;
+        }
+        return found;
+    }
+
+    static int firstTrackedBorrowedHotbarIndex(IntPredicate trackedSource) {
+        for (int raw = 36; raw <= 44; raw++) {
+            if (trackedSource.test(raw)) return raw - 36;
         }
         return -1;
     }
@@ -2573,7 +2738,7 @@ public final class StashRetriever {
     }
 
     private boolean isShulkerBoxItem(String itemId) {
-        return itemId != null && itemId.contains("shulker_box");
+        return ItemIdentifier.isShulkerBoxItem(itemId);
     }
 
     private String itemIdFromStack(ItemStack stack) {
@@ -2612,6 +2777,10 @@ public final class StashRetriever {
         double dy = pc.getY() - y;
         double dz = pc.getZ() - z;
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    private static long elapsedMillis(long from, long until) {
+        return from == 0 || until < from ? 0 : (until - from) / 1_000_000;
     }
 
     // Return true when this tick submits a split-stack click.

@@ -17,7 +17,7 @@ import java.util.Optional;
 
 /** Atomic checkpoint; an uncertain transfer must be inspected, never replayed blindly. */
 public final class KitFulfillmentJournalStore {
-    public static final int SCHEMA_VERSION = 12;
+    public static final int SCHEMA_VERSION = 14;
     private static final Gson GSON = new Gson();
 
     public record BorrowedBox(int[] sourcePosition, String itemId,
@@ -48,6 +48,15 @@ public final class KitFulfillmentJournalStore {
 
     public record RetainedShell(int rawSlot, String itemId, String componentsHash) { }
 
+    /** Operator-attested old stock kept separate from a partially recovered kit batch. */
+    public record ProtectedLoose(int rawSlot, String itemId, int amount,
+                                 String variantHash, int originalQuantity) { }
+
+    /** Write-ahead ownership witness for a previously retrieved batch returned to its box. */
+    public record HeldBoxRebase(int originalSourceUnits, int combinedSourceUnits,
+                                int retrievedUnits, int keptUnits,
+                                String sourceItemId, String itemId, String variantHash) { }
+
     /** Write-ahead intent for a single component-exact, fail-stop kit repair. */
     public record VariantRepair(int[] importPosition, int expectedImportSlots,
                                 int cargoRawSlot, String cargoHash, String itemId, int amount,
@@ -55,7 +64,19 @@ public final class KitFulfillmentJournalStore {
                                 String sourceHash, String outgoingHash, String shellHash,
                                 int displacedRawSlot, String displacedHash,
                                 String resultShellHash, int auditedIncomingRawSlot,
-                                int fingerprintVersion) {
+                                int fingerprintVersion, boolean replacementOnly) {
+        public VariantRepair(int[] importPosition, int expectedImportSlots,
+                             int cargoRawSlot, String cargoHash, String itemId, int amount,
+                             int outgoingSlot, int mergeTargetSlot,
+                             String sourceHash, String outgoingHash, String shellHash,
+                             int displacedRawSlot, String displacedHash,
+                             String resultShellHash, int auditedIncomingRawSlot,
+                             int fingerprintVersion) {
+            this(importPosition, expectedImportSlots, cargoRawSlot, cargoHash,
+                    itemId, amount, outgoingSlot, mergeTargetSlot, sourceHash,
+                    outgoingHash, shellHash, displacedRawSlot, displacedHash,
+                    resultShellHash, auditedIncomingRawSlot, fingerprintVersion, false);
+        }
         public VariantRepair(int[] importPosition, int expectedImportSlots,
                              int cargoRawSlot, String cargoHash, String itemId, int amount,
                              int outgoingSlot, int mergeTargetSlot,
@@ -65,7 +86,7 @@ public final class KitFulfillmentJournalStore {
             this(importPosition, expectedImportSlots, cargoRawSlot, cargoHash,
                     itemId, amount, outgoingSlot, mergeTargetSlot, sourceHash,
                     outgoingHash, shellHash, displacedRawSlot, displacedHash,
-                    resultShellHash, 0, 0);
+                    resultShellHash, 0, 0, false);
         }
         public VariantRepair(int[] importPosition, int expectedImportSlots,
                              int cargoRawSlot, String cargoHash, String itemId, int amount,
@@ -76,7 +97,7 @@ public final class KitFulfillmentJournalStore {
             this(importPosition, expectedImportSlots, cargoRawSlot, cargoHash,
                     itemId, amount, outgoingSlot, mergeTargetSlot, sourceHash,
                     outgoingHash, shellHash, displacedRawSlot, displacedHash,
-                    resultShellHash, auditedIncomingRawSlot, 0);
+                    resultShellHash, auditedIncomingRawSlot, 0, false);
         }
         public VariantRepair {
             importPosition = importPosition == null ? null : importPosition.clone();
@@ -89,27 +110,28 @@ public final class KitFulfillmentJournalStore {
                     cargoHash,
                     itemId, amount, outgoingSlot, mergeTargetSlot, sourceHash,
                     outgoingHash, shellHash, raw, hash, resultShellHash,
-                    auditedIncomingRawSlot, fingerprintVersion);
+                    auditedIncomingRawSlot, fingerprintVersion, replacementOnly);
         }
         public VariantRepair withResult(int raw, String hash, String resultHash) {
             return new VariantRepair(importPosition, expectedImportSlots, cargoRawSlot,
                     cargoHash,
                     itemId, amount, outgoingSlot, mergeTargetSlot, sourceHash,
                     outgoingHash, shellHash, raw, hash, resultHash,
-                    auditedIncomingRawSlot, fingerprintVersion);
+                    auditedIncomingRawSlot, fingerprintVersion, replacementOnly);
         }
         public VariantRepair withAuditedIncoming(int raw) {
             return new VariantRepair(importPosition, expectedImportSlots, cargoRawSlot,
                     cargoHash, itemId, amount, outgoingSlot, mergeTargetSlot,
                     sourceHash, outgoingHash, shellHash, displacedRawSlot,
-                    displacedHash, resultShellHash, raw, fingerprintVersion);
+                    displacedHash, resultShellHash, raw, fingerprintVersion,
+                    replacementOnly);
         }
         public VariantRepair withCanonicalEvidence(String cargo, String source,
                                                     String outgoing, String shell) {
             return new VariantRepair(importPosition, expectedImportSlots, cargoRawSlot,
                     cargo, itemId, amount, outgoingSlot, mergeTargetSlot, source,
                     outgoing, shell, displacedRawSlot, displacedHash, resultShellHash,
-                    auditedIncomingRawSlot, 2);
+                    auditedIncomingRawSlot, 2, replacementOnly);
         }
     }
 
@@ -128,7 +150,52 @@ public final class KitFulfillmentJournalStore {
                            int incompleteBoxes, Map<String, Integer> missingTotals,
                            Map<String, Integer> currentBoxMissing,
                            Map<Integer, KitInventoryAppleOwnership.Slot> displacedAppleSlots,
-                           RetainedShell retainedShell, VariantRepair variantRepair) {
+                           RetainedShell retainedShell, VariantRepair variantRepair,
+                           ProtectedLoose protectedLoose, HeldBoxRebase heldBoxRebase) {
+        public Snapshot(int schemaVersion, String kitName, String state,
+                        Map<String, Integer> recipe, Map<String, Integer> packedContents,
+                        int requestedBoxes, int completedBoxes, String currentItem,
+                        int currentQuantity, int ownedShellSlot, int[] exportPosition,
+                        int[] kitWorksite, int[] borrowedSourceWorksite,
+                        String borrowedSourceItemId, Map<String, Integer> borrowedSourceContents,
+                        String blocker, long updatedAtEpochMilli, String resumeState,
+                        long resumeNotBeforeEpochMilli, List<BorrowedBox> sourceBoxesToReturn,
+                        int auditedCargoSlot, List<BorrowedBox> writtenOffSources,
+                        Map<Integer, Integer> auditedCargoSlots, int incompleteBoxes,
+                        Map<String, Integer> missingTotals, Map<String, Integer> currentBoxMissing,
+                        Map<Integer, KitInventoryAppleOwnership.Slot> displacedAppleSlots,
+                        RetainedShell retainedShell, VariantRepair variantRepair,
+                        ProtectedLoose protectedLoose) {
+            this(schemaVersion, kitName, state, recipe, packedContents, requestedBoxes,
+                    completedBoxes, currentItem, currentQuantity, ownedShellSlot,
+                    exportPosition, kitWorksite, borrowedSourceWorksite, borrowedSourceItemId,
+                    borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
+                    resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
+                    writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
+                    currentBoxMissing, displacedAppleSlots, retainedShell, variantRepair,
+                    protectedLoose, null);
+        }
+        public Snapshot(int schemaVersion, String kitName, String state,
+                        Map<String, Integer> recipe, Map<String, Integer> packedContents,
+                        int requestedBoxes, int completedBoxes, String currentItem,
+                        int currentQuantity, int ownedShellSlot, int[] exportPosition,
+                        int[] kitWorksite, int[] borrowedSourceWorksite,
+                        String borrowedSourceItemId, Map<String, Integer> borrowedSourceContents,
+                        String blocker, long updatedAtEpochMilli, String resumeState,
+                        long resumeNotBeforeEpochMilli, List<BorrowedBox> sourceBoxesToReturn,
+                        int auditedCargoSlot, List<BorrowedBox> writtenOffSources,
+                        Map<Integer, Integer> auditedCargoSlots, int incompleteBoxes,
+                        Map<String, Integer> missingTotals, Map<String, Integer> currentBoxMissing,
+                        Map<Integer, KitInventoryAppleOwnership.Slot> displacedAppleSlots,
+                        RetainedShell retainedShell, VariantRepair variantRepair) {
+            this(schemaVersion, kitName, state, recipe, packedContents, requestedBoxes,
+                    completedBoxes, currentItem, currentQuantity, ownedShellSlot,
+                    exportPosition, kitWorksite, borrowedSourceWorksite, borrowedSourceItemId,
+                    borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
+                    resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
+                    writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
+                    currentBoxMissing, displacedAppleSlots, retainedShell, variantRepair, null);
+        }
         public Snapshot(int schemaVersion, String kitName, String state,
                         Map<String, Integer> recipe, Map<String, Integer> packedContents,
                         int requestedBoxes, int completedBoxes, String currentItem,
@@ -179,7 +246,8 @@ public final class KitFulfillmentJournalStore {
                     borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
                     resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
                     writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
-                    currentBoxMissing, displacedAppleSlots, shell, variantRepair);
+                    currentBoxMissing, displacedAppleSlots, shell, variantRepair, protectedLoose,
+                    heldBoxRebase);
         }
         public Snapshot withVariantRepair(VariantRepair repair) {
             return new Snapshot(schemaVersion, kitName, state, recipe, packedContents,
@@ -188,7 +256,8 @@ public final class KitFulfillmentJournalStore {
                     borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
                     resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
                     writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
-                    currentBoxMissing, displacedAppleSlots, retainedShell, repair);
+                    currentBoxMissing, displacedAppleSlots, retainedShell, repair, protectedLoose,
+                    heldBoxRebase);
         }
         public Snapshot(int schemaVersion, String kitName, String state,
                         Map<String, Integer> recipe, Map<String, Integer> packedContents,
@@ -219,7 +288,30 @@ public final class KitFulfillmentJournalStore {
                     borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
                     resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
                     writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
-                    currentBoxMissing, slots, retainedShell, variantRepair);
+                    currentBoxMissing, slots, retainedShell, variantRepair, protectedLoose,
+                    heldBoxRebase);
+        }
+
+        public Snapshot withProtectedLoose(ProtectedLoose witness) {
+            return new Snapshot(schemaVersion, kitName, state, recipe, packedContents,
+                    requestedBoxes, completedBoxes, currentItem, currentQuantity, ownedShellSlot,
+                    exportPosition, kitWorksite, borrowedSourceWorksite, borrowedSourceItemId,
+                    borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
+                    resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
+                    writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
+                    currentBoxMissing, displacedAppleSlots, retainedShell, variantRepair, witness,
+                    heldBoxRebase);
+        }
+
+        public Snapshot withHeldBoxRebase(HeldBoxRebase witness) {
+            return new Snapshot(schemaVersion, kitName, state, recipe, packedContents,
+                    requestedBoxes, completedBoxes, currentItem, currentQuantity, ownedShellSlot,
+                    exportPosition, kitWorksite, borrowedSourceWorksite, borrowedSourceItemId,
+                    borrowedSourceContents, blocker, updatedAtEpochMilli, resumeState,
+                    resumeNotBeforeEpochMilli, sourceBoxesToReturn, auditedCargoSlot,
+                    writtenOffSources, auditedCargoSlots, incompleteBoxes, missingTotals,
+                    currentBoxMissing, displacedAppleSlots, retainedShell, variantRepair,
+                    protectedLoose, witness);
         }
         public Snapshot(int schemaVersion, String kitName, String state,
                         Map<String, Integer> recipe, Map<String, Integer> packedContents,
@@ -380,6 +472,48 @@ public final class KitFulfillmentJournalStore {
                 throw new IOException("Refusing to discard unresolved variant repair");
             }
         }
+        if (exists() && snapshot.protectedLoose() == null) {
+            Snapshot previous = load().orElse(null);
+            if (previous != null && previous.kitName().equals(snapshot.kitName())
+                    && previous.protectedLoose() != null) {
+                boolean packed = snapshot.packedContents().getOrDefault(
+                        previous.currentItem(), 0)
+                        >= previous.packedContents().getOrDefault(previous.currentItem(), 0)
+                                + previous.currentQuantity();
+                if (!("RETURNING_SOURCE".equals(snapshot.state())
+                        || "NEED_CARGO".equals(snapshot.state())) || !packed
+                        || snapshot.completedBoxes() != previous.completedBoxes()
+                        || !java.util.Objects.equals(snapshot.currentItem(),
+                                previous.currentItem())
+                        || snapshot.currentQuantity() != previous.currentQuantity()
+                        || !sameBorrowedReturns(snapshot.sourceBoxesToReturn(),
+                                previous.sourceBoxesToReturn())) {
+                    throw new IOException("Refusing to discard unconsumed protected loose stock");
+                }
+            }
+        }
+        if (exists() && snapshot.heldBoxRebase() == null) {
+            Snapshot previous = load().orElse(null);
+            if (previous != null && previous.kitName().equals(snapshot.kitName())
+                    && previous.heldBoxRebase() != null) {
+                HeldBoxRebase witness = previous.heldBoxRebase();
+                int expectedAfter = witness.combinedSourceUnits() - witness.retrievedUnits();
+                boolean packed = snapshot.packedContents().getOrDefault(witness.itemId(), 0)
+                        >= previous.packedContents().getOrDefault(witness.itemId(), 0)
+                                + witness.retrievedUnits();
+                boolean returnedIdentity = snapshot.sourceBoxesToReturn().size() == 1
+                        && witness.sourceItemId().equals(
+                                snapshot.sourceBoxesToReturn().getFirst().itemId())
+                        && snapshot.sourceBoxesToReturn().getFirst().contents()
+                                .getOrDefault(witness.itemId(), -1) == expectedAfter;
+                if (!("RETURNING_SOURCE".equals(snapshot.state())
+                        || "NEED_CARGO".equals(snapshot.state())) || !packed
+                        || !returnedIdentity
+                        || snapshot.completedBoxes() != previous.completedBoxes()) {
+                    throw new IOException("Refusing to discard unconsumed held-box rebase witness");
+                }
+            }
+        }
         Path parent = path.toAbsolutePath().normalize().getParent();
         if (parent != null) Files.createDirectories(parent);
         Path temporary = path.resolveSibling(path.getFileName() + ".tmp");
@@ -429,7 +563,9 @@ public final class KitFulfillmentJournalStore {
                     snapshot.schemaVersion() >= 10 ? snapshot.displacedAppleSlots() : Map.of())
                     .withRetainedShell(snapshot.retainedShell())
                     .withVariantRepair(snapshot.schemaVersion() >= 11
-                            ? snapshot.variantRepair() : null);
+                            ? snapshot.variantRepair() : null)
+                    .withProtectedLoose(snapshot.schemaVersion() >= 13
+                            ? snapshot.protectedLoose() : null);
         }
         validate(snapshot);
         return Optional.of(snapshot);
@@ -475,11 +611,58 @@ public final class KitFulfillmentJournalStore {
                 || snapshot.writtenOffSources() == null
                 || snapshot.auditedCargoSlots() == null
                 || snapshot.displacedAppleSlots() == null
+                || (snapshot.heldBoxRebase() != null
+                    && (snapshot.protectedLoose() != null
+                        || snapshot.heldBoxRebase().originalSourceUnits() < 0
+                        || snapshot.heldBoxRebase().retrievedUnits() < 1
+                        || snapshot.heldBoxRebase().keptUnits() < 1
+                        || snapshot.heldBoxRebase().combinedSourceUnits()
+                            != snapshot.heldBoxRebase().originalSourceUnits()
+                                + snapshot.heldBoxRebase().retrievedUnits()
+                                + snapshot.heldBoxRebase().keptUnits()
+                        || snapshot.heldBoxRebase().retrievedUnits()
+                            != snapshot.currentQuantity()
+                        || !java.util.Objects.equals(snapshot.heldBoxRebase().itemId(),
+                                snapshot.currentItem())
+                        || !sha(snapshot.heldBoxRebase().variantHash())
+                        || snapshot.sourceBoxesToReturn().size() != 1
+                        || !java.util.Objects.equals(
+                                snapshot.heldBoxRebase().sourceItemId(),
+                                snapshot.sourceBoxesToReturn().getFirst().itemId())
+                        || !java.util.Set.of(
+                                snapshot.heldBoxRebase().combinedSourceUnits(),
+                                snapshot.heldBoxRebase().combinedSourceUnits()
+                                    - snapshot.heldBoxRebase().retrievedUnits())
+                                .contains(snapshot.sourceBoxesToReturn().getFirst().contents()
+                                    .getOrDefault(snapshot.currentItem(), -1))))
+                || (snapshot.protectedLoose() != null
+                    && (snapshot.protectedLoose().rawSlot() < 9
+                        || snapshot.protectedLoose().rawSlot() > 44
+                        || snapshot.protectedLoose().rawSlot() == snapshot.ownedShellSlot()
+                        || snapshot.protectedLoose().itemId() == null
+                        || !snapshot.protectedLoose().itemId().equals(snapshot.currentItem())
+                        || snapshot.protectedLoose().amount() < 1
+                        || snapshot.protectedLoose().amount() > 64
+                        || snapshot.protectedLoose().originalQuantity()
+                            != snapshot.protectedLoose().amount() + snapshot.currentQuantity()
+                        || snapshot.protectedLoose().originalQuantity()
+                            > snapshot.recipe().getOrDefault(snapshot.currentItem(), 0)
+                                - snapshot.packedContents().getOrDefault(snapshot.currentItem(), 0)
+                        || !sha(snapshot.protectedLoose().variantHash())
+                        || !("BLOCKED".equals(snapshot.state())
+                            || "WAIT_CARGO".equals(snapshot.state())
+                            || "PACKING".equals(snapshot.state()))
+                        || snapshot.sourceBoxesToReturn().size() != 1
+                        || snapshot.auditedCargoSlots().size() < 2
+                        || snapshot.auditedCargoSlots().containsKey(
+                                snapshot.protectedLoose().rawSlot())))
                 || (snapshot.variantRepair() != null && (!validPosition(
                         snapshot.variantRepair().importPosition())
                     || (snapshot.variantRepair().expectedImportSlots() != 27
                         && snapshot.variantRepair().expectedImportSlots() != 54)
-                    || snapshot.variantRepair().cargoRawSlot() < 9
+                    || (snapshot.variantRepair().cargoRawSlot() < 9
+                        && !validPinnedAppleBudgetRepair(snapshot)
+                        && !KitPackedStackCapacityRepair.repairCheckpoint(snapshot))
                     || snapshot.variantRepair().cargoRawSlot() > 44
                     || !sha(snapshot.variantRepair().cargoHash())
                     || (snapshot.variantRepair().fingerprintVersion() != 0
@@ -501,12 +684,16 @@ public final class KitFulfillmentJournalStore {
                         && !sha(snapshot.variantRepair().resultShellHash()))
                     || (snapshot.variantRepair().auditedIncomingRawSlot() != 0
                         && (snapshot.variantRepair().auditedIncomingRawSlot() < 9
-                            || snapshot.variantRepair().auditedIncomingRawSlot() > 35
+                            || snapshot.variantRepair().auditedIncomingRawSlot() > 44
+                            || (snapshot.variantRepair().auditedIncomingRawSlot() > 35
+                                && !KitPackedStackCapacityRepair.repairCheckpoint(snapshot))
                             || snapshot.variantRepair().auditedIncomingRawSlot()
                                 == snapshot.variantRepair().cargoRawSlot()))
                     || (snapshot.variantRepair().displacedRawSlot() != -1
                         && (snapshot.variantRepair().displacedRawSlot() < 9
+                            || snapshot.variantRepair().displacedRawSlot() > 44
                             || snapshot.variantRepair().displacedRawSlot() > 35
+                                && !KitPackedStackCapacityRepair.repairCheckpoint(snapshot)
                             || !sha(snapshot.variantRepair().displacedHash())))))
                 || (snapshot.retainedShell() != null
                     && (snapshot.retainedShell().rawSlot() < 9
@@ -554,6 +741,63 @@ public final class KitFulfillmentJournalStore {
                 || snapshot.resumeNotBeforeEpochMilli() < 0) {
             throw new IOException("Kit fulfillment resume schedule is invalid");
         }
+    }
+
+    private static boolean validPinnedAppleBudgetRepair(Snapshot snapshot) {
+        VariantRepair repair = snapshot.variantRepair();
+        if (repair == null) return false;
+        boolean twoFullAppleStacks = snapshot.auditedCargoSlots().size() == 2;
+        for (Integer amount : snapshot.auditedCargoSlots().values()) {
+            if (amount == null || amount != 64) twoFullAppleStacks = false;
+        }
+        boolean beforePacking = snapshot.packedContents().getOrDefault(
+                "enchanted_golden_apple", 0) == 0
+                && repair.displacedRawSlot() == -1
+                && repair.resultShellHash() == null
+                && twoFullAppleStacks;
+        boolean afterPacking = snapshot.packedContents().getOrDefault(
+                "enchanted_golden_apple", 0) == 128
+                && snapshot.auditedCargoSlots().isEmpty()
+                && repair.displacedRawSlot() >= 9
+                && repair.resultShellHash() != null
+                && repair.outgoingHash().equals(repair.displacedHash())
+                && snapshot.kitWorksite() == null
+                && ("VARIANT_STAGING".equals(snapshot.state())
+                    || "BLOCKED".equals(snapshot.state()));
+        return (beforePacking || afterPacking) && repair.cargoRawSlot() == -1
+                && !repair.replacementOnly() && repair.fingerprintVersion() == 2
+                && "enchanted_golden_apple".equals(snapshot.currentItem())
+                && snapshot.currentQuantity() == 128
+                && snapshot.auditedCargoSlot() == -1
+                && snapshot.packedContents().getOrDefault("end_crystal", 0) == 256
+                && "end_crystal".equals(repair.itemId()) && repair.amount() == 10
+                && ((snapshot.sourceBoxesToReturn().size() == 1
+                        && repair.auditedIncomingRawSlot() == 0)
+                    || (snapshot.sourceBoxesToReturn().size() == 2
+                        && snapshot.borrowedSourceWorksite() == null
+                        && snapshot.sourceBoxesToReturn().get(0).contents().size() == 1
+                        && snapshot.sourceBoxesToReturn().get(0).contents()
+                            .getOrDefault("enchanted_golden_apple", 0) > 0
+                        && snapshot.sourceBoxesToReturn().get(1).sourcePosition() != null
+                        && snapshot.sourceBoxesToReturn().get(1).contents().size() == 1
+                        && snapshot.sourceBoxesToReturn().get(1).contents()
+                            .getOrDefault("end_crystal", 0) > 0
+                        && snapshot.sourceBoxesToReturn().get(1).contents()
+                            .get("end_crystal") <= 1718));
+    }
+
+    private static boolean sameBorrowedReturns(List<BorrowedBox> actual,
+                                               List<BorrowedBox> expected) {
+        if (actual == null || expected == null || actual.size() != expected.size()) return false;
+        for (int i = 0; i < actual.size(); i++) {
+            BorrowedBox a = actual.get(i);
+            BorrowedBox b = expected.get(i);
+            if (a == null || b == null || !java.util.Objects.equals(a.itemId(), b.itemId())
+                    || !java.util.Objects.equals(a.contents(), b.contents())
+                    || !java.util.Arrays.equals(a.sourcePosition(), b.sourcePosition())
+                    || !java.util.Arrays.equals(a.returnPosition(), b.returnPosition())) return false;
+        }
+        return true;
     }
 
     private static boolean validPosition(int[] position) {

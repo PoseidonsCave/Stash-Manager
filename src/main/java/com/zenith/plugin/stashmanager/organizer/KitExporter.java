@@ -45,11 +45,14 @@ public final class KitExporter {
     private final KitReturnTargetStability<StackIdentity> returnTargetStability =
             new KitReturnTargetStability<>();
     private State state = State.IDLE;
+    private long phaseStartedAtNanos;
     private int[] target;
     private Map<String, Integer> expectedContents = Map.of();
     private String expectedItemId;
     private ItemStack expectedLooseStack;
     private boolean requireImportCapacity;
+    private boolean requireEmptyTarget;
+    private boolean protectedLooseReturn;
     private boolean verifyExistingReturn;
     private boolean verifyFailedReturn;
     private int expectedReturnSlots;
@@ -111,16 +114,27 @@ public final class KitExporter {
     public boolean start(int[] exportPosition, Map<String, Integer> contents,
                          int ownedRawSlot, String expectedItemId, boolean requireImportCapacity,
                          int expectedReturnSlots) {
+        return start(exportPosition, contents, ownedRawSlot, expectedItemId,
+                requireImportCapacity, expectedReturnSlots, false);
+    }
+
+    /** A repacked working-stock box may enter only a live-verified empty staging chest. */
+    public boolean start(int[] exportPosition, Map<String, Integer> contents,
+                         int ownedRawSlot, String expectedItemId, boolean requireImportCapacity,
+                         int expectedReturnSlots, boolean requireEmptyTarget) {
         if (isActive() || exportPosition == null || exportPosition.length != 3
                 || contents == null || (contents.isEmpty() && ownedRawSlot < 0)
                 || !Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
                 || CACHE.getPlayerCache().getInventoryCache().getOpenContainerId() > 0
+                || (requireEmptyTarget && (!requireImportCapacity || expectedReturnSlots != 54))
                 || (requireImportCapacity && expectedReturnSlots != 27
                     && expectedReturnSlots != 54)) return false;
         this.expectedContents = Map.copyOf(contents);
         this.expectedItemId = expectedItemId;
         this.expectedLooseStack = null;
+        this.protectedLooseReturn = false;
         this.requireImportCapacity = requireImportCapacity;
+        this.requireEmptyTarget = requireEmptyTarget;
         this.verifyExistingReturn = false;
         this.verifyFailedReturn = false;
         this.expectedReturnSlots = expectedReturnSlots;
@@ -156,6 +170,18 @@ public final class KitExporter {
     /** Deposit one component-exact loose stack into a registered, live-verified import. */
     public boolean startLooseImport(int[] importPosition, ItemStack stack,
                                     int ownedRawSlot, int expectedSlots) {
+        return startLooseImport(importPosition, stack, ownedRawSlot, expectedSlots, false);
+    }
+
+    /** Return one pinned loose stack while other matching inventory stacks remain protected. */
+    public boolean startProtectedLooseReturn(int[] lanePosition, ItemStack stack,
+                                             int ownedRawSlot, int expectedSlots) {
+        return startLooseImport(lanePosition, stack, ownedRawSlot, expectedSlots, true);
+    }
+
+    private boolean startLooseImport(int[] importPosition, ItemStack stack,
+                                    int ownedRawSlot, int expectedSlots,
+                                    boolean protectedLooseReturn) {
         if (isActive() || importPosition == null || importPosition.length != 3
                 || stack == null || stack.getAmount() < 1 || stack.getAmount() > 64
                 || ownedRawSlot < 9 || ownedRawSlot > 44
@@ -170,14 +196,17 @@ public final class KitExporter {
         this.expectedContents = Map.of();
         this.expectedItemId = null;
         this.expectedLooseStack = stack;
+        this.protectedLooseReturn = protectedLooseReturn;
         this.requireImportCapacity = true;
+        this.requireEmptyTarget = false;
         this.verifyExistingReturn = false;
         this.verifyFailedReturn = false;
         this.expectedReturnSlots = expectedSlots;
         this.returnTargetBefore = List.of();
         this.returnTargetStability.reset();
         this.playerMatchingBefore = countMatchingPlayerBoxes();
-        if (playerMatchingBefore != stack.getAmount()) return false;
+        if (protectedLooseReturn ? playerMatchingBefore < stack.getAmount()
+                : playerMatchingBefore != stack.getAmount()) return false;
         this.ownedRawSlot = ownedRawSlot;
         this.target = importPosition.clone();
         this.failureReason = null;
@@ -211,7 +240,9 @@ public final class KitExporter {
         this.expectedContents = Map.copyOf(contents);
         this.expectedItemId = itemId;
         this.expectedLooseStack = null;
+        this.protectedLooseReturn = false;
         this.requireImportCapacity = true;
+        this.requireEmptyTarget = false;
         this.verifyExistingReturn = true;
         this.verifyFailedReturn = false;
         this.expectedReturnSlots = slots;
@@ -255,7 +286,9 @@ public final class KitExporter {
         this.expectedContents = Map.copyOf(contents);
         this.expectedItemId = itemId;
         this.expectedLooseStack = null;
+        this.protectedLooseReturn = false;
         this.requireImportCapacity = true;
+        this.requireEmptyTarget = false;
         this.verifyExistingReturn = false;
         this.verifyFailedReturn = true;
         this.expectedReturnSlots = slots;
@@ -380,7 +413,9 @@ public final class KitExporter {
                 // wait for a stable live window before judging the persisted transfer.
                 if (!postcloseTargetSettled(open, slots)) return;
                 if (!depositCountVerified(open, slots)
-                        || depositEvidence == null || depositEvidence.moved(open) <= 0) {
+                        || depositEvidence == null || (protectedLooseReturn
+                            ? depositEvidence.moved(open) != expectedLooseStack.getAmount()
+                            : depositEvidence.moved(open) <= 0)) {
                     emit("kit_export_postclose_mismatch", Map.of(
                             "target", targetString(),
                             "matching_before", chestMatchingBefore,
@@ -401,6 +436,9 @@ public final class KitExporter {
             }
             if (occupiedChestSlots(open, slots) >= slots) { fail("export_chest_full"); return; }
             if (requireImportCapacity && !returnTargetSettled(open, slots)) return;
+            if (requireEmptyTarget && occupiedChestSlots(open, slots) != 0) {
+                fail("working_repack_staging_not_empty"); return;
+            }
             chestMatchingBefore = matchingInChest(open, slots);
             advance(State.DEPOSITING);
             return;
@@ -434,7 +472,9 @@ public final class KitExporter {
         int slots = containerSlots(open);
         if (depositEvidence != null) {
             if (depositCountVerified(open, slots)
-                    && depositEvidence.moved(open) > 0) {
+                    && (protectedLooseReturn
+                        ? depositEvidence.moved(open) == expectedLooseStack.getAmount()
+                        : depositEvidence.moved(open) > 0)) {
                 advance(State.VERIFYING);
                 return;
             }
@@ -450,6 +490,18 @@ public final class KitExporter {
                 fail("export_chest_full"); return;
             }
             if (!returnTargetSettled(open, slots)) return;
+            if (requireEmptyTarget && occupiedChestSlots(open, slots) != 0) {
+                fail("working_repack_staging_not_empty"); return;
+            }
+        }
+        if (protectedLooseReturn) {
+            Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+            ItemStack live = player == null ? null : player.getItemStack(ownedRawSlot);
+            if (!sameVariant(live, expectedLooseStack)
+                    || live.getAmount() != expectedLooseStack.getAmount()
+                    || countMatchingPlayerBoxes() != playerMatchingBefore) {
+                fail("protected_return_source_changed"); return;
+            }
         }
         int sourceSlot = -1;
         for (int raw = 9; raw <= 44; raw++) {
@@ -489,6 +541,7 @@ public final class KitExporter {
                 || (requireImportCapacity && (slots != expectedReturnSlots
                     || !KitSourceReturnPolicy.hasLiveCapacity(
                         occupiedChestSlots(replacement, slots), slots)
+                    || (requireEmptyTarget && occupiedChestSlots(replacement, slots) != 0)
                     || !returnTargetBefore.equals(chestSnapshot(replacement, slots))))
                 || !atAccessPosition()) {
             fail("export_reopened_window_mismatch");
@@ -504,7 +557,9 @@ public final class KitExporter {
         Container open = liveOpen();
         if (open == null) { fail("export_verification_window_lost"); return; }
         if (!depositCountVerified(open, containerSlots(open))
-                || depositEvidence == null || depositEvidence.moved(open) <= 0) {
+                || depositEvidence == null || (protectedLooseReturn
+                    ? depositEvidence.moved(open) != expectedLooseStack.getAmount()
+                    : depositEvidence.moved(open) <= 0)) {
             fail("export_verification_mismatch");
             return;
         }
@@ -579,6 +634,11 @@ public final class KitExporter {
     }
 
     private void advance(State next) {
+        long now = System.nanoTime();
+        long elapsed = phaseStartedAtNanos == 0 || state == State.IDLE
+                ? 0 : (now - phaseStartedAtNanos) / 1_000_000;
+        phaseStartedAtNanos = now;
+        State previous = state;
         state = next;
         phaseTicks = 0;
         if (next == State.OPENING) {
@@ -591,7 +651,8 @@ public final class KitExporter {
             BARITONE.stop();
             closeClearTicks = 0;
         }
-        emit("kit_export_phase", Map.of("phase", next.name()));
+        emit("kit_export_phase", Map.of("phase", next.name(),
+                "previous_phase", previous.name(), "previous_phase_ms", elapsed));
     }
 
     /** Re-check the same live window over several ticks; never submit a click while

@@ -44,8 +44,33 @@ class KitLostSourceIndexPolicyTest {
         assertNull(KitLostSourceIndexPolicy.withoutLostBox(
                 duplicate, LOST, "target_boots", 1));
         var stale = entry(List.of(new ContainerEntry.ShulkerDetail(0, "unknown",
-                Map.of("target_boots", 2))));
+                Map.of("target_boots", 1))));
         assertNull(KitLostSourceIndexPolicy.withoutLostBox(
                 stale, LOST, "target_boots", 1));
+    }
+
+    @Test void unchangedLostBoxIsRemovedEvenWhenCurrentTaskHasChanged() {
+        var original = new ContainerEntry(5, 64, 6, "minecraft:chest", false,
+                Map.of("shulker_box", 2, "target_boots", 2, "target_sword", 25), 2,
+                List.of(new ContainerEntry.ShulkerDetail(0, "unknown",
+                                Map.of("target_boots", 2)),
+                        new ContainerEntry.ShulkerDetail(1, "unknown",
+                                Map.of("target_sword", 25))), 100L);
+        var adjusted = KitLostSourceIndexPolicy.withoutLostBox(
+                original, LOST, "target_sword", 1);
+        assertEquals(Map.of("shulker_box", 1, "target_sword", 25), adjusted.items());
+        assertEquals(1, adjusted.shulkerCount());
+        assertEquals(1, adjusted.shulkerDetails().getFirst().slot());
+    }
+
+    @Test void exactAndReconstructedMatchesRemainAmbiguous() {
+        var original = new ContainerEntry(5, 64, 6, "minecraft:chest", false,
+                Map.of("shulker_box", 2, "target_boots", 5), 2,
+                List.of(new ContainerEntry.ShulkerDetail(0, "unknown",
+                                Map.of("target_boots", 2)),
+                        new ContainerEntry.ShulkerDetail(1, "unknown",
+                                Map.of("target_boots", 3))), 100L);
+        assertNull(KitLostSourceIndexPolicy.withoutLostBox(
+                original, LOST, "target_boots", 1));
     }
 }

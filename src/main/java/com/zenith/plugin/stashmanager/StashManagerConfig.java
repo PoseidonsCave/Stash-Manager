@@ -58,6 +58,9 @@ public class StashManagerConfig {
     public int condenseMinItems = 1;
     // Opt-in: craft an empty box only when no usable packing box is available.
     public boolean craftShulkersEnabled = false;
+    // Additional storage classes pinned against future kit-lane retirement. The built-in
+    // protected families are always pinned; this list only adds site-specific exclusions.
+    public List<String> kitConsolidationPinnedClasses = new ArrayList<>();
     // Only these extra, explicitly assigned chests may supply crafting ingredients outside
     // the organizer's managed lanes/imports. They are not general import chests.
     public List<int[]> craftMaterialChests = new ArrayList<>();
@@ -80,6 +83,9 @@ public class StashManagerConfig {
     public boolean apiAllowRemoteHttp = false;
     // Detailed world/pose/debug commands can expose coordinates and inventories.
     public boolean diagnosticCommandsEnabled = false;
+    // Local, opt-in packet evidence for reconciling kit inventory clicks. Records numeric
+    // item IDs/counts and window slots only; never packet bodies, names, chat, or NBT.
+    public boolean kitInteractionTraceEnabled = false;
     // Webhook titles remain useful without sending stash coordinates, item details,
     // or exception text to a third-party channel by default.
     public boolean webhookIncludeDetailedPayload = false;

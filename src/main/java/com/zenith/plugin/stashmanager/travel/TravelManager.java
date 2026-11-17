@@ -25,6 +25,11 @@ public final class TravelManager {
         if (manager != null) manager.tick();
     }
 
+    public boolean hasActiveWork() {
+        TunnelManager manager = tunnelManager;
+        return manager != null && manager.hasActiveWork();
+    }
+
     public TunnelManager tunnelManager() { return getTunnelManager(); }
 
     private TunnelManager getTunnelManager() {

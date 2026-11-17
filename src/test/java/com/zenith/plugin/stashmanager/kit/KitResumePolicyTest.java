@@ -11,6 +11,59 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class KitResumePolicyTest {
+    @Test void committedBatchWithNoBorrowedSourceCanRetryPhysicalCompaction() {
+        var blocked = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "cpvp", "BLOCKED",
+                Map.of("obsidian", 128, "end_crystal", 256),
+                Map.of("obsidian", 128), 54, 22, "obsidian", 128,
+                40, new int[]{1, 130, 2}, null, null, null, Map.of(),
+                "kit_physical_slot_budget_exceeded", 1L, null, 0L, List.of());
+        assertTrue(KitResumePolicy.canRetryCompactedPhysicalBudget(blocked));
+        assertNull(KitResumePolicy.blocker(blocked, "NEED_CARGO"));
+        var source = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{3, 130, 4}, "shulker_box", Map.of("obsidian", 1600));
+        var pending = new KitFulfillmentJournalStore.Snapshot(
+                blocked.schemaVersion(), blocked.kitName(), blocked.state(),
+                blocked.recipe(), blocked.packedContents(), blocked.requestedBoxes(),
+                blocked.completedBoxes(), blocked.currentItem(), blocked.currentQuantity(),
+                blocked.ownedShellSlot(), blocked.exportPosition(), null, null, null,
+                Map.of(), blocked.blocker(), 2L, null, 0L, List.of(source));
+        assertFalse(KitResumePolicy.canRetryCompactedPhysicalBudget(pending));
+    }
+
+    @Test void interruptedUnopenedBorrowRequiresAuditBeforeOriginalReturn() {
+        var interrupted = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "cpvp", "BLOCKED",
+                Map.of("enchanted_golden_apple", 128), Map.of(), 54, 16,
+                "enchanted_golden_apple", 128, 40, new int[]{5, 131, 6},
+                null, null, null, Map.of(), "interrupted:bot_ticks_stopped",
+                100L, "WAIT_CARGO", 0L, List.of());
+        assertTrue(KitResumePolicy.canAuditUnopenedSourceReturn(interrupted));
+        assertEquals("uncertain_wait_cargo", KitResumePolicy.blocker(interrupted));
+        var afterRestart = new KitFulfillmentJournalStore.Snapshot(
+                interrupted.schemaVersion(), interrupted.kitName(), "BLOCKED",
+                interrupted.recipe(), interrupted.packedContents(),
+                interrupted.requestedBoxes(), interrupted.completedBoxes(),
+                interrupted.currentItem(), interrupted.currentQuantity(),
+                interrupted.ownedShellSlot(), interrupted.exportPosition(), null, null,
+                null, Map.of(), "uncertain_wait_cargo", 101L, "WAIT_CARGO", 0L,
+                List.of());
+        assertTrue(KitResumePolicy.canAuditUnopenedSourceReturn(afterRestart));
+        var origin = new int[]{1, 130, 2};
+        var box = new KitFulfillmentJournalStore.BorrowedBox(origin, "shulker_box",
+                Map.of("enchanted_golden_apple", 1344), origin);
+        var scheduled = new KitFulfillmentJournalStore.Snapshot(
+                interrupted.schemaVersion(), interrupted.kitName(), "BLOCKED",
+                interrupted.recipe(), interrupted.packedContents(),
+                interrupted.requestedBoxes(), interrupted.completedBoxes(),
+                interrupted.currentItem(), interrupted.currentQuantity(),
+                interrupted.ownedShellSlot(), interrupted.exportPosition(), null, null,
+                null, Map.of(), "resume_unopened_source_to_origin", 101L,
+                "RETURNING_SOURCE", 200L, List.of(box));
+        assertNull(KitResumePolicy.blocker(scheduled));
+        assertFalse(KitResumePolicy.canAuditUnopenedSourceReturn(scheduled));
+    }
+
     @Test void unconfirmedSourceDepositRequiresFullChestAuditBeforeReroute() {
         var source = new KitFulfillmentJournalStore.BorrowedBox(
                 new int[]{1, 130, 2}, "shulker_box",

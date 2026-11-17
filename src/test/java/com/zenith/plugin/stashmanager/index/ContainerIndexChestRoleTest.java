@@ -13,6 +13,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ContainerIndexChestRoleTest {
     @Test
+    void kitWorkingRoleReloadsAsOrganizerExcluded() {
+        FakeDatabase database = new FakeDatabase();
+        database.working.add(new int[]{8, 64, 8});
+        ContainerIndex index = new ContainerIndex();
+        index.setDatabase(database);
+        index.loadFromDatabase();
+
+        var chest = new ContainerEntry(8, 64, 8, "minecraft:chest", false,
+                java.util.Map.of(), 0, List.of(), 1);
+        assertTrue(index.isKitWorkingChest(chest));
+        assertTrue(index.isOrganizerExcluded(chest));
+        assertTrue(index.hasAnyRole(8, 64, 8));
+    }
+
+    @Test
     void protectedAndExportRolesPersistBothDoubleChestBlocks() throws Exception {
         FakeDatabase database = new FakeDatabase();
         ContainerIndex index = new ContainerIndex();
@@ -42,12 +57,14 @@ class ContainerIndexChestRoleTest {
     private static final class FakeDatabase extends DatabaseManager {
         private final List<int[]> blacklist = new ArrayList<>();
         private final List<int[]> exports = new ArrayList<>();
+        private final List<int[]> working = new ArrayList<>();
 
         @Override public boolean isInitialized() { return true; }
         @Override public List<ContainerEntry> getAllContainers() { return List.of(); }
         @Override public List<int[]> loadImportChests() { return List.of(); }
         @Override public List<int[]> loadBlacklistedChests() { return copies(blacklist); }
         @Override public List<int[]> loadExportChests() { return copies(exports); }
+        @Override public List<int[]> loadKitWorkingChests() { return copies(working); }
         @Override public void addBlacklistedChests(Collection<int[]> positions) { add(blacklist, positions); }
         @Override public void removeBlacklistedChests(Collection<int[]> positions) { remove(blacklist, positions); }
         @Override public void addExportChests(Collection<int[]> positions) { add(exports, positions); }

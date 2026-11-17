@@ -307,6 +307,11 @@ public final class KitWorksiteRecovery {
      * Reconcile only the known capacity-failure boundary after proving every owned
      * item and the now-empty worksite. No inventory click or world action occurs. */
     private boolean recoverAlreadyHeldPackedShell() {
+        if (recoverAlreadyHeldPackedStackPreflight()) return true;
+        if (recoverAlreadyHeldAppleBudgetVariant()) return true;
+        if (recoverAlreadyHeldCrystalReplacement()) return true;
+        if (recoverAlreadyHeldObsidianReplacement()) return true;
+        if (reconcileAlreadyHeldCompletedBatch()) return true;
         try {
             var latest = journal.load().orElse(null);
             if (latest == null || !"BLOCKED".equals(latest.state())
@@ -382,6 +387,399 @@ public final class KitWorksiteRecovery {
             emit("kit_already_held_recovery_rejected", Map.of("stage", "checkpoint_write"));
             return false;
         }
+    }
+
+    /** The variant packer opened the shell but rejected its live window before
+     * any exchange click. Reconcile the already-held, unchanged shell only after
+     * proving the exact source box and loose replacement stack are still held. */
+    private boolean recoverAlreadyHeldPackedStackPreflight() {
+        try {
+            var latest = journal.load().orElse(null);
+            if (latest == null || !Arrays.equals(latest.kitWorksite(), current.position())
+                    || !Proxy.getInstance().isConnected()
+                    || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                    || !near(current.position())) return false;
+            var inventory = CACHE.getPlayerCache().getInventoryCache();
+            var cursor = inventory.getMouseStack();
+            if (inventory.getOpenContainerId() > 0 || INVENTORY.hasActiveRequest()
+                    || cursor != null && cursor.getAmount() > 0) return false;
+            int[] site = current.position();
+            if (!World.isChunkLoadedBlockPos(site[0], site[2])
+                    || World.getChunkSection(site[0], site[1], site[2]) == null
+                    || !BlockCompat.isAir(World.getBlock(site[0], site[1], site[2])))
+                return false;
+            int shellSlot = KitFulfillmentCoordinator.uniqueOwnedShellSlot(latest);
+            var repaired = recoveredPackedStackPreflightSnapshot(latest, shellSlot);
+            if (repaired == null) return false;
+            journal.save(repaired);
+            snapshot = repaired;
+            emit("kit_packed_stack_preflight_shell_reconciled", Map.of(
+                    "item", repaired.currentItem(), "shell_slot", shellSlot,
+                    "incoming_slot", repaired.variantRepair().auditedIncomingRawSlot()));
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    private KitFulfillmentJournalStore.Snapshot recoveredPackedStackPreflightSnapshot(
+            KitFulfillmentJournalStore.Snapshot latest, int shellSlot) {
+        if (latest == null || !"BLOCKED".equals(latest.state())
+                || !"kit_variant_pack_failed:variant_exchange_live_preflight_mismatch"
+                        .equals(latest.blocker())
+                || latest.resumeState() != null || latest.kitWorksite() == null
+                || latest.borrowedSourceWorksite() != null
+                || latest.sourceBoxesToReturn().size() != 1
+                || !KitPackedStackCapacityRepair.repairCheckpoint(latest)
+                || shellSlot < 9 || shellSlot > 44) return null;
+        var repaired = new KitFulfillmentJournalStore.Snapshot(
+                latest.schemaVersion(), latest.kitName(), "BLOCKED", latest.recipe(),
+                latest.packedContents(), latest.requestedBoxes(), latest.completedBoxes(),
+                latest.currentItem(), latest.currentQuantity(), shellSlot,
+                latest.exportPosition(), null, null, latest.borrowedSourceItemId(),
+                latest.borrowedSourceContents(), "kit_variant_source_cargo_unverified",
+                System.currentTimeMillis(), null, 0, latest.sourceBoxesToReturn(),
+                latest.auditedCargoSlot(), latest.writtenOffSources(),
+                latest.auditedCargoSlots(), latest.incompleteBoxes(),
+                latest.missingTotals(), latest.currentBoxMissing(),
+                latest.displacedAppleSlots(), latest.retainedShell(),
+                latest.variantRepair(), latest.protectedLoose(), latest.heldBoxRebase());
+        return KitFulfillmentCoordinator.variantReadyBoundaryFailure(repaired) == null
+                && KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                        repaired.displacedAppleSlots()) ? repaired : null;
+    }
+
+    /** The server already packed the audited apples and picked up the exchanged shell,
+     * but the old validator refused its staging checkpoint. Reconstruct the exact
+     * pre-exchange physical fingerprint before scheduling the import. */
+    private boolean recoverAlreadyHeldAppleBudgetVariant() {
+        try {
+            var latest = journal.load().orElse(null);
+            boolean interrupted = latest != null && "BLOCKED".equals(latest.state())
+                    && "process_restarted".equals(latest.blocker())
+                    && "VARIANT_PACKING".equals(latest.resumeState());
+            if (latest == null || !("VARIANT_PACKING".equals(latest.state()) || interrupted)
+                    || latest.borrowedSourceWorksite() != null
+                    || latest.variantRepair() == null
+                    || latest.variantRepair().replacementOnly()
+                    || latest.variantRepair().displacedRawSlot() >= 9
+                    || latest.sourceBoxesToReturn().size() != 2
+                    || !Arrays.equals(latest.kitWorksite(), current.position())
+                    || !Proxy.getInstance().isConnected()
+                    || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                    || !near(current.position())) return false;
+            var inventory = CACHE.getPlayerCache().getInventoryCache();
+            var player = inventory.getPlayerInventory();
+            var cursor = inventory.getMouseStack();
+            if (player == null || inventory.getOpenContainerId() > 0
+                    || INVENTORY.hasActiveRequest()
+                    || cursor != null && cursor.getAmount() > 0) return false;
+            int[] site = current.position();
+            if (!World.isChunkLoadedBlockPos(site[0], site[2])
+                    || World.getChunkSection(site[0], site[1], site[2]) == null
+                    || !BlockCompat.isAir(World.getBlock(site[0], site[1], site[2]))
+                    || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            latest.displacedAppleSlots())) return false;
+            Map<Integer, ItemStack> observed = new LinkedHashMap<>();
+            for (int raw = 9; raw <= 44; raw++)
+                observed.put(raw, player.getItemStack(raw));
+            var proof = KitAppleBudgetVariantEvidence.prove(latest, observed);
+            if (proof == null || proof.shellSlot() != latest.ownedShellSlot()) return false;
+            Map<String, Integer> packed = new LinkedHashMap<>(latest.packedContents());
+            packed.put("enchanted_golden_apple", 128);
+            long now = System.currentTimeMillis();
+            var repair = latest.variantRepair().withResult(proof.displacedSlot(),
+                    latest.variantRepair().outgoingHash(), proof.resultShellHash());
+            var repaired = new KitFulfillmentJournalStore.Snapshot(
+                    latest.schemaVersion(), latest.kitName(), "BLOCKED", latest.recipe(),
+                    packed, latest.requestedBoxes(), latest.completedBoxes(),
+                    latest.currentItem(), latest.currentQuantity(), proof.shellSlot(),
+                    latest.exportPosition(), null, null, latest.borrowedSourceItemId(),
+                    latest.borrowedSourceContents(), "resume_variant_staging", now,
+                    "VARIANT_STAGING", now + 300_000L, latest.sourceBoxesToReturn(),
+                    -1, latest.writtenOffSources(), Map.of(), latest.incompleteBoxes(),
+                    latest.missingTotals(), latest.currentBoxMissing(),
+                    latest.displacedAppleSlots(), latest.retainedShell(), repair,
+                    latest.protectedLoose(), latest.heldBoxRebase());
+            if (KitResumePolicy.blocker(repaired) != null
+                    || !KitFulfillmentCoordinator.verifiedVariantStagingBoundary(repaired))
+                return false;
+            journal.save(repaired);
+            snapshot = repaired;
+            emit("kit_apple_budget_variant_reconciled", Map.of(
+                    "shell_slot", proof.shellSlot(),
+                    "displaced_slot", proof.displacedSlot(), "amount", repair.amount()));
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Reconcile the witnessed first crystal exchange after a pickup timeout.
+     * The physical shell and displaced stack reconstruct the exact pre-exchange
+     * fingerprint; no click or world move is replayed. */
+    private boolean recoverAlreadyHeldCrystalReplacement() {
+        try {
+            var latest = journal.load().orElse(null);
+            if (latest == null || !"BLOCKED".equals(latest.state())
+                    || !"kit_variant_pack_failed:packed_shell_pickup_timeout".equals(
+                            latest.blocker())
+                    || latest.resumeState() != null
+                    || latest.borrowedSourceWorksite() != null
+                    || latest.variantRepair() == null
+                    || !latest.variantRepair().replacementOnly()
+                    || latest.variantRepair().amount() != 18
+                    || latest.variantRepair().displacedRawSlot() >= 9
+                    || latest.sourceBoxesToReturn().size() != 2
+                    || !Arrays.equals(latest.kitWorksite(), current.position())
+                    || !Proxy.getInstance().isConnected()
+                    || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                    || !near(current.position())) return false;
+            var inventory = CACHE.getPlayerCache().getInventoryCache();
+            var player = inventory.getPlayerInventory();
+            var cursor = inventory.getMouseStack();
+            if (player == null || inventory.getOpenContainerId() > 0
+                    || INVENTORY.hasActiveRequest()
+                    || cursor != null && cursor.getAmount() > 0) return false;
+            int[] site = current.position();
+            if (!World.isChunkLoadedBlockPos(site[0], site[2])
+                    || World.getChunkSection(site[0], site[1], site[2]) == null
+                    || !BlockCompat.isAir(World.getBlock(site[0], site[1], site[2])))
+                return false;
+            int shellSlot = KitFulfillmentCoordinator.uniqueOwnedShellSlot(latest);
+            if (shellSlot != latest.ownedShellSlot()
+                    || KitFulfillmentCoordinator.uniqueCurrentLooseCargoSlot(latest)
+                            != latest.variantRepair().cargoRawSlot()
+                    || KitFulfillmentCoordinator.verifiedPendingSourceSlots(latest).size() != 2
+                    || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            latest.displacedAppleSlots())) return false;
+            ItemStack shell = player.getItemStack(shellSlot);
+            Map<Integer, ItemStack> live = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+            var next = KitCrystalNormalizationPlan.next(live);
+            var repair = latest.variantRepair();
+            if (next == null || next.number() != 2
+                    || next.outgoingSlot() != 23
+                    || !repair.sourceHash().equals(KitVariantFingerprint.variant(
+                            live.get(repair.outgoingSlot()), repair.fingerprintVersion())))
+                return false;
+            int displacedRaw = -1;
+            ItemStack displaced = null;
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack == null || stack.getAmount() != repair.amount()
+                        || !repair.itemId().equals(ItemIdentifier.getItemId(stack))
+                        || !repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                                stack, repair.fingerprintVersion()))) continue;
+                if (displacedRaw >= 0) return false;
+                displacedRaw = raw;
+                displaced = stack;
+            }
+            if (displacedRaw < 9 || displacedRaw > 35
+                    || displacedRaw == repair.cargoRawSlot()) return false;
+            Map<Integer, ItemStack> before = new LinkedHashMap<>(live);
+            before.put(repair.outgoingSlot(), displaced);
+            if (!repair.shellHash().equals(KitVariantFingerprint.shell(
+                    before, repair.fingerprintVersion()))) return false;
+            String resultHash = KitVariantFingerprint.shell(live,
+                    repair.fingerprintVersion());
+            if (resultHash == null) return false;
+            long now = System.currentTimeMillis();
+            var repaired = new KitFulfillmentJournalStore.Snapshot(
+                    latest.schemaVersion(), latest.kitName(), "BLOCKED", latest.recipe(),
+                    latest.packedContents(), latest.requestedBoxes(), latest.completedBoxes(),
+                    latest.currentItem(), latest.currentQuantity(), shellSlot,
+                    latest.exportPosition(), null, null, latest.borrowedSourceItemId(),
+                    latest.borrowedSourceContents(), "resume_variant_staging", now,
+                    "VARIANT_STAGING", now + 300_000L, latest.sourceBoxesToReturn(),
+                    latest.auditedCargoSlot(), latest.writtenOffSources(),
+                    latest.auditedCargoSlots(), latest.incompleteBoxes(),
+                    latest.missingTotals(), latest.currentBoxMissing(),
+                    latest.displacedAppleSlots(), latest.retainedShell(),
+                    repair.withResult(displacedRaw, repair.outgoingHash(), resultHash),
+                    latest.protectedLoose(), latest.heldBoxRebase());
+            journal.save(repaired);
+            snapshot = repaired;
+            emit("kit_crystal_replacement_reconciled", Map.of(
+                    "shell_slot", shellSlot, "displaced_slot", displacedRaw,
+                    "amount", repair.amount()));
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** The exchange was server-confirmed, but another inventory behavior moved
+     * the displaced packed stack to a hotbar slot before the packer staged it. */
+    private boolean recoverAlreadyHeldObsidianReplacement() {
+        try {
+            var latest = journal.load().orElse(null);
+            if (latest == null || !"kit_variant_packed_evidence_unverified".equals(
+                    latest.blocker())) return false;
+            if (!KitPackedStackCapacityRepair.repairCheckpoint(latest)
+                    || !"BLOCKED".equals(latest.state()) || latest.resumeState() != null
+                    || !Arrays.equals(latest.kitWorksite(), current.position()))
+                return rejectObsidianRecovery("checkpoint_boundary");
+            if (!Proxy.getInstance().isConnected()
+                    || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                    || !near(current.position()))
+                return rejectObsidianRecovery("bot_boundary");
+            var inventory = CACHE.getPlayerCache().getInventoryCache();
+            var player = inventory.getPlayerInventory();
+            var cursor = inventory.getMouseStack();
+            if (player == null || inventory.getOpenContainerId() > 0
+                    || INVENTORY.hasActiveRequest()
+                    || cursor != null && cursor.getAmount() > 0)
+                return rejectObsidianRecovery("inventory_not_quiet");
+            int[] site = current.position();
+            if (!World.isChunkLoadedBlockPos(site[0], site[2])
+                    || World.getChunkSection(site[0], site[1], site[2]) == null
+                    || !BlockCompat.isAir(World.getBlock(site[0], site[1], site[2])))
+                return rejectObsidianRecovery("worksite_not_clear");
+            if (KitFulfillmentCoordinator.uniqueOwnedShellSlot(latest)
+                        != latest.ownedShellSlot())
+                return rejectObsidianRecovery("owned_shell_not_unique");
+            if (KitFulfillmentCoordinator.variantPendingSourceSlots(latest).size()
+                        != 1)
+                return rejectObsidianRecovery("source_box_ledger_mismatch");
+            if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                    latest.displacedAppleSlots()))
+                return rejectObsidianRecovery("baseline_apples_changed");
+            ItemStack shell = player.getItemStack(latest.ownedShellSlot());
+            Map<Integer, ItemStack> observed = new LinkedHashMap<>();
+            for (int raw = 9; raw <= 44; raw++)
+                observed.put(raw, player.getItemStack(raw));
+            var shellSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+            var proof = KitPackedStackCapacityRepair.proveAlreadyPacked(latest,
+                    shellSlots, observed);
+            if (proof == null) return rejectObsidianRecovery(
+                    KitPackedStackCapacityRepair.explainAlreadyPacked(latest,
+                            shellSlots, observed));
+            var repair = latest.variantRepair();
+            long now = System.currentTimeMillis();
+            var repaired = new KitFulfillmentJournalStore.Snapshot(
+                    latest.schemaVersion(), latest.kitName(), "BLOCKED", latest.recipe(),
+                    latest.packedContents(), latest.requestedBoxes(), latest.completedBoxes(),
+                    latest.currentItem(), latest.currentQuantity(), latest.ownedShellSlot(),
+                    latest.exportPosition(), null, null, latest.borrowedSourceItemId(),
+                    latest.borrowedSourceContents(), "resume_variant_staging", now,
+                    "VARIANT_STAGING", now + 300_000L, latest.sourceBoxesToReturn(),
+                    latest.auditedCargoSlot(), latest.writtenOffSources(),
+                    latest.auditedCargoSlots(), latest.incompleteBoxes(),
+                    latest.missingTotals(), latest.currentBoxMissing(),
+                    latest.displacedAppleSlots(), latest.retainedShell(),
+                    repair.withResult(proof.displacedRawSlot(), repair.outgoingHash(),
+                            proof.resultShellHash()),
+                    latest.protectedLoose(), latest.heldBoxRebase());
+            if (KitResumePolicy.blocker(repaired) != null
+                    || !KitFulfillmentCoordinator.verifiedVariantStagingBoundary(repaired))
+                return rejectObsidianRecovery("staging_boundary");
+            journal.save(repaired);
+            snapshot = repaired;
+            emit("kit_packed_stack_replacement_reconciled", Map.of(
+                    "item", repair.itemId(),
+                    "shell_slot", latest.ownedShellSlot(),
+                    "displaced_slot", proof.displacedRawSlot(),
+                    "amount", repair.amount()));
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return rejectObsidianRecovery("checkpoint_read_or_write_failed");
+        }
+    }
+
+    private boolean rejectObsidianRecovery(String stage) {
+        org.slf4j.LoggerFactory.getLogger("Plugin.StashManager.KitRecovery")
+                .warn("Packed stack recovery rejected at guard: {}", stage);
+        emit("kit_packed_stack_recovery_rejected", Map.of("stage", stage));
+        return false;
+    }
+
+    /** A packer can pick up the completed box before its DONE checkpoint is written.
+     * Reconcile only a unique exact-content box and the independently retained empty
+     * shell while the recorded worksite is loaded and clear. No inventory click occurs. */
+    private boolean reconcileAlreadyHeldCompletedBatch() {
+        try {
+            var latest = journal.load().orElse(null);
+            if (!canReconcileAlreadyHeldCompletedBatch(latest, current.position())
+                    || !Proxy.getInstance().isConnected()
+                    || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                    || !near(current.position())) return false;
+            var inventory = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = inventory.getMouseStack();
+            Container player = inventory.getPlayerInventory();
+            if (player == null || inventory.getOpenContainerId() > 0
+                    || INVENTORY.hasActiveRequest()
+                    || cursor != null && cursor.getAmount() > 0) return false;
+            int[] site = current.position();
+            if (!World.isChunkLoadedBlockPos(site[0], site[2])
+                    || World.getChunkSection(site[0], site[1], site[2]) == null
+                    || World.getBlock(site[0], site[1], site[2])
+                            .name().contains("shulker_box")) return false;
+            Map<String, Integer> completed = new LinkedHashMap<>(latest.packedContents());
+            completed.merge(latest.currentItem(), latest.currentQuantity(), Integer::sum);
+            int shellSlot = uniqueOwnedShellSlot(completed);
+            if (shellSlot < 9 || looseCurrentItemCount(latest.currentItem()) != 0
+                    || inventoryShulkerCount() != 2
+                    || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            latest.displacedAppleSlots())) return false;
+            Map<Integer, ItemStack> live = new LinkedHashMap<>();
+            for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+            int retainedSlot = KitRetainedShell.uniqueSlot(
+                    latest.retainedShell(), live, shellSlot);
+            if (retainedSlot < 9) return false;
+            var retained = new KitFulfillmentJournalStore.RetainedShell(
+                    retainedSlot, latest.retainedShell().itemId(),
+                    latest.retainedShell().componentsHash());
+            var repaired = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, latest.kitName(), "BLOCKED",
+                    latest.recipe(), completed, latest.requestedBoxes(),
+                    latest.completedBoxes(), null, 0, shellSlot,
+                    latest.exportPosition(), null, null, null, Map.of(),
+                    "recovered_packed_batch_verified", System.currentTimeMillis(),
+                    null, 0, latest.sourceBoxesToReturn(), -1,
+                    latest.writtenOffSources(), Map.of(), latest.incompleteBoxes(),
+                    latest.missingTotals(), latest.currentBoxMissing(),
+                    latest.displacedAppleSlots(), retained, null);
+            if (!KitResumePolicy.canResumeRecoveredPackedBatch(repaired)) return false;
+            journal.save(repaired);
+            snapshot = repaired;
+            emit("kit_already_held_completed_batch_verified", Map.of(
+                    "item", latest.currentItem(), "quantity", latest.currentQuantity(),
+                    "owned_shell_slot", shellSlot));
+            return true;
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    static boolean canReconcileAlreadyHeldCompletedBatch(
+            KitFulfillmentJournalStore.Snapshot latest, int[] worksite) {
+        if (latest == null) return false;
+        boolean stillPacking = "PACKING".equals(latest.state())
+                && latest.blocker() == null && latest.resumeState() == null;
+        boolean restartScheduled = "BLOCKED".equals(latest.state())
+                && "process_restarted".equals(latest.blocker())
+                && "PACKING".equals(latest.resumeState());
+        if (!(stillPacking || restartScheduled)
+                || latest.currentItem() == null || latest.currentQuantity() <= 0
+                || latest.retainedShell() == null || latest.variantRepair() != null
+                || latest.borrowedSourceWorksite() != null
+                || !latest.sourceBoxesToReturn().isEmpty()
+                || latest.kitWorksite() == null || worksite == null
+                || !Arrays.equals(latest.kitWorksite(), worksite)) return false;
+        long completed = (long) latest.packedContents().getOrDefault(latest.currentItem(), 0)
+                + latest.currentQuantity();
+        if (completed > latest.recipe().getOrDefault(latest.currentItem(), 0)) return false;
+        for (var entry : latest.packedContents().entrySet()) {
+            if (entry.getValue() < 0
+                    || entry.getValue() > latest.recipe().getOrDefault(entry.getKey(), 0))
+                return false;
+        }
+        return true;
     }
 
     private static int uniqueOwnedShellSlot(Map<String, Integer> expectedContents) {
@@ -686,6 +1084,20 @@ public final class KitWorksiteRecovery {
                         != snapshot.auditedCargoSlot()
                     || KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot) < 0)) {
             return false;
+        }
+        if ("kit_box".equals(current.kind()) && !misplacedSourceAtKitWorksite
+                && "kit_variant_pack_failed:variant_exchange_live_preflight_mismatch"
+                        .equals(snapshot.blocker())) {
+            var repaired = recoveredPackedStackPreflightSnapshot(snapshot,
+                    recoveredOwnedBoxSlot());
+            if (repaired == null) return false;
+            try {
+                journal.save(repaired);
+                snapshot = repaired;
+                return true;
+            } catch (IOException e) {
+                return false;
+            }
         }
         if ("kit_box".equals(current.kind()) && !misplacedSourceAtKitWorksite
                 && snapshot.currentItem() != null && snapshot.currentQuantity() > 0

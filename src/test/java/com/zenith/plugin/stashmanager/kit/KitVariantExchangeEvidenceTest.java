@@ -70,6 +70,55 @@ class KitVariantExchangeEvidenceTest {
         assertNull(KitVariantExchangeEvidence.capture(plan, shell, changedShell, player, 13, 15));
     }
 
+    @Test
+    void inPlaceReplacementRequiresExactServerWindowAndRecoveredShell() {
+        var shell = shell();
+        shell.put(21, crystal(18, "C"));
+        shell.put(24, crystal(50, "A"));
+        var player = Map.of(13, crystal(18, "A"),
+                14, new ItemStack(ItemRegistry.REGISTRY.get("diamond_chestplate").id(), 1));
+        var plan = new KitVariantExchangePlan.Plan(21, crystal(18, "C"),
+                24, crystal(50, "A"), -1, crystal(18, "A"), 18, 64, 27);
+        var evidence = KitVariantExchangeEvidence.capture(plan, shell, shell,
+                player, 13, 15, true);
+        assertNotNull(evidence);
+        var removed = new HashMap<>(shell);
+        removed.remove(21);
+        var displaced = new HashMap<>(player);
+        displaced.put(15, crystal(18, "C"));
+        assertTrue(evidence.matchesAfterRemoval(removed, displaced));
+        removed.put(21, crystal(18, "A"));
+        displaced.remove(13);
+        assertTrue(evidence.matchesAfterAddition(removed, displaced));
+        assertTrue(evidence.matchesRecoveredShell(box(removed)));
+        assertFalse(evidence.matchesRecoveredShell(box(shell)));
+        var recoveredInOriginalSlot = Map.of(40, box(removed), 42, box(shell));
+        assertTrue(evidence.uniqueRecoveredSlot(recoveredInOriginalSlot) == 40);
+        assertTrue(evidence.uniqueRecoveredSlot(Map.of(40, box(removed),
+                41, box(removed))) == -1);
+    }
+
+    @Test
+    void twoStackCargoFitsOnlyAfterExactTwentySixSlotExchange() {
+        var shell = shell();
+        shell.remove(26);
+        var apple = new ItemStack(ItemRegistry.REGISTRY.get("enchanted_golden_apple").id(), 64);
+        var player = Map.of(9, apple, 11, apple, 13, crystal(15, "A"));
+        var plan = new KitVariantExchangePlan.Plan(24, crystal(15, "B"),
+                21, crystal(49, "A"), -1, crystal(15, "A"), 15, 64, 25);
+        var evidence = KitVariantExchangeEvidence.capture(plan, shell, shell,
+                player, 13, 15, false);
+        assertNotNull(evidence);
+        var after = new HashMap<>(shell);
+        after.remove(24);
+        after.put(21, crystal(64, "A"));
+        after.put(24, apple);
+        after.put(26, apple);
+        assertTrue(evidence.matchesRecoveredWithCargo(box(after), List.of(apple, apple)));
+        after.put(26, new ItemStack(apple.getId(), 63));
+        assertFalse(evidence.matchesRecoveredWithCargo(box(after), List.of(apple, apple)));
+    }
+
     private static KitVariantExchangePlan.Plan plan() {
         var shell = List.of(
                 new KitVariantExchangePlan.SlotStack(20, crystal(64, "A")),
