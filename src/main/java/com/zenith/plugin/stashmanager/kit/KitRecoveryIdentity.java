@@ -11,7 +11,44 @@ public final class KitRecoveryIdentity {
                                         Map<String, Integer> observed) {
         if (worldBlockId == null || expectedItemId == null || before == null || observed == null
                 || !worldBlockId.equalsIgnoreCase(expectedItemId)) return false;
-        return bounded(observed, before);
+        return bounded(observed, before) || unopenedSignedBookRoundTrip(before, observed);
+    }
+
+    /** A placed unopened box may reserialize signed books. Keep every other item exact. */
+    public static boolean unopenedSignedBookRoundTrip(Map<String, Integer> before,
+                                                       Map<String, Integer> observed) {
+        if (before == null || observed == null || before.isEmpty() || observed.isEmpty()) return false;
+        int beforeBooks = 0;
+        int observedBooks = 0;
+        for (var item : before.entrySet()) {
+            if (item.getKey() == null || item.getValue() == null || item.getValue() <= 0)
+                return false;
+            if (item.getKey().startsWith("written_book[book=")) {
+                beforeBooks += item.getValue();
+            } else if (!item.getValue().equals(observed.get(item.getKey()))) {
+                return false;
+            }
+        }
+        for (var item : observed.entrySet()) {
+            if (item.getKey() == null || item.getValue() == null || item.getValue() <= 0)
+                return false;
+            if (item.getKey().startsWith("written_book[book=")) {
+                observedBooks += item.getValue();
+            } else if (!item.getValue().equals(before.get(item.getKey()))) {
+                return false;
+            }
+        }
+        return beforeBooks > 0 && beforeBooks == observedBooks;
+    }
+
+    /** The dropped item may restore the original signed-book encoding. */
+    public static boolean recoveredSourceItemMatches(Map<String, Integer> before,
+                                                     Map<String, Integer> worldContents,
+                                                     Map<String, Integer> carriedContents) {
+        return worldContents != null && carriedContents != null
+                && (worldContents.equals(carriedContents)
+                    || unopenedSignedBookRoundTrip(before, worldContents)
+                        && before.equals(carriedContents));
     }
 
     /** A misplaced, already-retrieved source may only be recovered by exact identity. */

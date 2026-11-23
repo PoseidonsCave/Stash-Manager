@@ -161,6 +161,43 @@ class KitPackedStackCapacityRepairTest {
                 List.copyOf(shell.values()), recipe, packed));
     }
 
+    @Test void repairsTravelRocketVariantSplitAtNineteenOccupiedSlots() {
+        Map<Integer, ItemStack> shell = new HashMap<>();
+        for (int slot = 0; slot < 9; slot++)
+            shell.put(slot, stack("totem_of_undying", 1));
+        for (int slot = 9; slot < 16; slot++)
+            shell.put(slot, named("firework_rocket", 64, "A"));
+        shell.put(16, named("firework_rocket", 40, "A"));
+        shell.put(17, named("firework_rocket", 64, "B"));
+        shell.put(18, named("firework_rocket", 24, "B"));
+        Map<String, Integer> packed = Map.of("totem_of_undying", 9,
+                "firework_rocket", 576);
+        Map<String, Integer> recipe = Map.of("totem_of_undying", 9,
+                "firework_rocket", 576, "experience_bottle", 576);
+        var blocked = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                recipe, packed, 54, 6, "firework_rocket", 576, 40,
+                new int[]{1, 130, 2}, null, null, null, Map.of(),
+                "kit_physical_slot_budget_exceeded", 1L, null, 0L, List.of());
+        assertTrue(KitPackedStackCapacityRepair.blockedBoundary(blocked));
+        assertFalse(KitPhysicalSlotBudget.fitsAfterCompaction(shell.size(),
+                List.copyOf(shell.values()), recipe, packed));
+        var opportunity = KitPackedStackCapacityRepair.opportunity(shell,
+                "firework_rocket");
+        assertNotNull(opportunity);
+        assertEquals(18, opportunity.outgoingSlot());
+        assertEquals(16, opportunity.mergeTargetSlot());
+        assertEquals(24, opportunity.amount());
+        assertNull(opportunity.withLiveSource(0,
+                named("firework_rocket", 24, "B")));
+        ItemStack incoming = named("firework_rocket", 24, "A");
+        assertNotNull(opportunity.withLiveSource(0, incoming));
+        var after = new HashMap<>(shell);
+        after.put(18, incoming);
+        assertTrue(KitPhysicalSlotBudget.fitsAfterCompaction(after.size(),
+                List.copyOf(after.values()), recipe, packed));
+    }
+
     @Test void provesAlreadyExchangedShellWhenDisplacedStackMovedToHotbar()
             throws Exception {
         Map<Integer, ItemStack> before = new HashMap<>();

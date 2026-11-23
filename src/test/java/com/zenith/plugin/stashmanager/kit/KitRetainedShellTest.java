@@ -4,11 +4,16 @@ import com.zenith.mc.item.ItemRegistry;
 import net.kyori.adventure.text.Component;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponents;
+import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentType;
 import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes;
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -50,6 +55,62 @@ class KitRetainedShellTest {
         var tools = shell("Tools", false);
         assertNotEquals(ores.componentsHash(), KitRetainedShell.evidence(43, tools).componentsHash());
         assertEquals(-1, KitRetainedShell.uniqueSlot(ores, Map.of(43, tools), -1));
+    }
+
+    @Test
+    void rebindsOnlyAUniqueMovedEmptyShell() {
+        var empty = shell("Reserved", true);
+        var expected = KitRetainedShell.evidence(44, empty);
+        var moved = KitRetainedShellSlotRebind.rebindIfUnique(
+                expected, 44, Map.of(11, empty));
+        assertEquals(11, moved.rawSlot());
+        assertEquals(expected.componentsHash(), moved.componentsHash());
+        assertEquals(expected, KitRetainedShellSlotRebind.rebindIfUnique(
+                expected, 44, Map.of(11, empty, 12, shell("Reserved", false))));
+    }
+
+    @Test
+    void journaledRetainedSlotIsAdmittedOnlyWhenEveryIdenticalBoxIsPendingReturn() {
+        ItemStack empty = new ItemStack(ItemRegistry.REGISTRY.get("shulker_box").id(), 1);
+        ItemStack owned = filled("blue_shulker_box", "firework_rocket", 576);
+        ItemStack source = filled("white_shulker_box", "experience_bottle", 1152);
+        var retained = KitRetainedShell.evidence(44, empty);
+        var pending = List.of(
+                new KitFulfillmentJournalStore.BorrowedBox(
+                        new int[]{1, 70, 2}, "shulker_box", Map.of()),
+                new KitFulfillmentJournalStore.BorrowedBox(
+                        new int[]{1, 70, 2}, "white_shulker_box",
+                        Map.of("experience_bottle", 1152)));
+        Map<Integer, ItemStack> live = Map.of(36, empty, 40, owned,
+                42, source, 44, empty);
+        assertEquals(-1, KitRetainedShell.uniqueSlot(retained, live, 40));
+        assertEquals(44, KitRetainedShellSlotRebind.accountedSlot(retained, 40,
+                Map.of("firework_rocket", 576), pending, live));
+        assertEquals(-1, KitRetainedShellSlotRebind.accountedSlot(retained, 40,
+                Map.of("firework_rocket", 576), pending.subList(1, 2), live));
+        var extra = new HashMap<>(live);
+        extra.put(35, empty);
+        assertEquals(-1, KitRetainedShellSlotRebind.accountedSlot(retained, 40,
+                Map.of("firework_rocket", 576), pending, extra));
+        var changed = new HashMap<>(live);
+        changed.put(44, shell("Different", true));
+        assertEquals(-1, KitRetainedShellSlotRebind.accountedSlot(retained, 40,
+                Map.of("firework_rocket", 576), pending, changed));
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static ItemStack filled(String boxId, String itemId, int count) {
+        List<Optional<ItemStack>> slots = new ArrayList<>();
+        for (int i = 0; i < 27; i++) slots.add(Optional.empty());
+        for (int i = 0; count > 0; i++) {
+            int amount = Math.min(64, count);
+            slots.set(i, Optional.of(new ItemStack(
+                    ItemRegistry.REGISTRY.get(itemId).id(), amount)));
+            count -= amount;
+        }
+        var components = new DataComponents(new HashMap<>());
+        components.put((DataComponentType) DataComponentTypes.CONTAINER, slots);
+        return new ItemStack(ItemRegistry.REGISTRY.get(boxId).id(), 1, components);
     }
 
     private static ItemStack shell(String name, boolean nameFirst) {

@@ -163,7 +163,39 @@ public final class KitResumePolicy {
 
     /** No transfer was observed: retry retrieval only after live inventory confirms no loose cargo. */
     public static boolean canRetryNoCargoRetrieval(KitFulfillmentJournalStore.Snapshot checkpoint) {
-        return canRetryBorrowedInventoryCargo(checkpoint)
+        boolean failedBeforeBorrow = checkpoint != null
+                && "BLOCKED".equals(checkpoint.state())
+                && checkpoint.resumeState() == null
+                && "kit_cargo_retrieval_start_failed".equals(checkpoint.blocker())
+                && checkpoint.borrowedSourceWorksite() == null
+                && checkpoint.kitWorksite() == null
+                && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
+                && checkpoint.currentItem() != null && checkpoint.currentQuantity() > 0
+                && checkpoint.currentQuantity() <= remainingForCurrentItem(checkpoint)
+                && checkpoint.auditedCargoSlots().isEmpty()
+                && hasRemainingBox(checkpoint);
+        boolean interruptedBeforeTransfer = checkpoint != null
+                && "BLOCKED".equals(checkpoint.state())
+                && "uncertain_wait_cargo".equals(checkpoint.blocker())
+                && "WAIT_CARGO".equals(checkpoint.resumeState())
+                && checkpoint.resumeNotBeforeEpochMilli() == 0
+                && checkpoint.borrowedSourceWorksite() == null
+                && checkpoint.kitWorksite() == null
+                && checkpoint.borrowedSourceItemId() == null
+                && checkpoint.borrowedSourceContents().isEmpty()
+                && checkpoint.ownedShellSlot() >= 9
+                && checkpoint.ownedShellSlot() <= 44
+                && checkpoint.currentItem() != null
+                && checkpoint.currentQuantity() > 0
+                && checkpoint.currentQuantity() <= remainingForCurrentItem(checkpoint)
+                && checkpoint.retainedShell() == null
+                && checkpoint.protectedLoose() == null
+                && checkpoint.variantRepair() == null
+                && checkpoint.writtenOffSources().isEmpty()
+                && checkpoint.auditedCargoSlots().isEmpty()
+                && hasRemainingBox(checkpoint);
+        return (canRetryBorrowedInventoryCargo(checkpoint) || failedBeforeBorrow
+                || interruptedBeforeTransfer)
                 && checkpoint.sourceBoxesToReturn().isEmpty()
                 && checkpoint.auditedCargoSlot() < 0;
     }
@@ -172,9 +204,25 @@ public final class KitResumePolicy {
      * exact live-slot declaration before treating that stock as non-cargo. */
     public static boolean canAuditKeptNoCargoRetrieval(
             KitFulfillmentJournalStore.Snapshot checkpoint) {
-        return canRetryNoCargoRetrieval(checkpoint)
-                && "kit_cargo_retrieval_incomplete".equals(checkpoint.blocker())
+        boolean incomplete = canRetryNoCargoRetrieval(checkpoint)
+                && "kit_cargo_retrieval_incomplete".equals(checkpoint.blocker());
+        boolean stoppedDuringRetrieval = checkpoint != null
+                && "BLOCKED".equals(checkpoint.state())
+                && "interrupted:manual_stop".equals(checkpoint.blocker())
+                && "WAIT_CARGO".equals(checkpoint.resumeState())
+                && checkpoint.resumeNotBeforeEpochMilli() == 0
+                && checkpoint.kitWorksite() == null
+                && checkpoint.borrowedSourceWorksite() == null
+                && checkpoint.sourceBoxesToReturn().isEmpty()
+                && checkpoint.ownedShellSlot() >= 9
+                && checkpoint.ownedShellSlot() <= 44
+                && checkpoint.currentItem() != null
+                && checkpoint.currentQuantity() > 0
+                && checkpoint.currentQuantity() <= remainingForCurrentItem(checkpoint)
+                && hasRemainingBox(checkpoint);
+        return (incomplete || stoppedDuringRetrieval)
                 && checkpoint.writtenOffSources().isEmpty()
+                && checkpoint.auditedCargoSlot() < 0
                 && checkpoint.auditedCargoSlots().isEmpty();
     }
 
@@ -214,7 +262,8 @@ public final class KitResumePolicy {
     public static boolean canRetryAuditedMultiSourcePreflight(
             KitFulfillmentJournalStore.Snapshot checkpoint) {
         if (checkpoint == null || !"BLOCKED".equals(checkpoint.state())
-                || !"borrowed_source_return_ambiguous".equals(checkpoint.blocker())
+                || !("borrowed_source_return_ambiguous".equals(checkpoint.blocker())
+                    || "borrowed_source_return_unverified".equals(checkpoint.blocker()))
                 || !"WAIT_CARGO".equals(checkpoint.resumeState())
                 || checkpoint.resumeNotBeforeEpochMilli() != 0
                 || checkpoint.kitWorksite() != null
@@ -272,7 +321,15 @@ public final class KitResumePolicy {
     public static boolean canAuditChangedBaselineCargo(
             KitFulfillmentJournalStore.Snapshot checkpoint) {
         return checkpoint != null && "BLOCKED".equals(checkpoint.state())
-                && "kit_preexisting_inventory_changed".equals(checkpoint.blocker())
+                && ("kit_preexisting_inventory_changed".equals(checkpoint.blocker())
+                    || "kit_packer_start_failed".equals(checkpoint.blocker())
+                        && checkpoint.currentItem() != null
+                        && checkpoint.packedContents().getOrDefault(
+                                checkpoint.currentItem(), 0) == 0
+                    || "kit_retained_shell_identity_ambiguous".equals(checkpoint.blocker())
+                        && checkpoint.retainedShell() != null
+                        && checkpoint.sourceBoxesToReturn() != null
+                        && checkpoint.sourceBoxesToReturn().size() >= 2)
                 && checkpoint.resumeState() == null
                 && checkpoint.borrowedSourceWorksite() == null
                 && checkpoint.kitWorksite() == null
@@ -417,9 +474,16 @@ public final class KitResumePolicy {
 
     /** The exporter rejected the target window before submitting a return click. */
     public static boolean canRerouteSourceReturn(KitFulfillmentJournalStore.Snapshot checkpoint) {
-        return checkpoint != null && "BLOCKED".equals(checkpoint.state())
-                && checkpoint.resumeState() == null
+        if (checkpoint == null || !"BLOCKED".equals(checkpoint.state())) return false;
+        boolean multiSourceAdmissionRetry = "RETURNING_SOURCE".equals(checkpoint.resumeState())
+                && checkpoint.blocker() != null
+                && checkpoint.blocker().startsWith("unexpected_inventory_slots:")
+                && checkpoint.sourceBoxesToReturn() != null
+                && checkpoint.sourceBoxesToReturn().size() > 1;
+        return (multiSourceAdmissionRetry || checkpoint.resumeState() == null
                 && ("kit_source_return_failed:export_chest_full".equals(checkpoint.blocker())
+                    || "kit_owned_shell_missing_before_source_return"
+                        .equals(checkpoint.blocker())
                     || "kit_source_return_no_empty_import".equals(checkpoint.blocker())
                     || "kit_source_return_no_capacity_import".equals(checkpoint.blocker())
                     || "kit_source_return_failed:export_target_footprint_changed"
@@ -435,7 +499,9 @@ public final class KitResumePolicy {
                     // Older exporter versions used this reason even before any click.
                     // The caller must verify the unique borrowed box is still in inventory.
                     || "kit_source_return_failed:export_window_lost"
-                        .equals(checkpoint.blocker()))
+                        .equals(checkpoint.blocker())
+                    || "kit_source_return_identity_unverified"
+                        .equals(checkpoint.blocker())))
                 && checkpoint.borrowedSourceWorksite() == null
                 && checkpoint.kitWorksite() == null
                 && checkpoint.ownedShellSlot() >= 9
@@ -467,21 +533,28 @@ public final class KitResumePolicy {
      * replaying the source-box deposit. */
     public static boolean canAuditCompletedSourceReturn(
             KitFulfillmentJournalStore.Snapshot checkpoint) {
+        boolean sameContentReturnInterrupted = checkpoint != null
+                && "kit_owned_shell_missing_before_source_return".equals(checkpoint.blocker())
+                && checkpoint.currentItem() == null && checkpoint.currentQuantity() == 0
+                && checkpoint.sourceBoxesToReturn() != null
+                && checkpoint.sourceBoxesToReturn().size() == 1
+                && checkpoint.packedContents().equals(
+                        checkpoint.sourceBoxesToReturn().getFirst().contents());
         return checkpoint != null && "BLOCKED".equals(checkpoint.state())
                 && checkpoint.resumeState() == null
-                && "kit_source_return_failed:export_postclose_verification_mismatch"
-                        .equals(checkpoint.blocker())
+                && ("kit_source_return_failed:export_postclose_verification_mismatch"
+                        .equals(checkpoint.blocker()) || sameContentReturnInterrupted)
                 && checkpoint.borrowedSourceWorksite() == null
                 && checkpoint.kitWorksite() == null
                 && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
                 && checkpoint.sourceBoxesToReturn() != null
                 && checkpoint.sourceBoxesToReturn().size() == 1
                 && checkpoint.sourceBoxesToReturn().getFirst().returnPosition() != null
-                && checkpoint.currentItem() != null
-                && checkpoint.currentQuantity() > 0
-                && checkpoint.packedContents().getOrDefault(checkpoint.currentItem(), 0)
-                    .intValue() == checkpoint.recipe().getOrDefault(checkpoint.currentItem(), -1)
-                    .intValue()
+                && (sameContentReturnInterrupted || checkpoint.currentItem() != null
+                    && checkpoint.currentQuantity() > 0
+                    && checkpoint.packedContents().getOrDefault(checkpoint.currentItem(), 0)
+                        .intValue() == checkpoint.recipe().getOrDefault(checkpoint.currentItem(), -1)
+                        .intValue())
                 && hasRemainingBox(checkpoint);
     }
 
@@ -579,7 +652,8 @@ public final class KitResumePolicy {
                     ? null : "uncertain_wait_cargo";
             case "RETURNING_SOURCE" -> ("resume_source_return".equals(checkpoint.blocker())
                     || "resume_source_return_exact_import".equals(checkpoint.blocker())
-                    || "resume_unopened_source_to_origin".equals(checkpoint.blocker()))
+                    || "resume_unopened_source_to_origin".equals(checkpoint.blocker())
+                    || KitSameContentReturnAudit.parse(checkpoint.blocker()) != null)
                     && checkpoint.ownedShellSlot() >= 9 && checkpoint.ownedShellSlot() <= 44
                     && checkpoint.sourceBoxesToReturn() != null
                     && !checkpoint.sourceBoxesToReturn().isEmpty()

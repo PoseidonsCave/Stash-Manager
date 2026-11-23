@@ -109,8 +109,8 @@ public final class KitPacker {
     private int[] lastPickupTarget;
     private Set<Integer> itemEntitiesBeforeBreak = Set.of();
     private int preplaceReplans;
-    private int matchingBoxCountBefore;
     private Set<Integer> matchingBoxSlotsBefore = Set.of();
+    private boolean pickupBaselineReady;
     private int pickupCandidateSlot = -1;
     private int pickupCandidateTicks;
     private boolean savedSneak;
@@ -383,8 +383,10 @@ public final class KitPacker {
         this.recoveredSlot = -1;
         this.shellItem = ItemRegistry.REGISTRY.get(player.getItemStack(foundShellSlot).getId());
         if (shellItem == null) return rejectStart("shell_item_unregistered");
-        this.matchingBoxCountBefore = countMatchingBoxes(after);
-        this.matchingBoxSlotsBefore = matchingBoxSlots(after);
+        // Capture matching carried boxes only after shell selection has completed.
+        // MoveToHotbarSlot may swap a matching borrowed source into this slot.
+        this.matchingBoxSlotsBefore = Set.of();
+        this.pickupBaselineReady = false;
         this.pickupCandidateSlot = -1;
         this.pickupCandidateTicks = 0;
         this.openContainerId = -1;
@@ -556,6 +558,11 @@ public final class KitPacker {
             }
             return;
         }
+        // The hotbar selection can swap an already-matching borrowed source
+        // into the shell's former raw slot. Capture the pickup baseline after
+        // that swap so the source cannot be credited as the packed kit shell.
+        matchingBoxSlotsBefore = matchingBoxSlots(expectedAfter);
+        pickupBaselineReady = true;
         setSneak(true);
         advance(State.PLACING);
     }
@@ -1050,11 +1057,10 @@ public final class KitPacker {
     }
 
     private void tickPickup() {
+        if (!pickupBaselineReady) { fail("packed_shell_pickup_baseline_missing"); return; }
         var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
         ItemStack cursor = inventoryCache.getMouseStack();
         Set<Integer> matching = matchingBoxSlots(expectedAfter);
-        Set<Integer> newlyMatching = new HashSet<>(matching);
-        newlyMatching.removeAll(matchingBoxSlotsBefore);
         boolean settled = inventoryCache.getOpenContainerId() == 0
                 && (cursor == null || cursor.getAmount() <= 0)
                 && !isShulkerAtWorksite();
@@ -1066,9 +1072,8 @@ public final class KitPacker {
             Map<Integer, ItemStack> held = new HashMap<>();
             for (int raw = 9; raw <= 44; raw++) held.put(raw, playerStack(raw));
             candidate = variantEvidence.uniqueRecoveredSlot(held);
-        } else if (settled && matching.size() == matchingBoxCountBefore + 1
-                && newlyMatching.size() == 1) {
-            candidate = newlyMatching.iterator().next();
+        } else if (settled) {
+            candidate = uniqueNewMatchingSlot(matchingBoxSlotsBefore, matching);
         }
         if (candidate >= 0) {
             if (candidate != pickupCandidateSlot) {
@@ -1425,13 +1430,11 @@ public final class KitPacker {
         return -1;
     }
 
-    private static int countMatchingBoxes(Map<String, Integer> contents) {
-        int count = 0;
-        for (int raw = 9; raw <= 44; raw++) {
-            ItemStack stack = playerStack(raw);
-            if (isShulker(stack) && ItemIdentifier.readShulkerContents(stack).equals(contents)) count++;
-        }
-        return count;
+    static int uniqueNewMatchingSlot(Set<Integer> before, Set<Integer> after) {
+        if (before == null || after == null || after.size() != before.size() + 1
+                || !after.containsAll(before)) return -1;
+        for (int raw : after) if (!before.contains(raw)) return raw;
+        return -1;
     }
 
     private static Set<Integer> matchingBoxSlots(Map<String, Integer> contents) {

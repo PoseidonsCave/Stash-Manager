@@ -6,8 +6,21 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class KitBorrowedSourceTest {
+    @Test
+    void kitSkipsMixedSignedBookSourceForOtherCargo() {
+        assertFalse(StashRetriever.kitSourceWithoutSignedBooks(
+                Map.of("firework_rocket", 960, "written_book[book=one]", 1),
+                Map.of("firework_rocket", 576)));
+        assertTrue(StashRetriever.kitSourceWithoutSignedBooks(
+                Map.of("firework_rocket", 960), Map.of("firework_rocket", 576)));
+        assertTrue(StashRetriever.kitSourceWithoutSignedBooks(
+                Map.of("written_book[book=one]", 1),
+                Map.of("written_book[book=one]", 1)));
+    }
     @Test
     void recordsOnlyTheAmountTakenFromEachSourceBox() {
         assertEquals(Map.of("respawn_anchor", 16, "obsidian", 64),

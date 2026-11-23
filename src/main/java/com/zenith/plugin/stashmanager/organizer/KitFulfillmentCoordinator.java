@@ -23,7 +23,9 @@ import com.zenith.plugin.stashmanager.kit.KitFulfillmentJournalStore;
 import com.zenith.plugin.stashmanager.kit.KitProvenanceJournal;
 import com.zenith.plugin.stashmanager.kit.KitResumePolicy;
 import com.zenith.plugin.stashmanager.kit.KitRetainedShell;
+import com.zenith.plugin.stashmanager.kit.KitRetainedShellSlotRebind;
 import com.zenith.plugin.stashmanager.kit.KitShulkerLedger;
+import com.zenith.plugin.stashmanager.kit.KitSameContentReturnAudit;
 import com.zenith.plugin.stashmanager.kit.KitSourceReturnPolicy;
 import com.zenith.plugin.stashmanager.kit.KitVariantExchangePlan;
 import com.zenith.plugin.stashmanager.kit.KitCrystalNormalizationPlan;
@@ -255,7 +257,9 @@ public final class KitFulfillmentCoordinator {
         boolean originalUnopenedReturn = "resume_unopened_source_to_origin"
                 .equals(snapshot.blocker());
         boolean returningSource = "resume_source_return".equals(snapshot.blocker())
-                || originalUnopenedReturn;
+                || originalUnopenedReturn
+                || KitSameContentReturnAudit.parse(snapshot.blocker()) != null;
+        var pinnedSourceReturn = KitSameContentReturnAudit.parse(snapshot.blocker());
         boolean exactCapacityImportReturn = "resume_source_return_exact_import"
                 .equals(snapshot.blocker());
         boolean verifyCompletedReturn = "resume_audit_completed_source_return"
@@ -296,6 +300,18 @@ public final class KitFulfillmentCoordinator {
                 ? uniqueBorrowedInventorySourceSlot(snapshot) : -1;
         if (borrowedInventorySource && inventorySourceSlot < 0) return false;
         if (returningSource && uniqueSourceReturnSlot(snapshot) < 0) return false;
+        if (pinnedSourceReturn != null) {
+            if (snapshot.sourceBoxesToReturn().size() != 1
+                    || snapshot.ownedShellSlot() != pinnedSourceReturn.ownedRaw()
+                    || uniqueSourceReturnSlot(snapshot) != pinnedSourceReturn.sourceRaw())
+                return false;
+            var source = snapshot.sourceBoxesToReturn().getFirst();
+            var identity = new KitShulkerLedger.Identity(source.itemId(), source.contents());
+            if (!snapshot.packedContents().equals(source.contents())) return false;
+            var boxes = inventoryShulkerSlots();
+            if (!KitSameContentReturnAudit.beforeDeposit(pinnedSourceReturn, boxes,
+                    identity, inventoryShulkerFingerprints(boxes))) return false;
+        }
         if (originalUnopenedReturn && (snapshot.sourceBoxesToReturn().size() != 1
                 || snapshot.sourceBoxesToReturn().getFirst().sourcePosition() == null
                 || !java.util.Arrays.equals(
@@ -398,7 +414,7 @@ public final class KitFulfillmentCoordinator {
         this.recoverySourceAfter = null;
         this.hotbarEvacuation = null;
         this.kitWorksite = null;
-        this.blocker = null;
+        this.blocker = pinnedSourceReturn == null ? null : snapshot.blocker();
         this.retrievalRequest = null;
         this.retrievalSucceeded = auditedCargo || variantReady ? Boolean.TRUE : null;
         this.retrievalSettleTicks = 0;
@@ -766,15 +782,20 @@ public final class KitFulfillmentCoordinator {
                 || snapshot.sourceBoxesToReturn().isEmpty()) return -1;
         Container player = playerInventory();
         if (player == null) return -1;
+        int retained = snapshot.retainedShell() == null ? -1
+                : uniqueRetainedShellSlot(snapshot);
+        if (snapshot.retainedShell() != null && retained < 9) return -1;
         var source = snapshot.sourceBoxesToReturn().getFirst();
         int found = -1;
         for (int raw = 9; raw <= 44; raw++) {
-            if (raw == snapshot.ownedShellSlot()) continue;
+            if (raw == snapshot.ownedShellSlot() || raw == retained) continue;
             ItemStack stack = player.getItemStack(raw);
             if (!isShulker(stack) || stack.getAmount() != 1
                     || !source.itemId().equals(ItemIdentifier.getItemId(stack))
                     || !source.contents().equals(ItemIdentifier.readShulkerContents(stack))) continue;
-            if (found >= 0) return -1;
+            if (found >= 0) return accountedDuplicateSourceSlot(
+                    snapshot.sourceBoxesToReturn(), snapshot.ownedShellSlot(), retained,
+                    snapshot.packedContents(), source);
             found = raw;
         }
         return found;
@@ -793,8 +814,15 @@ public final class KitFulfillmentCoordinator {
             if (source == null || source.itemId() == null || source.contents() == null) return false;
             pending.add(new KitShulkerLedger.Identity(source.itemId(), source.contents()));
         }
-        return KitShulkerLedger.matchesPendingReturns(
-                inventoryShulkerIdentities(), shell, pending);
+        Map<Integer, KitShulkerLedger.Identity> slots =
+                new HashMap<>(inventoryShulkerSlots());
+        if (snapshot.retainedShell() != null) {
+            int retained = uniqueRetainedShellSlot(snapshot);
+            if (retained < 9 || retained == shellSlot || slots.remove(retained) == null)
+                return false;
+        }
+        return KitShulkerLedger.pendingReturnSlots(slots, shellSlot, shell, pending)
+                .size() == pending.size();
     }
 
     /** Return only source slots proven by the complete live shulker multiset. */
@@ -803,8 +831,14 @@ public final class KitFulfillmentCoordinator {
         if (snapshot == null || snapshot.sourceBoxesToReturn() == null
                 || snapshot.sourceBoxesToReturn().isEmpty()) return Set.of();
         int shellSlot = uniqueOwnedShellSlot(snapshot);
-        Map<Integer, KitShulkerLedger.Identity> slots = inventoryShulkerSlots();
+        Map<Integer, KitShulkerLedger.Identity> slots =
+                new HashMap<>(inventoryShulkerSlots());
         KitShulkerLedger.Identity shell = slots.get(shellSlot);
+        if (snapshot.retainedShell() != null) {
+            int retained = uniqueRetainedShellSlot(snapshot);
+            if (retained < 9 || retained == shellSlot || slots.remove(retained) == null)
+                return Set.of();
+        }
         List<KitShulkerLedger.Identity> pending = new ArrayList<>();
         for (var source : snapshot.sourceBoxesToReturn()) {
             if (source == null || source.itemId() == null || source.contents() == null)
@@ -1568,7 +1602,8 @@ public final class KitFulfillmentCoordinator {
         if (!admitInventory(Set.of())) return;
         if (!hotbarSlotsReady()) { block("kit_hotbar_slots_unavailable"); return; }
         if (retainedShell != null) {
-            int reservedSlot = uniqueRetainedShellSlot(retainedShell, -1);
+            int reservedSlot = uniqueRetainedShellSlot(retainedShell, -1,
+                    sourceBoxesToReturn, packedContents);
             if (reservedSlot < 0) { block("kit_retained_shell_identity_ambiguous"); return; }
             var consumed = retainedShell;
             ownedShellSlot = reservedSlot;
@@ -1792,7 +1827,8 @@ public final class KitFulfillmentCoordinator {
         Set<Integer> admitted = new HashSet<>(ownedSlots);
         admitted.addAll(displacedAppleSlots.keySet());
         if (retainedShell != null) {
-            int reservedSlot = uniqueRetainedShellSlot(retainedShell, ownedShellSlot);
+            int reservedSlot = uniqueRetainedShellSlot(retainedShell, ownedShellSlot,
+                    sourceBoxesToReturn, packedContents);
             if (reservedSlot < 0) {
                 block("kit_retained_shell_identity_ambiguous");
                 return false;
@@ -2037,17 +2073,26 @@ public final class KitFulfillmentCoordinator {
             }
         }
         if (!baselineStillPresent()) { block("kit_preexisting_inventory_changed"); return; }
-        for (KitShulkerLedger.Identity source : recoveredShulkersDuringCurrentRetrieval.keySet()) {
-            if (source.contents().equals(packedContents)) {
-                block("kit_owned_shell_identity_ambiguous"); return;
-            }
-        }
-        KitShulkerLedger.Identity recovered = sourceRecoveredDuringCurrentRetrieval
-                ? new KitShulkerLedger.Identity(recoveredSourceItemId, recoveredSourceContents)
-                : null;
-        int verifiedShellSlot = KitShulkerLedger.ownedSlot(inventoryShulkerSlots(),
-                ownedShellSlot, packedContents, recovered);
+        int verifiedShellSlot = recoveredShulkersDuringCurrentRetrieval.isEmpty()
+                ? KitShulkerLedger.ownedSlot(inventoryShulkerSlots(),
+                        ownedShellSlot, packedContents, null)
+                : KitShulkerLedger.ownedSlotAfterRetrieval(inventoryShulkerSlots(),
+                        packedContents, recoveredShulkersDuringCurrentRetrieval);
+        verifiedShellSlot = recoverInterchangeableShell(verifiedShellSlot);
         if (verifiedShellSlot < 0) { block("kit_owned_shell_identity_ambiguous"); return; }
+        int oldRetainedSlot = retainedShell == null ? -1 : retainedShell.rawSlot();
+        if (retainedShell != null) {
+            retainedShell = KitRetainedShellSlotRebind.rebindIfUnique(
+                    retainedShell, verifiedShellSlot);
+            int verifiedRetainedSlot = uniqueRetainedShellSlot(retainedShell,
+                    verifiedShellSlot, sourceBoxesToReturn, packedContents);
+            if (verifiedRetainedSlot < 0) {
+                block("kit_retained_shell_identity_ambiguous"); return;
+            }
+            retainedShell = new KitFulfillmentJournalStore.RetainedShell(
+                    verifiedRetainedSlot, retainedShell.itemId(),
+                    retainedShell.componentsHash());
+        }
         ownedShellSlot = verifiedShellSlot;
         if (heldBoxRebase != null) {
             Container player = playerInventory();
@@ -2095,7 +2140,24 @@ public final class KitFulfillmentCoordinator {
         if (!persist()) {
             packer.cancelBeforeWorldAction();
             block("kit_checkpoint_write_failed");
+        } else if (retainedShell != null && oldRetainedSlot != retainedShell.rawSlot()) {
+            emit("kit_retained_shell_rebound", Map.of(
+                    "from_slot", oldRetainedSlot, "to_slot", retainedShell.rawSlot()));
         }
+    }
+
+    private int recoverInterchangeableShell(int candidate) {
+        if (candidate >= 0 || recoveredShulkersDuringCurrentRetrieval.isEmpty())
+            return candidate;
+        Map<Integer, KitShulkerLedger.Identity> observed = inventoryShulkerSlots();
+        int recovered = KitShulkerLedger.interchangeableOwnedSlotAfterRetrieval(
+                observed, ownedShellSlot, packedContents, auditedShulkers,
+                recoveredShulkersDuringCurrentRetrieval,
+                inventoryShulkerFingerprints(observed));
+        if (recovered >= 0) emit("kit_interchangeable_shell_recovered", Map.of(
+                "shell_slot", recovered,
+                "evidence", "exact_shulker_ledger_and_serialized_components"));
+        return recovered;
     }
 
     private void tickPacking() {
@@ -2166,7 +2228,8 @@ public final class KitFulfillmentCoordinator {
             int slot = findBorrowedSourceSlot(source);
             if (slot < 0) continue;
             var evidence = KitRetainedShell.evidence(slot, playerInventory().getItemStack(slot));
-            if (evidence == null || uniqueRetainedShellSlot(evidence, ownedShellSlot) != slot)
+            if (evidence == null || uniqueRetainedShellSlot(evidence, ownedShellSlot,
+                    sourceBoxesToReturn, packedContents) != slot)
                 continue;
             retainedShell = evidence;
             sourceBoxesToReturn.remove(i);
@@ -2182,8 +2245,49 @@ public final class KitFulfillmentCoordinator {
         KitShulkerLedger.Identity returning = sourceBoxesToReturn.isEmpty() ? null
                 : new KitShulkerLedger.Identity(sourceBoxesToReturn.getFirst().itemId(),
                         sourceBoxesToReturn.getFirst().contents());
-        int verifiedShellSlot = KitShulkerLedger.ownedSlot(inventoryShulkerSlots(),
+        Map<Integer, KitShulkerLedger.Identity> observedBoxes = inventoryShulkerSlots();
+        int verifiedShellSlot = KitShulkerLedger.ownedSlot(observedBoxes,
                 ownedShellSlot, packedContents, returning);
+        var pinnedSourceReturn = KitSameContentReturnAudit.parse(blocker);
+        if (verifiedShellSlot < 0 && pinnedSourceReturn != null
+                && sourceBoxesToReturn.size() == 1 && returning != null
+                && ownedShellSlot == pinnedSourceReturn.ownedRaw()
+                && returning.contents().equals(packedContents)) {
+            Map<Integer, String> hashes = inventoryShulkerFingerprints(observedBoxes);
+            if (KitSameContentReturnAudit.beforeDeposit(pinnedSourceReturn,
+                    observedBoxes, returning, hashes)
+                    || sourceReturnStarted && KitSameContentReturnAudit.afterDeposit(
+                            pinnedSourceReturn, observedBoxes, returning, hashes)) {
+                verifiedShellSlot = ownedShellSlot;
+            }
+        }
+        if (verifiedShellSlot < 0 && sourceBoxesToReturn.size() == 1
+                && returning != null && returning.contents().equals(packedContents)
+                && returning.equals(observedBoxes.get(ownedShellSlot))) {
+            if (observedBoxes.size() == 2) {
+                Map<Integer, String> fingerprints = new HashMap<>();
+                Container player = playerInventory();
+                if (player != null) {
+                    for (int raw : observedBoxes.keySet()) {
+                        ItemStack stack = player.getItemStack(raw);
+                        if (stack != null && stack.getAmount() == 1) {
+                            try {
+                                fingerprints.put(raw, KitVariantFingerprint.canonicalVariant(stack));
+                            } catch (RuntimeException ignored) {
+                                // An unencodable component cannot establish interchangeability.
+                            }
+                        }
+                    }
+                }
+                verifiedShellSlot = KitShulkerLedger.interchangeableOwnedSourceSlot(
+                        observedBoxes, ownedShellSlot, returning, returning, fingerprints);
+            } else if (sourceReturnStarted && observedBoxes.size() == 1) {
+                // The exporter was started only after the two-box guard passed in
+                // this process. Its deposit may remove the source before the
+                // server-window verification completes.
+                verifiedShellSlot = ownedShellSlot;
+            }
+        }
         if (verifiedShellSlot < 0) {
             block("kit_owned_shell_missing_before_source_return");
             return;
@@ -2218,6 +2322,9 @@ public final class KitFulfillmentCoordinator {
             sourceReturnCloseWaitTicks = 0;
             int sourceSlot = findBorrowedSourceSlot(source);
             if (sourceSlot < 0) { block("kit_source_return_identity_unverified"); return; }
+            if (pinnedSourceReturn != null && sourceSlot != pinnedSourceReturn.sourceRaw()) {
+                block("kit_pinned_source_slot_changed"); return;
+            }
             boolean requireImportCapacity = sourceReturnOriginalAudit
                     || source.returnPosition() != null
                     && !java.util.Arrays.equals(source.returnPosition(), source.sourcePosition());
@@ -2275,6 +2382,7 @@ public final class KitFulfillmentCoordinator {
             sourceBoxesToReturn.removeFirst();
             sourceReturnStarted = false;
             sourceReturnOriginalAudit = false;
+            if (pinnedSourceReturn != null) blocker = null;
             emit("kit_source_return_verified", Map.of("item_id", source.itemId(),
                     "empty", source.contents().isEmpty(),
                     "remaining_returns", sourceBoxesToReturn.size()));
@@ -2454,32 +2562,90 @@ public final class KitFulfillmentCoordinator {
     private int findBorrowedSourceSlot(KitFulfillmentJournalStore.BorrowedBox source) {
         Container player = playerInventory();
         if (player == null) return -1;
+        int retained = retainedShell == null ? -1
+                : uniqueRetainedShellSlot(retainedShell, ownedShellSlot,
+                    sourceBoxesToReturn, packedContents);
+        if (retainedShell != null && retained < 9) return -1;
         int found = -1;
         for (int raw = 9; raw <= 44; raw++) {
-            if (raw == ownedShellSlot) continue;
+            if (raw == ownedShellSlot || raw == retained) continue;
             ItemStack stack = player.getItemStack(raw);
             if (isShulker(stack) && stack.getAmount() == 1
                     && source.itemId().equals(ItemIdentifier.getItemId(stack))
                     && source.contents().equals(ItemIdentifier.readShulkerContents(stack))) {
-                if (found >= 0) return -1;
+                if (found >= 0) return accountedDuplicateSourceSlot(
+                        sourceBoxesToReturn, ownedShellSlot, retained,
+                        packedContents, source);
                 found = raw;
             }
         }
         return found;
     }
 
+    /** Identical source boxes are interchangeable only when every carried box
+     * matches the complete pending-return ledger and both copies have the same
+     * serialized components and original source position.
+     */
+    private static int accountedDuplicateSourceSlot(
+            List<KitFulfillmentJournalStore.BorrowedBox> pending, int ownedSlot,
+            int retainedSlot, Map<String, Integer> packed,
+            KitFulfillmentJournalStore.BorrowedBox wanted) {
+        Container player = playerInventory();
+        if (player == null || pending == null || pending.size() < 2
+                || packed == null || wanted == null || wanted.sourcePosition() == null)
+            return -1;
+        Map<Integer, KitShulkerLedger.Identity> boxes =
+                new HashMap<>(inventoryShulkerSlots());
+        KitShulkerLedger.Identity owned = boxes.get(ownedSlot);
+        if (owned == null || !packed.equals(owned.contents())) return -1;
+        if (retainedSlot >= 9 && boxes.remove(retainedSlot) == null) return -1;
+        KitShulkerLedger.Identity desired = new KitShulkerLedger.Identity(
+                wanted.itemId(), wanted.contents());
+        List<KitShulkerLedger.Identity> expected = new ArrayList<>();
+        int duplicateObligations = 0;
+        for (var source : pending) {
+            if (source == null || source.itemId() == null || source.contents() == null)
+                return -1;
+            KitShulkerLedger.Identity identity = new KitShulkerLedger.Identity(
+                    source.itemId(), source.contents());
+            expected.add(identity);
+            if (desired.equals(identity)) {
+                if (!java.util.Arrays.equals(wanted.sourcePosition(),
+                        source.sourcePosition())) return -1;
+                duplicateObligations++;
+            }
+        }
+        if (duplicateObligations < 2) return -1;
+        Map<Integer, String> fingerprints = new HashMap<>();
+        for (var entry : boxes.entrySet()) {
+            if (!desired.equals(entry.getValue())) continue;
+            int raw = entry.getKey();
+            ItemStack stack = player.getItemStack(raw);
+            if (stack == null || stack.getAmount() != 1) return -1;
+            fingerprints.put(raw, KitVariantFingerprint.canonicalVariant(stack));
+        }
+        return KitShulkerLedger.interchangeablePendingSourceSlot(
+                boxes, ownedSlot, owned, expected, desired,
+                fingerprints);
+    }
+
     public static int uniqueRetainedShellSlot(KitFulfillmentJournalStore.Snapshot snapshot) {
         return snapshot == null ? -1
-                : uniqueRetainedShellSlot(snapshot.retainedShell(), snapshot.ownedShellSlot());
+                : uniqueRetainedShellSlot(snapshot.retainedShell(),
+                    snapshot.ownedShellSlot(), snapshot.sourceBoxesToReturn(),
+                    snapshot.packedContents());
     }
 
     private static int uniqueRetainedShellSlot(
-            KitFulfillmentJournalStore.RetainedShell expected, int ownedSlot) {
+            KitFulfillmentJournalStore.RetainedShell expected, int ownedSlot,
+            List<KitFulfillmentJournalStore.BorrowedBox> pending,
+            Map<String, Integer> packedContents) {
         Container player = playerInventory();
         if (player == null) return -1;
         Map<Integer, ItemStack> live = new HashMap<>();
         for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
-        return KitRetainedShell.uniqueSlot(expected, live, ownedSlot);
+        return KitRetainedShellSlotRebind.accountedSlot(expected, ownedSlot,
+                packedContents, pending, live);
     }
 
     private boolean selectNextReturnTarget(String reason) {
@@ -2586,18 +2752,22 @@ public final class KitFulfillmentCoordinator {
                     }
                 }
             };
-        } else if (wanted.containsKey("end_crystal")) {
-            int requested = wanted.get("end_crystal");
+        } else if (wanted.containsKey("end_crystal")
+                || wanted.containsKey("firework_rocket")) {
+            String item = wanted.containsKey("end_crystal")
+                    ? "end_crystal" : "firework_rocket";
+            int requested = wanted.get(item);
             Container player = playerInventory();
             ItemStack shell = player == null || ownedShellSlot < 9 || ownedShellSlot > 44
                     ? null : player.getItemStack(ownedShellSlot);
             List<ItemStack> shellStacks = shell == null ? List.of()
                     : ItemIdentifier.readShulkerPhysicalStacks(shell);
-            KitItemSourcePolicy sourcePolicy = KitItemSourcePolicy.CRYSTALS;
-            boolean alreadyPackedCrystals = shellStacks.stream()
+            KitItemSourcePolicy sourcePolicy = "end_crystal".equals(item)
+                    ? KitItemSourcePolicy.CRYSTALS : KitItemSourcePolicy.ROCKETS;
+            boolean alreadyPackedVariant = shellStacks.stream()
                     .anyMatch(sourcePolicy::acceptsCandidate);
             ItemStack anchored = sourcePolicy.partialShellVariant(shellStacks, requested);
-            if (alreadyPackedCrystals && anchored == null) return false;
+            if (alreadyPackedVariant && anchored == null) return false;
             ItemStack[] selected = {anchored};
             physicalFilter = stack -> {
                 if (!sourcePolicy.acceptsCandidate(stack)) return false;
@@ -2605,7 +2775,8 @@ public final class KitFulfillmentCoordinator {
             };
             physicalSurvey = observed -> {
                 if (selected[0] == null) selected[0] = sourcePolicy.choose(observed, requested);
-                if (selected[0] != null) emit("kit_crystal_source_variant_selected", Map.of(
+                if (selected[0] != null) emit("kit_" + item
+                        + "_source_variant_selected", Map.of(
                         "request_units", requested,
                         "observed_group_units", observed.stream()
                                 .filter(stack -> sourcePolicy.accepts(stack, selected[0]))
@@ -2686,6 +2857,8 @@ public final class KitFulfillmentCoordinator {
 
     private boolean persist() {
         try {
+            retainedShell = KitRetainedShellSlotRebind.rebindIfUnique(
+                    retainedShell, ownedShellSlot);
             journal.save(new KitFulfillmentJournalStore.Snapshot(
                     KitFulfillmentJournalStore.SCHEMA_VERSION, kitName, state.name(),
                     recipe, packedContents, requestedBoxes, completedBoxes,
@@ -2903,6 +3076,25 @@ public final class KitFulfillmentCoordinator {
             }
         }
         return Map.copyOf(observed);
+    }
+
+    private static Map<Integer, String> inventoryShulkerFingerprints(
+            Map<Integer, KitShulkerLedger.Identity> boxes) {
+        Container player = playerInventory();
+        if (player == null || boxes == null) return Map.of();
+        Map<Integer, String> hashes = new HashMap<>();
+        for (int raw : boxes.keySet()) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack == null || stack.getAmount() != 1) return Map.of();
+            try {
+                String hash = KitVariantFingerprint.canonicalVariant(stack);
+                if (hash == null) return Map.of();
+                hashes.put(raw, hash);
+            } catch (RuntimeException ignored) {
+                return Map.of();
+            }
+        }
+        return Map.copyOf(hashes);
     }
 
     private static Map<KitShulkerLedger.Identity, Integer> inventoryShulkerIdentities() {

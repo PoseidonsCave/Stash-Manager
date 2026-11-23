@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -31,6 +32,22 @@ class KitItemSourcePolicyTest {
         assertFalse(obsidian.accepts(other, full));
         assertNull(obsidian.choose(List.of(other), 64));
         assertNull(obsidian.choose(List.of(full), 0));
+    }
+
+    @Test
+    void rocketPolicyPrefersOneUsableVariantOverMixedPartialStacks() {
+        ItemStack shortA = namedRocket(39, "A");
+        ItemStack shortB = namedRocket(39, "B");
+        ItemStack fullC = namedRocket(64, "C");
+        ItemStack partialC = namedRocket(50, "C");
+        List<ItemStack> observed = new java.util.ArrayList<>(
+                List.of(shortA, shortB));
+        observed.addAll(Collections.nCopies(17, fullC));
+
+        assertSame(fullC, KitItemSourcePolicy.ROCKETS.choose(observed, 576));
+        assertFalse(KitItemSourcePolicy.ROCKETS.accepts(shortA, fullC));
+        assertSame(partialC, KitItemSourcePolicy.ROCKETS.partialShellVariant(
+                List.of(partialC), 14));
     }
 
     @Test
@@ -62,5 +79,12 @@ class KitItemSourcePolicyTest {
         DataComponents components = new DataComponents(new HashMap<>());
         components.put(DataComponentTypes.CUSTOM_NAME, Component.text(name));
         return new ItemStack(ItemRegistry.REGISTRY.get("obsidian").id(), count, components);
+    }
+
+    private static ItemStack namedRocket(int count, String name) {
+        DataComponents components = new DataComponents(new HashMap<>());
+        components.put(DataComponentTypes.CUSTOM_NAME, Component.text(name));
+        return new ItemStack(ItemRegistry.REGISTRY.get("firework_rocket").id(),
+                count, components);
     }
 }

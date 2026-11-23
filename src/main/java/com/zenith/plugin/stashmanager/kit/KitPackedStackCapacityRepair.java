@@ -20,6 +20,7 @@ public final class KitPackedStackCapacityRepair {
         return switch (itemId) {
             case "obsidian" -> new Profile(itemId, 128, 24, 23);
             case "ender_chest" -> new Profile(itemId, 16, 19, 18);
+            case "firework_rocket" -> new Profile(itemId, 576, 19, 18);
             default -> null;
         };
     }

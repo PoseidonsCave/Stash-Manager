@@ -16,6 +16,7 @@ import com.zenith.plugin.stashmanager.orchestration.SneakReleaseGate;
 import com.zenith.plugin.stashmanager.kit.KitWindowOpenPolicy;
 import com.zenith.plugin.stashmanager.kit.KitSourceReturnPolicy;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
 import com.zenith.util.RequestFuture;
 import org.geysermc.mcprotocollib.protocol.data.game.inventory.ShiftClickItemAction;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
@@ -439,6 +440,9 @@ public final class KitExporter {
             if (requireEmptyTarget && occupiedChestSlots(open, slots) != 0) {
                 fail("working_repack_staging_not_empty"); return;
             }
+            if (isOrdinaryKitOutput() && !liveKitOutputHasNoHopper(slots)) {
+                fail("export_output_geometry_or_hopper_changed"); return;
+            }
             chestMatchingBefore = matchingInChest(open, slots);
             advance(State.DEPOSITING);
             return;
@@ -493,6 +497,9 @@ public final class KitExporter {
             if (requireEmptyTarget && occupiedChestSlots(open, slots) != 0) {
                 fail("working_repack_staging_not_empty"); return;
             }
+        }
+        if (isOrdinaryKitOutput() && !liveKitOutputHasNoHopper(slots)) {
+            fail("export_output_geometry_or_hopper_changed"); return;
         }
         if (protectedLooseReturn) {
             Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
@@ -736,6 +743,33 @@ public final class KitExporter {
     private boolean depositCountVerified(Container open, int slots) {
         int delta = matchingInChest(open, slots) - chestMatchingBefore;
         return expectedLooseStack == null ? delta > 0 : delta == expectedLooseStack.getAmount();
+    }
+
+    private boolean isOrdinaryKitOutput() {
+        return !requireImportCapacity && !protectedLooseReturn && expectedItemId == null;
+    }
+
+    /** A saved empty-chest scan can predate a hopper or a changed chest pairing.
+     * Check the loaded blocks again before transferring the completed kit. */
+    private boolean liveKitOutputHasNoHopper(int slots) {
+        if (target == null || (slots != 27 && slots != 54)) return false;
+        int x = target[0], y = target[1], z = target[2];
+        if (!World.isChunkLoadedBlockPos(x, z)
+                || World.getChunkSection(x, y, z) == null) return false;
+        var identity = DoubleChestIdentity.resolve(x, y, z, slots == 54);
+        if (!identity.identityKnown() || identity.blocks().size() != (slots == 54 ? 2 : 1)
+                || identity.inventoryX() != x || identity.inventoryY() != y
+                || identity.inventoryZ() != z) return false;
+        for (int[] half : identity.blocks()) {
+            int hx = half[0], hz = half[2];
+            if (!World.isChunkLoadedBlockPos(hx, hz)
+                    || World.getChunkSection(hx, y - 1, hz) == null
+                    || !("chest".equals(World.getBlockState(hx, y, hz).block().name())
+                        || "trapped_chest".equals(World.getBlockState(hx, y, hz).block().name()))
+                    || "hopper".equals(World.getBlockState(hx, y - 1, hz).block().name()))
+                return false;
+        }
+        return true;
     }
 
     private static boolean sameVariant(ItemStack a, ItemStack b) {

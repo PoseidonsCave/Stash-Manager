@@ -22,6 +22,31 @@ class KitRecoveryIdentityTest {
     }
 
     @Test
+    void unopenedSignedBooksMayReserializeOnlyWhenOtherContentsRemainExact() {
+        Map<String, Integer> before = Map.of("firework_rocket", 960,
+                "written_book[book=old1]", 1, "written_book[book=old2]", 1);
+        Map<String, Integer> observed = Map.of("firework_rocket", 960,
+                "written_book[book=new1]", 1, "written_book[book=new2]", 1);
+        assertTrue(KitRecoveryIdentity.unopenedSignedBookRoundTrip(before, observed));
+        assertTrue(KitRecoveryIdentity.sourceMatches("RED_SHULKER_BOX",
+                "red_shulker_box", before, observed));
+        assertTrue(KitRecoveryIdentity.recoveredSourceItemMatches(before, observed, before));
+        assertTrue(KitRecoveryIdentity.recoveredSourceItemMatches(before, observed, observed));
+        assertFalse(KitRecoveryIdentity.recoveredSourceItemMatches(before, observed,
+                Map.of("firework_rocket", 960, "written_book[book=third]", 2)));
+        assertFalse(KitRecoveryIdentity.unopenedSignedBookRoundTrip(before,
+                Map.of("firework_rocket", 959, "written_book[book=new1]", 1,
+                        "written_book[book=new2]", 1)));
+        assertFalse(KitRecoveryIdentity.unopenedSignedBookRoundTrip(before,
+                Map.of("firework_rocket", 960, "written_book[book=new1]", 1)));
+        assertFalse(KitRecoveryIdentity.unopenedSignedBookRoundTrip(before,
+                Map.of("firework_rocket", 960, "written_book[book=new1]", 1,
+                        "written_book[book=new2]", 1, "diamond", 1)));
+        assertFalse(KitRecoveryIdentity.sourceMatches("BLUE_SHULKER_BOX",
+                "red_shulker_box", before, observed));
+    }
+
+    @Test
     void kitCanBePartiallyFilledButMustRetainPriorBatches() {
         Map<String, Integer> recipe = Map.of("firework_rocket", 576,
                 "experience_bottle", 576, "totem_of_undying", 9);

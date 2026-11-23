@@ -29,6 +29,9 @@ public record KitItemSourcePolicy(String itemId, Predicate<ItemStack> eligible,
     public static final KitItemSourcePolicy CRYSTALS = new KitItemSourcePolicy(
             "end_crystal", stack -> true, KitVariantFingerprint::sameComponents,
             64, false);
+    public static final KitItemSourcePolicy ROCKETS = new KitItemSourcePolicy(
+            "firework_rocket", stack -> true, KitVariantFingerprint::sameComponents,
+            64, false);
 
     public KitItemSourcePolicy {
         Objects.requireNonNull(itemId);
@@ -71,7 +74,7 @@ public record KitItemSourcePolicy(String itemId, Predicate<ItemStack> eligible,
         return best == null ? null : best.exemplar;
     }
 
-    /** Find an already packed variant with room for the whole remaining batch. */
+    /** Keep the packed variant when a batch fits its partial stack or fresh box slots. */
     public ItemStack partialShellVariant(List<ItemStack> shell, int needed) {
         if (shell == null || needed < 1) return null;
         List<ItemStack> matching = shell.stream().filter(this::acceptsCandidate).toList();
@@ -86,7 +89,8 @@ public record KitItemSourcePolicy(String itemId, Predicate<ItemStack> eligible,
                 available = room;
             }
         }
-        return selected;
+        return selected != null ? selected : KitFullStackContinuation.choose(
+                shell, matching, needed, stackLimit, sameStack);
     }
 
     /** A named-apple preference pass may skip only a source that was never opened. */

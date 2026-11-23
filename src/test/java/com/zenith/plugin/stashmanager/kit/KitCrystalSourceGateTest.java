@@ -8,6 +8,7 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponen
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -33,6 +34,32 @@ class KitCrystalSourceGateTest {
                 crystal(64, "B"), crystal(64, "B"), crystal(58, "B")), 256);
         assertTrue(KitCrystalSourceGate.accepts(crystal(1, "B"), selected));
         assertFalse(KitCrystalSourceGate.accepts(crystal(1, "A"), selected));
+    }
+
+    @Test
+    void fullCrystalStacksContinueIntoAnEmptyShellSlot() {
+        List<ItemStack> shell = List.of(
+                crystal(64, "A"), crystal(64, "A"), crystal(64, "A"));
+        ItemStack selected = KitCrystalSourceGate.partialShellVariant(shell, 64);
+        assertNotNull(selected);
+        assertTrue(KitCrystalSourceGate.accepts(crystal(64, "A"), selected));
+        assertTrue(KitCrystalSourceGate.accepts(crystal(64, "A"),
+                KitFullStackContinuation.chooseCrystals(shell, 64)));
+    }
+
+    @Test
+    void fullStackContinuationRejectsMixedVariantsOrAFullShell() {
+        assertNull(KitCrystalSourceGate.partialShellVariant(List.of(
+                crystal(64, "A"), crystal(64, "B"), crystal(64, "A")), 64));
+        assertNull(KitFullStackContinuation.chooseCrystals(List.of(
+                crystal(64, "A"), crystal(64, "B"), crystal(64, "A")), 64));
+
+        List<ItemStack> fullShell = new ArrayList<>(List.of(
+                crystal(64, "A"), crystal(64, "A"), crystal(64, "A")));
+        for (int i = 0; i < 24; i++) {
+            fullShell.add(new ItemStack(ItemRegistry.REGISTRY.get("stone").id(), 64));
+        }
+        assertNull(KitCrystalSourceGate.partialShellVariant(fullShell, 64));
     }
 
     private static ItemStack crystal(int amount, String name) {

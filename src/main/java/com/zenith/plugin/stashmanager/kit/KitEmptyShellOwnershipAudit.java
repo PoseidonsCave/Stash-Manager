@@ -2,6 +2,7 @@ package com.zenith.plugin.stashmanager.kit;
 
 import com.zenith.cache.data.inventory.Container;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
+import com.zenith.plugin.stashmanager.kit.KitShulkerLedger.Identity;
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 
 import java.util.HashMap;
@@ -21,7 +22,8 @@ public final class KitEmptyShellOwnershipAudit {
                 || snapshot.retainedShell() != null || snapshot.currentItem() == null
                 || snapshot.currentQuantity() <= 0 || snapshot.auditedCargoSlot() >= 0
                 || !snapshot.auditedCargoSlots().isEmpty()
-                || snapshot.sourceBoxesToReturn().size() != 2) return false;
+                || snapshot.sourceBoxesToReturn().isEmpty()
+                || snapshot.sourceBoxesToReturn().size() > 2) return false;
         long empty = snapshot.sourceBoxesToReturn().stream()
                 .filter(source -> source != null && source.contents().isEmpty()).count();
         return empty == 1;
@@ -33,12 +35,31 @@ public final class KitEmptyShellOwnershipAudit {
                 || ownedRaw == borrowedRaw || owned == null || borrowed == null) return null;
         String ownedHash = KitVariantFingerprint.canonicalVariant(owned);
         String borrowedHash = KitVariantFingerprint.canonicalVariant(borrowed);
-        if (ownedHash == null || borrowedHash == null || ownedHash.equals(borrowedHash)) return null;
+        boolean interchangeable = interchangeablePlainEmptyPair(owned, borrowed);
+        if (ownedHash == null || borrowedHash == null
+                || ownedHash.equals(borrowedHash) && !interchangeable) return null;
+        Identity ownedIdentity = identity(owned);
+        Identity borrowedIdentity = identity(borrowed);
+        if (ownedIdentity == null || borrowedIdentity == null
+                || !ownedIdentity.contents().isEmpty()
+                || !borrowedIdentity.contents().isEmpty()) return null;
+        // Distinct component fingerprints identify the operator-pinned boxes even
+        // when the owned shell, rather than the borrowed source, carries a name.
         return PREFIX + ownedRaw + ":" + borrowedRaw + ":" + ownedHash + ":" + borrowedHash;
     }
 
     public static boolean isScheduled(String blocker) {
         return blocker != null && blocker.startsWith(PREFIX);
+    }
+
+    /** Travel consumables are defined by item and count; source stock may carry
+     * distinct presentation components, which the packer preserves in separate stacks.
+     */
+    public static boolean acceptsMixedCargoVariants(
+            KitFulfillmentJournalStore.Snapshot snapshot) {
+        return snapshot != null && "travel".equals(snapshot.kitName())
+                && ("experience_bottle".equals(snapshot.currentItem())
+                    || "totem_of_undying".equals(snapshot.currentItem()));
     }
 
     /** Recheck all three carried boxes and both physical fingerprints after cooldown. */
@@ -48,7 +69,9 @@ public final class KitEmptyShellOwnershipAudit {
                 || !"WAIT_CARGO".equals(snapshot.resumeState())
                 || !snapshot.packedContents().isEmpty()
                 || snapshot.kitWorksite() != null || snapshot.borrowedSourceWorksite() != null
-                || snapshot.retainedShell() != null || snapshot.sourceBoxesToReturn().size() != 2)
+                || snapshot.retainedShell() != null
+                || snapshot.sourceBoxesToReturn().isEmpty()
+                || snapshot.sourceBoxesToReturn().size() > 2)
             return false;
         String[] parts = snapshot.blocker().substring(PREFIX.length()).split(":", -1);
         if (parts.length != 4) return false;
@@ -67,15 +90,21 @@ public final class KitEmptyShellOwnershipAudit {
         ItemStack borrowed = player.getItemStack(borrowedRaw);
         if (owned == null || borrowed == null || owned.getAmount() != 1
                 || borrowed.getAmount() != 1
-                || ItemIdentifier.hasCustomPresentation(owned)
-                || !ItemIdentifier.hasCustomPresentation(borrowed)
                 || !parts[2].equals(KitVariantFingerprint.canonicalVariant(owned))
                 || !parts[3].equals(KitVariantFingerprint.canonicalVariant(borrowed))) return false;
         KitShulkerLedger.Identity ownedIdentity = identity(owned);
         KitShulkerLedger.Identity borrowedIdentity = identity(borrowed);
         if (ownedIdentity == null || borrowedIdentity == null
                 || !ownedIdentity.contents().isEmpty()
-                || !ownedIdentity.equals(borrowedIdentity)) return false;
+                || !borrowedIdentity.contents().isEmpty()) return false;
+        if (ownedIdentity.equals(borrowedIdentity)
+                && parts[2].equals(parts[3])
+                && !interchangeablePlainEmptyPair(owned, borrowed)) return false;
+        KitShulkerLedger.Identity expectedEmptySource = snapshot.sourceBoxesToReturn().stream()
+                .filter(source -> source.contents().isEmpty())
+                .map(source -> new KitShulkerLedger.Identity(source.itemId(), source.contents()))
+                .findFirst().orElse(null);
+        if (!borrowedIdentity.equals(expectedEmptySource)) return false;
         Map<KitShulkerLedger.Identity, Integer> observed = new HashMap<>();
         for (int raw = 9; raw <= 44; raw++) {
             ItemStack stack = player.getItemStack(raw);
@@ -98,5 +127,17 @@ public final class KitEmptyShellOwnershipAudit {
         if (!ItemIdentifier.baseItemId(itemId).contains("shulker_box")) return null;
         return new KitShulkerLedger.Identity(itemId,
                 ItemIdentifier.readShulkerContents(stack));
+    }
+
+    private static boolean interchangeablePlainEmptyPair(ItemStack owned,
+                                                           ItemStack borrowed) {
+        Identity first = identity(owned);
+        Identity second = identity(borrowed);
+        String firstHash = KitVariantFingerprint.canonicalVariant(owned);
+        return first != null && first.equals(second) && first.contents().isEmpty()
+                && firstHash != null
+                && firstHash.equals(KitVariantFingerprint.canonicalVariant(borrowed))
+                && !ItemIdentifier.hasCustomPresentation(owned)
+                && !ItemIdentifier.hasCustomPresentation(borrowed);
     }
 }

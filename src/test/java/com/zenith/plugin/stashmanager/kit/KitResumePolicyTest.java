@@ -11,6 +11,58 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class KitResumePolicyTest {
+    @Test void interruptedWaitCargoWithoutBorrowCanRetryOnlyFromExactBoundary() {
+        var stopped = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("experience_bottle", 576, "totem_of_undying", 9,
+                        "firework_rocket", 576),
+                Map.of("experience_bottle", 576, "totem_of_undying", 9),
+                54, 10, "firework_rocket", 576, 40, new int[]{1, 130, 2},
+                null, null, null, Map.of(), "uncertain_wait_cargo",
+                100L, "WAIT_CARGO", 0L, List.of());
+        assertTrue(KitResumePolicy.canRetryNoCargoRetrieval(stopped));
+        assertNull(KitResumePolicy.blocker(stopped, "NEED_CARGO"));
+        var pending = new KitFulfillmentJournalStore.Snapshot(
+                stopped.schemaVersion(), stopped.kitName(), stopped.state(),
+                stopped.recipe(), stopped.packedContents(), stopped.requestedBoxes(),
+                stopped.completedBoxes(), stopped.currentItem(), stopped.currentQuantity(),
+                stopped.ownedShellSlot(), stopped.exportPosition(), null, null, null,
+                Map.of(), stopped.blocker(), 100L, "WAIT_CARGO", 0L,
+                List.of(new KitFulfillmentJournalStore.BorrowedBox(
+                        new int[]{3, 130, 4}, "shulker_box",
+                        Map.of("firework_rocket", 1664))));
+        assertFalse(KitResumePolicy.canRetryNoCargoRetrieval(pending));
+        var inWorld = new KitFulfillmentJournalStore.Snapshot(
+                stopped.schemaVersion(), stopped.kitName(), stopped.state(),
+                stopped.recipe(), stopped.packedContents(), stopped.requestedBoxes(),
+                stopped.completedBoxes(), stopped.currentItem(), stopped.currentQuantity(),
+                stopped.ownedShellSlot(), stopped.exportPosition(),
+                new int[]{3, 130, 4}, null, null, Map.of(),
+                stopped.blocker(), 100L, "WAIT_CARGO", 0L, List.of());
+        assertFalse(KitResumePolicy.canRetryNoCargoRetrieval(inWorld));
+    }
+
+    @Test void stoppedRetrievalMayAuditOnlyAnUnclaimedNoCargoBoundary() {
+        var stopped = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("experience_bottle", 576, "totem_of_undying", 9),
+                Map.of("experience_bottle", 576), 1, 0,
+                "totem_of_undying", 9, 40, new int[]{1, 131, 2},
+                null, null, null, Map.of(), "interrupted:manual_stop",
+                100L, "WAIT_CARGO", 0L, List.of());
+        assertTrue(KitResumePolicy.canAuditKeptNoCargoRetrieval(stopped));
+        assertEquals("uncertain_wait_cargo", KitResumePolicy.blocker(stopped));
+        var pendingSource = new KitFulfillmentJournalStore.Snapshot(
+                stopped.schemaVersion(), stopped.kitName(), stopped.state(),
+                stopped.recipe(), stopped.packedContents(), stopped.requestedBoxes(),
+                stopped.completedBoxes(), stopped.currentItem(), stopped.currentQuantity(),
+                stopped.ownedShellSlot(), stopped.exportPosition(), null, null, null,
+                Map.of(), stopped.blocker(), 100L, "WAIT_CARGO", 0L,
+                List.of(new KitFulfillmentJournalStore.BorrowedBox(
+                        new int[]{3, 130, 4}, "shulker_box", Map.of("totem_of_undying", 9))));
+        assertFalse(KitResumePolicy.canAuditKeptNoCargoRetrieval(pendingSource));
+    }
+
     @Test void committedBatchWithNoBorrowedSourceCanRetryPhysicalCompaction() {
         var blocked = new KitFulfillmentJournalStore.Snapshot(
                 KitFulfillmentJournalStore.SCHEMA_VERSION, "cpvp", "BLOCKED",
@@ -129,6 +181,28 @@ class KitResumePolicyTest {
                         checkpoint.blocker(), 102L, null, 0L,
                         List.of(new KitFulfillmentJournalStore.BorrowedBox(
                                 source.sourcePosition(), source.itemId(), source.contents())))));
+
+        var sameContentSource = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{1, 130, 2}, "yellow_shulker_box",
+                Map.of("totem_of_undying", 9), new int[]{3, 130, 4});
+        var interrupted = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("totem_of_undying", 9, "firework_rocket", 576),
+                Map.of("totem_of_undying", 9), 54, 7, null, 0,
+                40, new int[]{5, 130, 6}, null, null, null, Map.of(),
+                "kit_owned_shell_missing_before_source_return", 101L,
+                null, 0L, List.of(sameContentSource));
+        assertTrue(KitResumePolicy.canAuditCompletedSourceReturn(interrupted));
+        assertTrue(KitResumePolicy.canRerouteSourceReturn(interrupted));
+        assertFalse(KitResumePolicy.canAuditCompletedSourceReturn(
+                new KitFulfillmentJournalStore.Snapshot(
+                        interrupted.schemaVersion(), interrupted.kitName(),
+                        interrupted.state(), interrupted.recipe(), Map.of(),
+                        interrupted.requestedBoxes(), interrupted.completedBoxes(),
+                        null, 0, interrupted.ownedShellSlot(),
+                        interrupted.exportPosition(), null, null, null, Map.of(),
+                        interrupted.blocker(), 102L, null, 0L,
+                        List.of(sameContentSource))));
     }
 
     @Test void recoveredBorrowedBoxBatchRequiresOneUnauditedPendingSource() {
@@ -196,6 +270,19 @@ class KitResumePolicyTest {
                 Map.of(13, 64, 14, 49, 21, 64, 22, 64, 23, 15),
                 0, Map.of(), Map.of());
         assertTrue(KitResumePolicy.canRetryAuditedMultiSourcePreflight(checkpoint));
+        var retained = new KitFulfillmentJournalStore.RetainedShell(
+                40, "shulker_box", "journaled-empty-shell-hash");
+        var reviewed = new KitFulfillmentJournalStore.Snapshot(
+                checkpoint.schemaVersion(), checkpoint.kitName(), checkpoint.state(),
+                checkpoint.recipe(), checkpoint.packedContents(), checkpoint.requestedBoxes(),
+                checkpoint.completedBoxes(), checkpoint.currentItem(),
+                checkpoint.currentQuantity(), checkpoint.ownedShellSlot(),
+                checkpoint.exportPosition(), null, null, null, Map.of(),
+                "borrowed_source_return_unverified", 101L, "WAIT_CARGO", 0L,
+                checkpoint.sourceBoxesToReturn(), -1, List.of(),
+                checkpoint.auditedCargoSlots(), 0, Map.of(), Map.of())
+                .withRetainedShell(retained);
+        assertTrue(KitResumePolicy.canRetryAuditedMultiSourcePreflight(reviewed));
         assertFalse(KitResumePolicy.canRetryAuditedMultiSourcePreflight(
                 new KitFulfillmentJournalStore.Snapshot(
                         checkpoint.schemaVersion(), checkpoint.kitName(), checkpoint.state(),
@@ -544,6 +631,14 @@ class KitResumePolicyTest {
         assertTrue(KitResumePolicy.canRetryBorrowedInventoryCargo(incomplete));
         assertTrue(KitResumePolicy.canRetryNoCargoRetrieval(incomplete));
         assertTrue(KitResumePolicy.canAuditKeptNoCargoRetrieval(incomplete));
+        var failedBeforeBorrow = new KitFulfillmentJournalStore.Snapshot(
+                incomplete.schemaVersion(), incomplete.kitName(), incomplete.state(),
+                incomplete.recipe(), incomplete.packedContents(), incomplete.requestedBoxes(),
+                incomplete.completedBoxes(), incomplete.currentItem(), incomplete.currentQuantity(),
+                incomplete.ownedShellSlot(), incomplete.exportPosition(), null, null, null,
+                Map.of(), "kit_cargo_retrieval_start_failed", 100, null, 0);
+        assertTrue(KitResumePolicy.canRetryNoCargoRetrieval(failedBeforeBorrow));
+        assertFalse(KitResumePolicy.canRetryBorrowedInventoryCargo(failedBeforeBorrow));
         assertFalse(KitResumePolicy.canRetryBorrowedInventoryCargo(new KitFulfillmentJournalStore.Snapshot(
                 incomplete.schemaVersion(), incomplete.kitName(), incomplete.state(),
                 incomplete.recipe(), incomplete.packedContents(), incomplete.requestedBoxes(),
@@ -676,6 +771,55 @@ class KitResumePolicyTest {
                 List.of(source));
         assertFalse(KitResumePolicy.canRerouteSourceReturn(scheduled));
         assertNull(KitResumePolicy.blocker(scheduled));
+
+        var pinned = new KitFulfillmentJournalStore.Snapshot(
+                blocked.schemaVersion(), blocked.kitName(), blocked.state(),
+                blocked.recipe(), blocked.packedContents(), blocked.requestedBoxes(),
+                blocked.completedBoxes(), blocked.currentItem(), blocked.currentQuantity(),
+                36, blocked.exportPosition(), null, null, null, Map.of(),
+                KitSameContentReturnAudit.marker(new KitSameContentReturnAudit.Witness(
+                        36, 44, "a".repeat(64), "b".repeat(64))),
+                101, "RETURNING_SOURCE", 300_000, List.of(source));
+        assertNull(KitResumePolicy.blocker(pinned));
+    }
+
+    @Test void distinctSourceBoxMayRetryAfterEqualContentsShellGuard() {
+        var source = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{3, 64, 4}, "yellow_shulker_box",
+                Map.of("totem_of_undying", 9));
+        var blocked = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("totem_of_undying", 9, "experience_bottle", 576),
+                Map.of("totem_of_undying", 9), 54, 7,
+                "totem_of_undying", 9, 40, new int[]{1, 64, 2},
+                null, null, null, Map.of(),
+                "kit_owned_shell_missing_before_source_return", 100,
+                null, 0, List.of(source));
+        assertTrue(KitResumePolicy.canRerouteSourceReturn(blocked));
+    }
+
+    @Test void multiSourceReturnCanRetryAfterAdmissionRejectedOtherJournaledBoxes() {
+        var empty = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{3, 64, 4}, "purple_shulker_box", Map.of());
+        var stock = new KitFulfillmentJournalStore.BorrowedBox(
+                new int[]{3, 64, 4}, "magenta_shulker_box",
+                Map.of("firework_rocket", 1258));
+        var blocked = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("firework_rocket", 576), Map.of("firework_rocket", 576),
+                54, 36, "firework_rocket", 576, 36, new int[]{5, 64, 6},
+                null, null, null, Map.of(),
+                "unexpected_inventory_slots:[42, 44]; disposition=[42=SHULKER_IDENTITY_REVIEW,44=SHULKER_IDENTITY_REVIEW]",
+                100, "RETURNING_SOURCE", 0, List.of(empty, empty, stock));
+        assertTrue(KitResumePolicy.canRerouteSourceReturn(blocked));
+        var unrelated = new KitFulfillmentJournalStore.Snapshot(
+                blocked.schemaVersion(), blocked.kitName(), blocked.state(),
+                blocked.recipe(), blocked.packedContents(), blocked.requestedBoxes(),
+                blocked.completedBoxes(), blocked.currentItem(), blocked.currentQuantity(),
+                blocked.ownedShellSlot(), blocked.exportPosition(), null, null, null,
+                Map.of(), "kit_source_return_failed:export_deposit_unconfirmed",
+                100, "RETURNING_SOURCE", 0, blocked.sourceBoxesToReturn());
+        assertFalse(KitResumePolicy.canRerouteSourceReturn(unrelated));
     }
 
     @Test void onlyPreplacementWorksiteFailureCanUseUnplacedShellRecovery() {
@@ -771,5 +915,38 @@ class KitResumePolicyTest {
                 blocked.ownedShellSlot(), blocked.exportPosition(), null, null, null,
                 Map.of(), blocked.blocker(), 100, null, 0, List.of());
         assertFalse(KitResumePolicy.canAuditChangedBaselineCargo(noSources));
+
+        var duplicateRetained = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("firework_rocket", 576, "experience_bottle", 576),
+                Map.of("firework_rocket", 576), 54, 6,
+                "experience_bottle", 576, 40, new int[]{1, 64, 2},
+                null, null, null, Map.of(), "kit_retained_shell_identity_ambiguous",
+                100, null, 0, List.of(empty, crystals))
+                .withRetainedShell(new KitFulfillmentJournalStore.RetainedShell(
+                        44, "shulker_box", "witness"));
+        assertTrue(KitResumePolicy.canAuditChangedBaselineCargo(duplicateRetained));
+        assertFalse(KitResumePolicy.canAuditChangedBaselineCargo(
+                duplicateRetained.withRetainedShell(null)));
+
+        var packerBlocked = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, "travel", "BLOCKED",
+                Map.of("totem_of_undying", 9, "experience_bottle", 576,
+                        "firework_rocket", 576),
+                Map.of("totem_of_undying", 9, "experience_bottle", 576),
+                54, 7, "firework_rocket", 576, 40, new int[]{1, 64, 2},
+                null, null, null, Map.of(), "kit_packer_start_failed",
+                100, null, 0, List.of(crystals));
+        assertTrue(KitResumePolicy.canAuditChangedBaselineCargo(packerBlocked));
+        assertFalse(KitResumePolicy.canAuditChangedBaselineCargo(
+                new KitFulfillmentJournalStore.Snapshot(
+                        packerBlocked.schemaVersion(), packerBlocked.kitName(),
+                        packerBlocked.state(), packerBlocked.recipe(),
+                        Map.of("firework_rocket", 64), packerBlocked.requestedBoxes(),
+                        packerBlocked.completedBoxes(), packerBlocked.currentItem(),
+                        packerBlocked.currentQuantity(), packerBlocked.ownedShellSlot(),
+                        packerBlocked.exportPosition(), null, null, null, Map.of(),
+                        packerBlocked.blocker(), 100, null, 0,
+                        packerBlocked.sourceBoxesToReturn())));
     }
 }

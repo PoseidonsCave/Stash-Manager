@@ -9,6 +9,7 @@
 [![License](https://img.shields.io/badge/license-AGPL%20v3-blue.svg)](LICENSE)
 
 [![Join the Discord](https://img.shields.io/badge/Join%20the%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/6v5greuSp)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=000000)](https://buymeacoffee.com/poseidonscave)
 
 [Quick start](#-quick-start) • [Commands](#-commands) • [Database setup](#-database-setup) • [API](#-rest-api)
 
@@ -238,6 +239,11 @@ interruption, a clean between-items checkpoint waits through the configured cool
 window, then continues automatically. A submitted click, placed box, or uncertain export still
 pauses for recovery and cargo review; it never blindly replays an ingredient move. `stash kit stop`
 cancels automatic resumption. Use `stash kit resume` only after reviewing a safe paused checkpoint.
+
+Kit output needs a standalone chest with no hopper below either half. Build and resume preflight
+reject indexed drains; the exporter checks the loaded chest geometry again before depositing.
+This keeps a FIFO lane from moving a finished box before its delivery can be verified. A scan
+records chest contents at one moment, so inspect or rescan the output when its surroundings change.
 
 After all deliveries, use the [return playbook](docs/RETURN_PLAYBOOK.md).
 Borrowed source boxes retain their checkpointed return obligations. Surplus

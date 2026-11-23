@@ -2155,6 +2155,11 @@ public final class StashRetriever {
         if (stack == null || stack.getAmount() <= 0) return false;
         String itemId = itemIdFromStack(stack);
         if (!isShulkerBoxItem(itemId)) return false;
+        // Signed books have changed fingerprints when a mixed source box was placed
+        // on 2b2t. Kit jobs must use another source for non-book cargo rather than
+        // weakening the exact borrowed-box identity guard during extraction.
+        if (strictBorrowedPickup() && !kitSourceWithoutSignedBooks(
+                ItemIdentifier.readShulkerContents(stack), remaining)) return false;
 
         if (kitPhysicalStackFilter != null) {
             for (ItemStack inner : ItemIdentifier.readShulkerPhysicalStacks(stack)) {
@@ -2174,6 +2179,15 @@ public final class StashRetriever {
             }
         }
         return false;
+    }
+
+    static boolean kitSourceWithoutSignedBooks(Map<String, Integer> contents,
+                                                Map<String, Integer> remaining) {
+        if (contents == null || remaining == null) return false;
+        if (remaining.keySet().stream().anyMatch(id -> "written_book".equals(
+                ItemIdentifier.baseItemId(id)))) return true;
+        return contents.keySet().stream().noneMatch(id -> "written_book".equals(
+                ItemIdentifier.baseItemId(id)));
     }
 
     private boolean physicalStackAllowed(ItemStack stack) {
@@ -2738,7 +2752,7 @@ public final class StashRetriever {
     }
 
     private boolean isShulkerBoxItem(String itemId) {
-        return ItemIdentifier.isShulkerBoxItem(itemId);
+        return itemId != null && itemId.contains("shulker_box");
     }
 
     private String itemIdFromStack(ItemStack stack) {

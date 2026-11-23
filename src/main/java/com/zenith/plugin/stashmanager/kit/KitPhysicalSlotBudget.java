@@ -6,11 +6,36 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import java.util.AbstractMap;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Collection;
 import java.util.Map;
 
 /** Lower bound for the physical slots still needed by a partly packed kit. */
 public final class KitPhysicalSlotBudget {
     private KitPhysicalSlotBudget() { }
+
+    /** Count slots after ordinary same-component stacking, including loose cargo. */
+    public static int requiredExactSlots(Collection<ItemStack> physicalStacks) {
+        if (physicalStacks == null) return Integer.MAX_VALUE;
+        Map<Map.Entry<Integer, Object>, Integer> totals = new HashMap<>();
+        for (ItemStack stack : physicalStacks) {
+            if (stack == null || stack.getId() <= 0 || stack.getAmount() <= 0)
+                return Integer.MAX_VALUE;
+            var item = ItemRegistry.REGISTRY.get(stack.getId());
+            if (item == null || item.stackSize() < 1
+                    || stack.getAmount() > item.stackSize()) return Integer.MAX_VALUE;
+            totals.merge(new AbstractMap.SimpleImmutableEntry<>(
+                    stack.getId(), stack.getDataComponents()),
+                    stack.getAmount(), Integer::sum);
+        }
+        long slots = 0;
+        for (var entry : totals.entrySet()) {
+            var item = ItemRegistry.REGISTRY.get(entry.getKey().getKey());
+            if (item == null || item.stackSize() < 1) return Integer.MAX_VALUE;
+            slots += 1L + (entry.getValue() - 1L) / item.stackSize();
+            if (slots > Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        }
+        return (int) slots;
+    }
 
     public static int minimumRemaining(Map<String, Integer> recipe,
                                        Map<String, Integer> packedContents) {

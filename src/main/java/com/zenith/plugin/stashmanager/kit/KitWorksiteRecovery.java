@@ -25,6 +25,7 @@ import java.util.ArrayDeque;
 import java.util.Arrays;
 import java.util.Deque;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
@@ -213,6 +214,12 @@ public final class KitWorksiteRecovery {
             emit("kit_recovery_manual_review", Map.of(
                     "reason", "world_boxes_recovered_check_cargo_before_resuming"));
             return true;
+        }
+        if ("borrowed_source".equals(current.kind())
+                && recoverAlreadyHeldSignedBookSource()) {
+            emit("kit_recovered_held_signed_book_source", Map.of(
+                    "position", pos(current.position())));
+            return nextTarget();
         }
         if ("kit_box".equals(current.kind())
                 && KitResumePolicy.canRecoverUnplacedKitShell(snapshot)) {
@@ -1078,6 +1085,36 @@ public final class KitWorksiteRecovery {
         } catch (IOException e) {
             return false;
         }
+        // An unopened source can contain signed books whose fingerprints change when
+        // the server materializes the placed box. The opened window is the new exact
+        // identity; return that intact box to a verified import before fetching cargo.
+        if ("borrowed_source".equals(current.kind())) {
+            int recoveredSourceSlot = recoveredOwnedBoxSlot();
+            Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+            Map<String, Integer> carriedContents = player == null || recoveredSourceSlot < 9
+                    ? Map.of() : ItemIdentifier.readShulkerContents(
+                            player.getItemStack(recoveredSourceSlot));
+            var scheduled = unopenedSignedBookReturnSnapshot(snapshot,
+                    observedItemId, observedContents, carriedContents, recoveredSourceSlot,
+                    looseCurrentItemCount(snapshot.currentItem()),
+                    KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot),
+                    System.currentTimeMillis());
+            if (scheduled != null) {
+                if (KitFulfillmentCoordinator.uniqueSourceReturnSlot(scheduled)
+                            != recoveredSourceSlot
+                        || KitResumePolicy.blocker(scheduled) != null) return false;
+                try {
+                    journal.save(scheduled);
+                    snapshot = scheduled;
+                    emit("kit_recovered_unopened_source_return_scheduled", Map.of(
+                            "source_slot", recoveredSourceSlot,
+                            "source_contents", observedContents));
+                    return true;
+                } catch (IOException e) {
+                    return false;
+                }
+            }
+        }
         if (misplacedSourceAtKitWorksite
                 && (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
                     || KitFulfillmentCoordinator.uniqueAuditedCargoSlot(snapshot)
@@ -1156,6 +1193,90 @@ public final class KitWorksiteRecovery {
         } catch (IOException e) {
             return false;
         }
+    }
+
+    private boolean recoverAlreadyHeldSignedBookSource() {
+        if (snapshot == null || snapshot.borrowedSourceWorksite() == null
+                || !Arrays.equals(current.position(), snapshot.borrowedSourceWorksite())
+                || !KitRecoveryIdentity.unopenedSignedBookRoundTrip(
+                        snapshot.borrowedSourceContents(),
+                        snapshot.borrowedSourceContents())) return false;
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        Container player = cache.getPlayerInventory();
+        ItemStack cursor = cache.getMouseStack();
+        if (player == null || cache.getOpenContainerId() > 0
+                || INVENTORY.hasActiveRequest()
+                || cursor != null && cursor.getAmount() > 0
+                || !World.isChunkLoadedBlockPos(current.position()[0], current.position()[2])
+                || World.getChunkSection(current.position()[0], current.position()[1],
+                        current.position()[2]) == null
+                || !BlockCompat.isAir(World.getBlock(current.position()[0],
+                        current.position()[1], current.position()[2]))) return false;
+        int sourceSlot = -1;
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack == null || stack.getAmount() != 1
+                    || !snapshot.borrowedSourceItemId().equals(ItemIdentifier.getItemId(stack))
+                    || !snapshot.borrowedSourceContents().equals(
+                            ItemIdentifier.readShulkerContents(stack))) continue;
+            if (sourceSlot >= 0) return false;
+            sourceSlot = raw;
+        }
+        var scheduled = unopenedSignedBookReturnSnapshot(snapshot,
+                snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                snapshot.borrowedSourceContents(), sourceSlot,
+                looseCurrentItemCount(snapshot.currentItem()),
+                KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot),
+                System.currentTimeMillis());
+        if (scheduled == null
+                || KitFulfillmentCoordinator.uniqueSourceReturnSlot(scheduled) != sourceSlot
+                || KitResumePolicy.blocker(scheduled) != null) return false;
+        try {
+            journal.save(scheduled);
+            snapshot = scheduled;
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    static KitFulfillmentJournalStore.Snapshot unopenedSignedBookReturnSnapshot(
+            KitFulfillmentJournalStore.Snapshot snapshot, String observedItemId,
+            Map<String, Integer> observedContents, Map<String, Integer> carriedContents,
+            int recoveredSourceSlot,
+            int looseCurrentItemCount, boolean ownedShellVerified, long now) {
+        if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                || !"kit_cargo_retrieval_incomplete".equals(snapshot.blocker())
+                || snapshot.resumeState() != null || snapshot.kitWorksite() != null
+                || snapshot.borrowedSourceWorksite() == null
+                || !snapshot.sourceBoxesToReturn().isEmpty()
+                || snapshot.auditedCargoSlot() >= 0
+                || !snapshot.auditedCargoSlots().isEmpty()
+                || snapshot.retainedShell() != null
+                || snapshot.variantRepair() != null
+                || snapshot.protectedLoose() != null
+                || snapshot.heldBoxRebase() != null
+                || snapshot.currentItem() == null || snapshot.currentQuantity() <= 0
+                || !snapshot.borrowedSourceItemId().equals(observedItemId)
+                || recoveredSourceSlot < 9 || recoveredSourceSlot > 44
+                || looseCurrentItemCount != 0 || !ownedShellVerified
+                || !KitRecoveryIdentity.unopenedSignedBookRoundTrip(
+                        snapshot.borrowedSourceContents(), observedContents)
+                || !KitRecoveryIdentity.recoveredSourceItemMatches(
+                        snapshot.borrowedSourceContents(), observedContents,
+                        carriedContents)) return null;
+        var recoveredSource = new KitFulfillmentJournalStore.BorrowedBox(
+                null, observedItemId, carriedContents);
+        return new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                Map.of(), "resume_source_return", now, "RETURNING_SOURCE",
+                now + 60_000L, List.of(recoveredSource), -1,
+                snapshot.writtenOffSources(), Map.of(), snapshot.incompleteBoxes(),
+                snapshot.missingTotals(), snapshot.currentBoxMissing())
+                .withDisplacedAppleSlots(snapshot.displacedAppleSlots());
     }
 
     private void guardNavigation() {
@@ -1254,10 +1375,15 @@ public final class KitWorksiteRecovery {
         for (int raw = 9; raw <= 44; raw++) {
             if (shulkerSlotsBeforeBreak.contains(raw)) continue;
             ItemStack stack = player.getItemStack(raw);
-            if (stack != null && stack.getAmount() > 0
-                    && observedItemId.equalsIgnoreCase(ItemIdentifier.baseItemId(
-                            ItemIdentifier.getItemId(stack)))
-                    && observedContents.equals(ItemIdentifier.readShulkerContents(stack))) {
+            if (stack == null || stack.getAmount() <= 0
+                    || !observedItemId.equalsIgnoreCase(ItemIdentifier.baseItemId(
+                            ItemIdentifier.getItemId(stack)))) continue;
+            Map<String, Integer> carriedContents = ItemIdentifier.readShulkerContents(stack);
+            if ("borrowed_source".equals(current.kind())
+                    ? KitRecoveryIdentity.recoveredSourceItemMatches(
+                            snapshot.borrowedSourceContents(), observedContents,
+                            carriedContents)
+                    : observedContents.equals(carriedContents)) {
                 if (found >= 0) return -1;
                 found = raw;
             }
