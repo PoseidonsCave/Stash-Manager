@@ -39,4 +39,19 @@ public final class ScanNavigationPolicy {
                 || playerY < minY || playerY > maxY
                 || playerZ < minZ || playerZ > maxZ;
     }
+
+    /** Limit travel to the corridor between the scan start and the selected region. */
+    public static boolean isOutsideTransitEnvelope(
+            double playerX, double playerY, double playerZ,
+            double startX, double startY, double startZ,
+            int[] pos1, int[] pos2,
+            double horizontalMargin, double verticalMargin) {
+        if (pos1 == null || pos2 == null || pos1.length < 3 || pos2.length < 3) return true;
+        return playerX < Math.min(startX, Math.min(pos1[0], pos2[0])) - horizontalMargin
+                || playerX > Math.max(startX, Math.max(pos1[0], pos2[0])) + 1 + horizontalMargin
+                || playerY < Math.min(startY, Math.min(pos1[1], pos2[1])) - verticalMargin
+                || playerY > Math.max(startY, Math.max(pos1[1], pos2[1])) + 1 + verticalMargin
+                || playerZ < Math.min(startZ, Math.min(pos1[2], pos2[2])) - horizontalMargin
+                || playerZ > Math.max(startZ, Math.max(pos1[2], pos2[2])) + 1 + horizontalMargin;
+    }
 }

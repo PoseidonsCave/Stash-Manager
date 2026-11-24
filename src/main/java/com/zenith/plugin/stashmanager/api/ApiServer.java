@@ -8,12 +8,14 @@ import com.zenith.plugin.stashmanager.index.ContainerIndex;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 // Serves the stash integration API.
 public class ApiServer implements AutoCloseable {
 
     private HttpServer server;
+    private ExecutorService executor;
     private volatile boolean running = false;
 
     private final StashManagerConfig config;
@@ -32,10 +34,12 @@ public class ApiServer implements AutoCloseable {
     public boolean start() {
         if (!config.apiEnabled) return false;
         if (running) return true;
+        ApiExposurePolicy.validate(config);
 
         try {
             server = HttpServer.create(new InetSocketAddress(config.apiBindAddress, config.apiPort), 0);
-            server.setExecutor(Executors.newFixedThreadPool(config.apiThreads));
+            executor = Executors.newFixedThreadPool(config.apiThreads);
+            server.setExecutor(executor);
 
             ApiHandler handler = new ApiHandler(config, module, index, database);
 
@@ -63,11 +67,20 @@ public class ApiServer implements AutoCloseable {
         return running;
     }
 
+    int boundPort() {
+        return server.getAddress().getPort();
+    }
+
     @Override
     public void close() {
         if (server != null) {
             server.stop(1);
+            server = null;
             running = false;
+        }
+        if (executor != null) {
+            executor.shutdownNow();
+            executor = null;
         }
     }
 }

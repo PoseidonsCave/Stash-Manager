@@ -9,11 +9,11 @@ import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import static com.zenith.Globals.CACHE;
 
 /** Places a held stack into an empty slot without Zenith's bundle-specific click path. */
-final class PlaceCursorStackInEmptySlot implements InventoryAction {
+public final class PlaceCursorStackInEmptySlot implements InventoryAction {
     private final int containerId;
     private final int slotId;
 
-    PlaceCursorStackInEmptySlot(int containerId, int slotId) {
+    public PlaceCursorStackInEmptySlot(int containerId, int slotId) {
         this.containerId = containerId;
         this.slotId = slotId;
     }
@@ -35,7 +35,8 @@ final class PlaceCursorStackInEmptySlot implements InventoryAction {
     static boolean canPlace(int containerId, int slotId, Container open, ItemStack cursor) {
         return open != null && open.getContainerId() == containerId
                 && slotId >= 0 && slotId < open.getSize()
-                && open.getItemStack(slotId) == Container.EMPTY_STACK
+                && (open.getItemStack(slotId) == null
+                        || open.getItemStack(slotId).getAmount() <= 0)
                 && cursor != null && cursor.getAmount() > 0;
     }
 }

@@ -30,6 +30,10 @@ public class ApiHandler {
     private final StashManagerModule module;
     private final ContainerIndex index;
     private final DatabaseManager database;
+    private final ExpiringSnapshot<LaneCapacityReport> laneCapacitySnapshot =
+            new ExpiringSnapshot<>(java.util.concurrent.TimeUnit.SECONDS.toNanos(5), System::nanoTime);
+    private final ExpiringSnapshot<Map<String, Object>> statisticsSnapshot =
+            new ExpiringSnapshot<>(java.util.concurrent.TimeUnit.SECONDS.toNanos(5), System::nanoTime);
 
     public ApiHandler(StashManagerConfig config, StashManagerModule module,
                       ContainerIndex index, DatabaseManager database) {
@@ -101,7 +105,11 @@ public class ApiHandler {
 
         Map<String, String> params = parseQueryParams(exchange.getRequestURI());
         int page = parseIntParam(params, "page", 1);
-        int size = Math.min(parseIntParam(params, "size", 50), 200);
+        int size = parseIntParam(params, "size", 50);
+        if (page < 1 || size < 1 || size > 200 || page > Integer.MAX_VALUE / size) {
+            sendError(exchange, 400, "page must be positive and size must be 1..200");
+            return;
+        }
 
         List<ContainerEntry> entries;
         int totalCount;
@@ -112,7 +120,7 @@ public class ApiHandler {
                 entries = database.getContainersPage(page, size);
                 totalCount = database.getContainerCount();
             } catch (Exception e) {
-                sendError(exchange, 500, "Database query failed: " + e.getMessage());
+                sendError(exchange, 500, "Database query failed");
                 return;
             }
         } else {
@@ -142,16 +150,20 @@ public class ApiHandler {
             sendError(exchange, 400, "Missing required parameter: item");
             return;
         }
+        if (item.length() > 128) {
+            sendError(exchange, 400, "item query is too long");
+            return;
+        }
 
         List<ContainerEntry> results;
         int totalItemCount;
 
         if (database != null && database.isInitialized()) {
             try {
-                results = database.searchContainers(item);
+                results = database.searchContainers(item, 201);
                 totalItemCount = database.getTotalItemCount(item);
             } catch (Exception e) {
-                sendError(exchange, 500, "Database query failed: " + e.getMessage());
+                sendError(exchange, 500, "Database query failed");
                 return;
             }
         } else {
@@ -159,11 +171,15 @@ public class ApiHandler {
             totalItemCount = index.totalItemCount(item);
         }
 
+        boolean truncated = results.size() > 200;
+        if (truncated) results = results.subList(0, 200);
+
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("query", item);
         body.put("readable_name", IndexExporter.toReadableName(item));
         body.put("total_item_count", totalItemCount);
         body.put("container_count", results.size());
+        body.put("results_truncated", truncated);
         body.put("containers", results.stream().map(this::containerToMap).toList());
 
         sendJson(exchange, 200, body);
@@ -178,9 +194,9 @@ public class ApiHandler {
 
         if (database != null && database.isInitialized()) {
             try {
-                body.putAll(database.getStatistics());
+                body.putAll(readCachedStatistics());
             } catch (Exception e) {
-                sendError(exchange, 500, "Database query failed: " + e.getMessage());
+                sendError(exchange, 500, "Database query failed");
                 return;
             }
         } else {
@@ -344,7 +360,7 @@ public class ApiHandler {
 
         if (database != null && database.isInitialized()) {
             try {
-                Map<String, Object> stats = database.getStatistics();
+                Map<String, Object> stats = readCachedStatistics();
                 if (stats.containsKey("total_items")) {
                     sb.append("# HELP stash_items_total Total number of items across all containers\n");
                     sb.append("# TYPE stash_items_total gauge\n");
@@ -402,9 +418,8 @@ public class ApiHandler {
                     organizer.getPermanentLaneGaps());
         }
 
-        LaneCapacityReport capacity = module.getLaneCapacityReport();
-        boolean importStagingAvailable = config.pos1 != null && config.pos2 != null
-                && index.getInRegion(config.pos1, config.pos2).stream().anyMatch(index::isImportChest);
+        LaneCapacityReport capacity = laneCapacitySnapshot.get(module::getLaneCapacityReport);
+        boolean importStagingAvailable = module.hasLaneCapacityImportStaging();
         sb.append("# HELP stash_lane_capacity_ready Whether the latest scan is trusted and has enough dedicated lanes\n");
         sb.append("# TYPE stash_lane_capacity_ready gauge\n");
         sb.append("stash_lane_capacity_ready ")
@@ -467,6 +482,18 @@ public class ApiHandler {
         sendText(exchange, 200, sb.toString());
     }
 
+    private Map<String, Object> readCachedStatistics() throws java.sql.SQLException {
+        Map<String, Object> stats = statisticsSnapshot.get(() -> {
+            try {
+                return database.getStatistics();
+            } catch (java.sql.SQLException ignored) {
+                return null;
+            }
+        });
+        if (stats == null) throw new java.sql.SQLException("statistics unavailable");
+        return stats;
+    }
+
     private static void appendGauge(StringBuilder output, String name, String help, Number value) {
         output.append("# HELP ").append(name).append(' ').append(help).append('\n');
         output.append("# TYPE ").append(name).append(" gauge\n");
@@ -525,13 +552,16 @@ public class ApiHandler {
                     module.getProxyControlGraceRemainingSeconds());
             body.put("status", organizer.getStatus());
         }
-        LaneCapacityReport capacity = module.getLaneCapacityReport();
+        LaneCapacityReport capacity = laneCapacitySnapshot.get(module::getLaneCapacityReport);
+        body.put("lane_capacity_region", module.getLaneCapacityRegionName());
         body.put("import_chest_blocks", index.getImportChestBlockCount());
         body.put("import_chests", index.getImportChests().stream()
                 .map(pos -> Map.of("x", pos[0], "y", pos[1], "z", pos[2]))
                 .toList());
         body.put("lane_capacity", Map.ofEntries(
                 Map.entry("status", capacity.status().name()),
+                Map.entry("import_chest_blocks_in_storage_region",
+                        module.getLaneCapacityImportChestBlockCount()),
                 Map.entry("detected_lanes", capacity.detectedLanes()),
                 Map.entry("protected_lanes", capacity.protectedLanes()),
                 Map.entry("assignable_lanes", capacity.assignableLanes()),
@@ -620,12 +650,16 @@ public class ApiHandler {
                     r.put("name", region.name());
                     r.put("pos1", Map.of("x", region.pos1()[0], "y", region.pos1()[1], "z", region.pos1()[2]));
                     r.put("pos2", Map.of("x", region.pos2()[0], "y", region.pos2()[1], "z", region.pos2()[2]));
+                    r.put("role", region.role() == DatabaseManager.RegionRole.UNASSIGNED
+                            ? null : region.role().databaseValue());
+                    r.put("effective_role", region.role().isStorageCapable()
+                            ? "storage" : region.role().databaseValue());
                     list.add(r);
                 }
                 body.put("regions", list);
                 body.put("count", regions.size());
             } catch (Exception e) {
-                sendError(exchange, 500, "Database query failed: " + e.getMessage());
+                sendError(exchange, 500, "Database query failed");
                 return;
             }
         } else {
@@ -661,6 +695,7 @@ public class ApiHandler {
                 Map<String, Object> kit = new LinkedHashMap<>();
                 kit.put("name", definition.name());
                 kit.put("status", definition.status().name().toLowerCase(Locale.ROOT));
+                kit.put("craft_missing", definition.craftMissing());
                 kit.put("items", definition.items());
                 kit.put("unique_items", definition.items().size());
                 kit.put("shulker_slots", definition.requiredSlots());
@@ -672,7 +707,7 @@ public class ApiHandler {
             }
             sendJson(exchange, 200, Map.of("count", kits.size(), "kits", kits));
         } catch (Exception e) {
-            sendError(exchange, 500, "Database query failed: " + e.getMessage());
+            sendError(exchange, 500, "Database query failed");
         }
     }
 
@@ -765,13 +800,8 @@ public class ApiHandler {
     }
 
     private boolean checkApiKey(HttpExchange exchange) throws IOException {
-        if (config.apiKey == null || config.apiKey.isBlank()) return true;
-
         String authHeader = exchange.getRequestHeaders().getFirst("Authorization");
-        if (authHeader != null && authHeader.startsWith("Bearer ")) {
-            String token = authHeader.substring("Bearer ".length());
-            if (config.apiKey.equals(token)) return true;
-        }
+        if (ApiExposurePolicy.acceptsBearer(config.apiKey, authHeader)) return true;
 
         sendError(exchange, 401, "Unauthorized: invalid or missing API key");
         return false;
@@ -781,14 +811,19 @@ public class ApiHandler {
         Map<String, String> params = new LinkedHashMap<>();
         String query = uri.getRawQuery();
         if (query == null) return params;
+        if (query.length() > 4096) return params;
 
-        for (String pair : query.split("&")) {
-            int eq = pair.indexOf('=');
-            if (eq > 0) {
-                String key = java.net.URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8);
-                String value = java.net.URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
-                params.put(key, value);
+        try {
+            for (String pair : query.split("&")) {
+                int eq = pair.indexOf('=');
+                if (eq > 0) {
+                    String key = java.net.URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8);
+                    String value = java.net.URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+                    params.put(key, value);
+                }
             }
+        } catch (IllegalArgumentException malformedQuery) {
+            return Map.of();
         }
         return params;
     }

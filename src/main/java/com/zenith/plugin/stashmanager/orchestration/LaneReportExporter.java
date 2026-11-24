@@ -279,6 +279,8 @@ public final class LaneReportExporter {
             case NEEDS_FRESH_SCAN -> "Run a fresh scan first";
             case NEEDS_FRESH_CONTAINER_SCAN -> "Scan the chests again first";
             case REGION_NOT_DEFINED -> "Set the stash area first";
+            case NO_STORAGE_REGION -> "No storage-capable region saved";
+            case MULTIPLE_STORAGE_REGIONS -> "Choose a storage region";
             case NO_SCANNED_CONTAINERS -> "Scan the stash first";
             case NO_LANES_DETECTED -> "No lanes found yet";
         };

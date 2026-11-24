@@ -20,6 +20,9 @@ import java.util.Optional;
 /** Atomic, local persistence for a long-running organizer transaction. */
 final class OrganizerJournalStore {
     static final int SCHEMA_VERSION = 1;
+    // Older binaries must reject a kit-owned inventory transaction rather than treating
+    // its extra pinned-slot fields as an ordinary organizer plan after a rollback.
+    static final int INVENTORY_RECOVERY_SCHEMA_VERSION = 2;
 
     record TaskSnapshot(
             int id,
@@ -53,10 +56,14 @@ final class OrganizerJournalStore {
 
     record Failure(String reason, String state, long timestamp) {}
 
+    record CraftMaterialSource(long inventoryKey, int slot, String fingerprint) {}
+
     record PackingSupply(PackingSupplySearch.Snapshot search, List<Integer> deferredTaskIds,
                          boolean stagingCargo, MixedStagingLedger.Snapshot stagingLedger,
                          Map<String, Integer> stagesWithoutDelivery,
-                         int craftingHeadroomStrategyVersion) {}
+                         int craftingHeadroomStrategyVersion,
+                         List<CraftMaterialSource> shellSourcesTried,
+                         List<CraftMaterialSource> chestSourcesTried) {}
 
     record MixedShellVerification(int elapsedTicks, boolean collectionConfirmed,
                                   String pickupFingerprint, List<Integer> cargoTaskIds) {}
@@ -64,17 +71,18 @@ final class OrganizerJournalStore {
     record ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
                                  String pickupStorageKey, String pickupItemId,
                                  int inventorySyncRecoveries,
-                                 int inventorySyncStrategyVersion) {
+                                 int inventorySyncStrategyVersion,
+                                 int manualPackedBoxCount) {
         ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
                               String pickupStorageKey, int inventorySyncRecoveries) {
             this(collectionConfirmed, pickupFingerprint, pickupStorageKey, null,
-                    inventorySyncRecoveries, 0);
+                    inventorySyncRecoveries, 0, 0);
         }
 
         ShulkerPickupEvidence(boolean collectionConfirmed, String pickupFingerprint,
                               int inventorySyncRecoveries) {
             this(collectionConfirmed, pickupFingerprint, null, null,
-                    inventorySyncRecoveries, 0);
+                    inventorySyncRecoveries, 0, 0);
         }
     }
 
@@ -87,7 +95,27 @@ final class OrganizerJournalStore {
             int[] regionPos2,
             List<TaskSnapshot> tasks,
             Map<String, ColumnSnapshot> columnAssignments,
-            List<Long> managedSourceContainerKeys) {}
+            List<Long> managedSourceContainerKeys,
+            List<StashOrganizer.IntakeRegion> intakeRegions,
+            boolean inventoryRecoveryOnly,
+            List<Integer> pinnedInventorySlots) {
+        Plan(int schemaVersion, String jobId, long createdAtEpochMilli, String dimension,
+             int[] regionPos1, int[] regionPos2, List<TaskSnapshot> tasks,
+             Map<String, ColumnSnapshot> columnAssignments,
+             List<Long> managedSourceContainerKeys,
+             List<StashOrganizer.IntakeRegion> intakeRegions) {
+            this(schemaVersion, jobId, createdAtEpochMilli, dimension, regionPos1, regionPos2,
+                    tasks, columnAssignments, managedSourceContainerKeys, intakeRegions,
+                    false, List.of());
+        }
+        Plan(int schemaVersion, String jobId, long createdAtEpochMilli, String dimension,
+             int[] regionPos1, int[] regionPos2, List<TaskSnapshot> tasks,
+             Map<String, ColumnSnapshot> columnAssignments,
+             List<Long> managedSourceContainerKeys) {
+            this(schemaVersion, jobId, createdAtEpochMilli, dimension, regionPos1, regionPos2,
+                    tasks, columnAssignments, managedSourceContainerKeys, List.of(), false, List.of());
+        }
+    }
 
     record Checkpoint(
             int schemaVersion,
@@ -198,6 +226,9 @@ final class OrganizerJournalStore {
 
         validatePlan(plan);
         validateCheckpointShape(checkpoint);
+        if (plan.schemaVersion() != checkpoint.schemaVersion()) {
+            throw new IOException("Organizer plan and checkpoint use different schemas");
+        }
         if (!plan.jobId().equals(checkpoint.jobId())) {
             throw new IOException("Organizer plan and checkpoint belong to different jobs");
         }
@@ -236,7 +267,10 @@ final class OrganizerJournalStore {
     }
 
     private static void validatePlan(Plan plan) throws IOException {
-        if (plan == null || plan.schemaVersion() != SCHEMA_VERSION) {
+        if (plan == null || (plan.schemaVersion() != SCHEMA_VERSION
+                && plan.schemaVersion() != INVENTORY_RECOVERY_SCHEMA_VERSION)
+                || (plan.inventoryRecoveryOnly()
+                    != (plan.schemaVersion() == INVENTORY_RECOVERY_SCHEMA_VERSION))) {
             throw new IOException("Unsupported organizer plan schema");
         }
         if (plan.jobId() == null || plan.jobId().isBlank()) {
@@ -247,6 +281,28 @@ final class OrganizerJournalStore {
         if (plan.tasks() == null || plan.columnAssignments() == null
                 || plan.managedSourceContainerKeys() == null) {
             throw new IOException("Organizer plan is missing required collections");
+        }
+        if (plan.inventoryRecoveryOnly()) {
+            if (plan.pinnedInventorySlots() == null || plan.pinnedInventorySlots().stream()
+                    .anyMatch(slot -> slot == null || slot < 9 || slot > 44)) {
+                throw new IOException("Inventory recovery plan has invalid pinned slots");
+            }
+        }
+        // Old single-region plans omit this optional field; null means no intake route.
+        if (plan.intakeRegions() != null) {
+            for (StashOrganizer.IntakeRegion region : plan.intakeRegions()) {
+                if (region == null || region.name() == null || region.name().isBlank()) {
+                    throw new IOException("Organizer plan contains an invalid intake region");
+                }
+                requirePosition(region.pos1(), "intake pos1");
+                requirePosition(region.pos2(), "intake pos2");
+                if (region.importBlocks() == null || region.importBlocks().isEmpty()) {
+                    throw new IOException("Organizer plan intake has no pinned import blocks");
+                }
+                for (int[] position : region.importBlocks()) {
+                    requirePosition(position, "intake import block");
+                }
+            }
         }
         java.util.HashSet<Integer> ids = new java.util.HashSet<>();
         for (TaskSnapshot task : plan.tasks()) {
@@ -262,7 +318,8 @@ final class OrganizerJournalStore {
     }
 
     private static void validateCheckpointShape(Checkpoint checkpoint) throws IOException {
-        if (checkpoint == null || checkpoint.schemaVersion() != SCHEMA_VERSION) {
+        if (checkpoint == null || (checkpoint.schemaVersion() != SCHEMA_VERSION
+                && checkpoint.schemaVersion() != INVENTORY_RECOVERY_SCHEMA_VERSION)) {
             throw new IOException("Unsupported organizer checkpoint schema");
         }
         if (checkpoint.jobId() == null || checkpoint.jobId().isBlank()
@@ -279,6 +336,17 @@ final class OrganizerJournalStore {
         if (checkpoint.completedTasks() < 0 || checkpoint.totalTasks() < 0) {
             throw new IOException("Organizer checkpoint has invalid task counts");
         }
+        for (int[] position : checkpoint.stagingImportDestinations()) {
+            requirePosition(position, "staging import destination");
+        }
+        if (checkpoint.mixedStagingUsedDestinations() != null) {
+            for (int[] position : checkpoint.mixedStagingUsedDestinations()) {
+                requirePosition(position, "mixed staging destination");
+            }
+        }
+        if (checkpoint.packDestination() != null) {
+            requirePosition(checkpoint.packDestination(), "packing destination");
+        }
         var supply = checkpoint.packingSupply();
         if (supply != null && supply.stagesWithoutDelivery() != null
                 && supply.stagesWithoutDelivery().entrySet().stream().anyMatch(e ->
@@ -294,7 +362,9 @@ final class OrganizerJournalStore {
             throw new IOException("Organizer checkpoint has invalid empty-shell verification state");
         }
         ShulkerPickupEvidence pickup = checkpoint.shulkerPickupEvidence();
-        if (pickup != null && pickup.inventorySyncRecoveries() < 0) {
+        if (pickup != null && (pickup.inventorySyncRecoveries() < 0
+                || pickup.manualPackedBoxCount() < 0
+                || pickup.manualPackedBoxCount() > 27 * 64)) {
             throw new IOException("Organizer checkpoint has invalid shulker-pickup recovery state");
         }
         if (checkpoint.packedImportTriedDestinationKeys() != null

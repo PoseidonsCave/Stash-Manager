@@ -2,6 +2,7 @@ package com.zenith.plugin.stashmanager;
 
 import com.github.rfresh2.EventConsumer;
 import com.zenith.Proxy;
+import com.zenith.cache.data.inventory.Container;
 import com.zenith.discord.Embed;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.event.client.ClientConnectEvent;
@@ -19,6 +20,9 @@ import com.zenith.feature.inventory.InventoryActionRequest;
 import com.zenith.feature.inventory.actions.CloseContainer;
 import com.zenith.feature.inventory.util.InventoryActionMacros;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
+import com.zenith.feature.pathfinder.PathInput;
+import com.zenith.feature.pathfinder.PlayerContext;
+import com.zenith.feature.pathfinder.goals.GoalBlock;
 import com.zenith.feature.pathfinder.goals.GoalGetToBlock;
 import com.zenith.feature.pathfinder.goals.GoalNear;
 import com.zenith.feature.pathfinder.movement.IMovement;
@@ -33,8 +37,65 @@ import com.zenith.mc.food.FoodRegistry;
 import com.zenith.module.api.Module;
 import com.zenith.network.codec.PacketHandlerCodec;
 import com.zenith.network.codec.PacketHandlerStateCodec;
+import com.zenith.network.codec.PostOutgoingPacketHandler;
+import com.zenith.network.client.ClientSession;
 import com.zenith.plugin.stashmanager.database.DatabaseManager;
+import com.zenith.plugin.stashmanager.index.ContainerEntry;
+import com.zenith.plugin.stashmanager.kit.KitFulfillmentJournalStore;
+import com.zenith.plugin.stashmanager.kit.KitInventoryReconciliationBoundary;
+import com.zenith.plugin.stashmanager.kit.KitInventoryAppleOwnership;
+import com.zenith.plugin.stashmanager.kit.KitReturnPlaybook;
+import com.zenith.plugin.stashmanager.kit.KitFulfillmentPlan;
+import com.zenith.plugin.stashmanager.kit.KitCapacity;
+import com.zenith.plugin.stashmanager.profile.ItemProfiles;
+import com.zenith.plugin.stashmanager.kit.KitWorkingLanePlan;
+import com.zenith.plugin.stashmanager.kit.KitWorkingFillAdmission;
+import com.zenith.plugin.stashmanager.kit.KitWorkingFillCoordinator;
+import com.zenith.plugin.stashmanager.kit.KitWorkingFillJournal;
+import com.zenith.plugin.stashmanager.kit.KitWorkingMinecraftPort;
+import com.zenith.plugin.stashmanager.kit.KitWorkingFillPreparation;
+import com.zenith.plugin.stashmanager.kit.KitWorkingSourceAssignmentPlan;
+import com.zenith.plugin.stashmanager.kit.KitWorkingReservationPreparation;
+import com.zenith.plugin.stashmanager.kit.KitWorkingRecoveryPreparation;
+import com.zenith.plugin.stashmanager.kit.KitWorkingManifestPlan;
+import com.zenith.plugin.stashmanager.kit.KitWorkingLaneAllocation;
+import com.zenith.plugin.stashmanager.kit.KitWorkingTransferJournal;
+import com.zenith.plugin.stashmanager.kit.KitConsolidationPlan;
+import com.zenith.plugin.stashmanager.kit.KitExportAudit;
+import com.zenith.plugin.stashmanager.kit.KitEmptyShellOwnershipAudit;
+import com.zenith.plugin.stashmanager.kit.KitCraftingPlan;
+import com.zenith.plugin.stashmanager.kit.KitLostSourcePolicy;
+import com.zenith.plugin.stashmanager.kit.KitLostSourceIndexPolicy;
+import com.zenith.plugin.stashmanager.kit.KitNoCargoKeepAudit;
+import com.zenith.plugin.stashmanager.kit.KitCargoAudit;
+import com.zenith.plugin.stashmanager.kit.KitShiftedShellCargoAudit;
+import com.zenith.plugin.stashmanager.kit.KitPartialBorrowedCargoGuard;
+import com.zenith.plugin.stashmanager.kit.KitHeldBorrowedBoxPolicy;
+import com.zenith.plugin.stashmanager.kit.KitHeldScanRecoveryPolicy;
+import com.zenith.plugin.stashmanager.kit.KitResumeCadence;
+import com.zenith.plugin.stashmanager.kit.KitResumePolicy;
+import com.zenith.plugin.stashmanager.kit.KitSameContentReturnAudit;
+import com.zenith.plugin.stashmanager.kit.KitOutputChestPolicy;
+import com.zenith.plugin.stashmanager.kit.KitPhysicalSlotBudget;
+import com.zenith.plugin.stashmanager.kit.KitPackedStackCapacityRepair;
+import com.zenith.plugin.stashmanager.kit.KitRetainedShell;
+import com.zenith.plugin.stashmanager.kit.KitScanAdmission;
+import com.zenith.plugin.stashmanager.kit.KitSourceGuiAudit;
+import com.zenith.plugin.stashmanager.kit.KitAppleExchangePlan;
+import com.zenith.plugin.stashmanager.kit.KitItemSourcePolicy;
+import com.zenith.plugin.stashmanager.kit.KitSourceDiagnostics;
+import com.zenith.plugin.stashmanager.kit.KitSourceReturnPolicy;
+import com.zenith.plugin.stashmanager.kit.KitVariantExchangePlan;
+import com.zenith.plugin.stashmanager.kit.KitCrystalNormalizationPlan;
+import com.zenith.plugin.stashmanager.kit.KitVariantFingerprint;
+import com.zenith.plugin.stashmanager.kit.KitVariantShellRebaseline;
+import com.zenith.plugin.stashmanager.kit.KitWorksiteRecovery;
+import java.io.IOException;
+import java.nio.file.Path;
 import com.zenith.plugin.stashmanager.debug.DebugRecorder;
+import com.zenith.plugin.stashmanager.debug.KitInteractionTrace;
+import com.zenith.plugin.stashmanager.debug.PoseTraceRecorder;
+import com.zenith.plugin.stashmanager.debug.WorldGeometrySnapshot;
 import com.zenith.plugin.stashmanager.index.ContainerIndex;
 import com.zenith.plugin.stashmanager.orchestration.CooperativePreemptionGate;
 import com.zenith.plugin.stashmanager.orchestration.ConnectionRecoveryTracker;
@@ -44,18 +105,34 @@ import com.zenith.plugin.stashmanager.orchestration.FoodContingencyRetryPolicy;
 import com.zenith.plugin.stashmanager.orchestration.KeepReequipSelection;
 import com.zenith.plugin.stashmanager.orchestration.JobContinuanceManager;
 import com.zenith.plugin.stashmanager.orchestration.LaneCapacityReport;
+import com.zenith.plugin.stashmanager.orchestration.MultiRegionImportRoutePolicy;
 import com.zenith.plugin.stashmanager.orchestration.ContainerApproach;
+import com.zenith.plugin.stashmanager.orchestration.ContainerAccessPlanner;
+import com.zenith.plugin.stashmanager.orchestration.ContainerOpenReach;
+import com.zenith.plugin.stashmanager.orchestration.AlternateApproachProgress;
 import com.zenith.plugin.stashmanager.orchestration.OpenRetryCadence;
+import com.zenith.plugin.stashmanager.orchestration.ScanChestOpenFallback;
+import com.zenith.plugin.stashmanager.orchestration.ScanPathRetryCadence;
 import com.zenith.plugin.stashmanager.orchestration.ScanCompletionPolicy;
+import com.zenith.plugin.stashmanager.orchestration.ScanQueueCursor;
+import com.zenith.plugin.stashmanager.orchestration.RegionCapacitySelector;
 import com.zenith.plugin.stashmanager.orchestration.ScanNavigationPolicy;
+import com.zenith.plugin.stashmanager.orchestration.ScanWalkProgress;
+import com.zenith.plugin.stashmanager.orchestration.StorageClassPolicy;
 import com.zenith.plugin.stashmanager.orchestration.SneakReleaseGate;
 import com.zenith.plugin.stashmanager.orchestration.TailRetryTracker;
 import com.zenith.plugin.stashmanager.organizer.StashOrganizer;
+import com.zenith.plugin.stashmanager.organizer.KitExporter;
+import com.zenith.plugin.stashmanager.organizer.KitFulfillmentCoordinator;
+import com.zenith.plugin.stashmanager.organizer.KitInventoryAdmissionPolicy;
+import com.zenith.plugin.stashmanager.organizer.KitInventoryDispositionPolicy;
+import com.zenith.plugin.stashmanager.organizer.KitPacker;
 import com.zenith.plugin.stashmanager.retriever.StashRetriever;
 import com.zenith.plugin.stashmanager.scanner.ContainerReader;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner;
 import com.zenith.plugin.stashmanager.scanner.RegionScanner.ContainerLocation;
 import com.zenith.plugin.stashmanager.util.DoubleChestIdentity;
+import com.zenith.plugin.stashmanager.util.BlockCompat;
 import com.zenith.plugin.stashmanager.util.ItemIdentifier;
 import com.zenith.plugin.stashmanager.travel.tunnel.network.sync.SyncWorker;
 import com.zenith.util.RequestFuture;
@@ -64,15 +141,24 @@ import org.geysermc.mcprotocollib.protocol.data.game.level.block.BlockEntityType
 import org.geysermc.mcprotocollib.protocol.data.game.item.ItemStack;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.entity.ClientboundTakeItemEntityPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetContentPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerSetSlotPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundContainerClosePacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.clientbound.inventory.ClientboundOpenScreenPacket;
+import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClickPacket;
 import org.geysermc.mcprotocollib.protocol.packet.ingame.serverbound.inventory.ServerboundContainerClosePacket;
 import org.jspecify.annotations.Nullable;
 
+import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 
 import static com.github.rfresh2.EventConsumer.of;
@@ -86,6 +172,7 @@ public class StashManagerModule extends Module {
         IDLE,
         ZONE_SCANNING,
         WALKING,
+        APPROACHING,
         OPENING,
         READING,
         CLOSING,
@@ -112,7 +199,7 @@ public class StashManagerModule extends Module {
     private final ContainerIndex index;
     private final RegionScanner regionScanner;
     private ContainerReader containerReader;
-    private final StashManagerNotifications notifications = new StashManagerNotifications();
+    private final StashManagerNotifications notifications;
     private int foodSafetyProbeTicks;
     private static final String KEEP_REEQUIP_REQUEST = "reequip:keep";
     private static final String KEEP_REEQUIP_FOOD_REQUEST = "reequip:food";
@@ -135,6 +222,26 @@ public class StashManagerModule extends Module {
     // Organizer integration
     private StashOrganizer organizer;
     private final StashRetriever retriever;
+    private final KitFulfillmentJournalStore kitJournal = KitFulfillmentJournalStore.defaultStore();
+    private final KitPacker kitPacker = new KitPacker();
+    private final KitExporter kitExporter = new KitExporter();
+    private final KitFulfillmentCoordinator kitFulfillment;
+    private final KitWorkingFillJournal kitWorkingFillJournal = KitWorkingFillJournal.defaultStore();
+    private final KitWorkingTransferJournal kitWorkingTransferJournal =
+            KitWorkingTransferJournal.defaultStore();
+    private final KitWorkingFillCoordinator kitWorkingFill;
+    private @Nullable KitWorkingFillPreparation kitWorkingPreparation;
+    private @Nullable KitWorkingRecoveryPreparation kitWorkingRecovery;
+    private @Nullable KitWorkingReservationPreparation kitWorkingReservation;
+    private boolean kitWorkingReservationRelease;
+    private int[] kitWorkingReservationPosition;
+    private KitWorkingManifestPlan.@Nullable Report kitWorkingReservationPlan;
+    private DatabaseManager.@Nullable ScanSummary kitWorkingReservationScan;
+    private Map<String, Long> kitWorkingReservationClaims = Map.of();
+    private String lastKitWorkingPreparationResult = "none";
+    private final KitWorksiteRecovery kitRecovery = new KitWorksiteRecovery(kitJournal);
+    private final KitResumeCadence kitResumeCadence = new KitResumeCadence(40);
+    private long lastKitResumeWaitDiagnosticEpochMilli;
 
     private volatile ScanState state = ScanState.IDLE;
     private List<ContainerLocation> pendingContainers = new ArrayList<>();
@@ -143,6 +250,12 @@ public class StashManagerModule extends Module {
     private int openTimeoutCounter = 0;
     private int openInteractionAttempts = 0;
     private int lastOpenInteractionTick = -1;
+    private @Nullable BlockPos scanOpenClickTarget;
+    private @Nullable BlockPos scanAlternateGoal;
+    private final AlternateApproachProgress scanAlternateProgress = new AlternateApproachProgress();
+    private final Map<Long, Set<Long>> rejectedScanStances = new HashMap<>();
+    private final Map<Long, Integer> scanAlternateAttempts = new HashMap<>();
+    private static final int MAX_SCAN_ALTERNATE_STANCES = 5;
     private boolean containerDataReceived = false;
     private final SneakReleaseGate containerOpenGate = new SneakReleaseGate();
 
@@ -200,6 +313,7 @@ public class StashManagerModule extends Module {
     // A scanner target owns no inventory cargo, so a transient failure can safely move the
     // untouched target to the tail. Counts stay tied to physical containers, not attempts.
     private final Set<Long> discoveredContainerKeys = new HashSet<>();
+    private final Set<Long> settledContainerKeys = new HashSet<>();
     private static final int MAX_CONTAINER_ATTEMPTS = 3;
     private final TailRetryTracker<Long> containerRetries =
         new TailRetryTracker<>(MAX_CONTAINER_ATTEMPTS);
@@ -215,7 +329,9 @@ public class StashManagerModule extends Module {
     private int walkRetryCount = 0;
     private static final int MAX_WALK_RETRIES = 3;
     private int walkingTickCount = 0;
-    private static final int WALK_TIMEOUT_TICKS = 600; // 30 seconds at 20tps
+    private int lastContainerPathRequestTick = 0;
+    private final ScanWalkProgress scanWalkProgress = new ScanWalkProgress();
+    private static final int PATH_RETRY_SETTLE_TICKS = 20;
     private static final int DOOR_OPEN_TIMEOUT_TICKS = 60;
     private final Set<BlockPos> attemptedScanDoors = new HashSet<>();
     private @Nullable BlockPos scanDoorOpeningPos;
@@ -231,15 +347,31 @@ public class StashManagerModule extends Module {
     private DatabaseManager database;
     private long currentScanId = -1;
     private boolean latestScanTrusted = false;
+    private @Nullable int[] activeScanPos1;
+    private @Nullable int[] activeScanPos2;
+    private @Nullable String activeScanRegionName;
+    private final List<DatabaseManager.SavedRegion> pendingScanRegions = new ArrayList<>();
+    private int scanRegionHandoffWaitTicks;
+    private boolean scanTransitActive;
+    private double scanTransitX, scanTransitY, scanTransitZ;
+    private static final double NAMED_SCAN_START_HORIZONTAL_MARGIN = 128.0;
+    private static final double NAMED_SCAN_START_VERTICAL_MARGIN = 48.0;
 
     // Tunnel network sync
     private final SyncWorker tunnelNetworkSyncWorker;
 
     // Exportable troubleshooting log (see /stash debug)
     private final DebugRecorder debugRecorder = new DebugRecorder();
+    private final DebugRecorder geometryRecorder = new DebugRecorder(128, 16000);
+    private final PoseTraceRecorder poseTraceRecorder = new PoseTraceRecorder();
+    private final KitInteractionTrace kitInteractionTrace = KitInteractionTrace.defaultStore();
+    private boolean kitInteractionTraceFailureReported;
+    private int poseTraceTicks;
+    private static final int POSE_TRACE_SAMPLE_TICKS = 10;
 
     public StashManagerModule(StashManagerConfig config, ContainerIndex index) {
         this.config = config;
+        this.notifications = new StashManagerNotifications(config);
         this.index = index;
         this.scannerPreemptionGate = newScannerPreemptionGate();
         this.organizerPreemptionGate = newOrganizerPreemptionGate();
@@ -247,6 +379,19 @@ public class StashManagerModule extends Module {
         this.containerReader = new ContainerReader(index);
         this.retriever = new StashRetriever();
         this.retriever.setEventCallback(this::handleAutomationEvent);
+        this.kitFulfillment = new KitFulfillmentCoordinator(
+                retriever, kitPacker, kitExporter, kitJournal);
+        this.kitWorkingFill = new KitWorkingFillCoordinator(
+                kitWorkingFillJournal, kitWorkingTransferJournal,
+                () -> new KitWorkingMinecraftPort(this::workingFillOwnsAutomation),
+                ticket -> KitWorkingFillAdmission.blocker(database, index,
+                        config.pos1, config.pos2, ticket,
+                        workingFillOwnsAutomation()) == null,
+                ticket -> database != null && database.activateVerifiedKitWorkingSlot(ticket));
+        this.kitFulfillment.setEventCallback(this::handleAutomationEvent);
+        this.kitPacker.setEventCallback(this::handleAutomationEvent);
+        this.kitExporter.setEventCallback(this::handleAutomationEvent);
+        this.kitRecovery.setEventCallback(this::handleAutomationEvent);
         this.tunnelNetworkSyncWorker = new SyncWorker(config);
     }
 
@@ -267,17 +412,3839 @@ public class StashManagerModule extends Module {
     }
 
     public LaneCapacityReport getLaneCapacityReport() {
-        return organizer == null
-                ? LaneCapacityReport.unavailable(LaneCapacityReport.Status.NO_SCANNED_CONTAINERS)
-                : organizer.calculateLaneCapacity();
+        if (organizer == null) {
+            return LaneCapacityReport.unavailable(LaneCapacityReport.Status.NO_SCANNED_CONTAINERS);
+        }
+        var selection = selectLaneCapacityRegion();
+        return switch (selection.result()) {
+            case SELECTED -> organizer.calculateLaneCapacity(selection.pos1(), selection.pos2());
+            case NO_REGION -> LaneCapacityReport.unavailable(LaneCapacityReport.Status.REGION_NOT_DEFINED);
+            case NO_STORAGE_REGION -> LaneCapacityReport.unavailable(LaneCapacityReport.Status.NO_STORAGE_REGION);
+            case AMBIGUOUS -> LaneCapacityReport.unavailable(LaneCapacityReport.Status.MULTIPLE_STORAGE_REGIONS);
+        };
+    }
+
+    public @Nullable String getLaneCapacityRegionName() {
+        return selectLaneCapacityRegion().name();
+    }
+
+    public boolean hasLaneCapacityImportStaging() {
+        return getLaneCapacityImportChestBlockCount() > 0;
+    }
+
+    public int getLaneCapacityImportChestBlockCount() {
+        var selection = selectLaneCapacityRegion();
+        if (!selection.selected()) return 0;
+        if (organizer != null && organizer.isActive()
+                && Arrays.equals(selection.pos1(), config.pos1)
+                && Arrays.equals(selection.pos2(), config.pos2)) {
+            return organizer.scopedImportChestBlockCount();
+        }
+        return (int) index.getImportChests().stream().filter(position ->
+                inBounds(position, selection.pos1(), selection.pos2())).count();
+    }
+
+    private static boolean inBounds(int[] position, int[] pos1, int[] pos2) {
+        for (int axis = 0; axis < 3; axis++) {
+            if (position[axis] < Math.min(pos1[axis], pos2[axis])
+                    || position[axis] > Math.max(pos1[axis], pos2[axis])) return false;
+        }
+        return true;
+    }
+
+    private RegionCapacitySelector.Selection selectLaneCapacityRegion() {
+        if (database != null && database.isInitialized()) {
+            try {
+                return RegionCapacitySelector.select(database.listRegions(), config.pos1, config.pos2);
+            } catch (Exception e) {
+                warn("Cannot select storage region for lane capacity: {}", e.getMessage());
+                return new RegionCapacitySelector.Selection(
+                        RegionCapacitySelector.Result.NO_STORAGE_REGION, null, null, null);
+            }
+        }
+        return RegionCapacitySelector.select(List.of(), config.pos1, config.pos2);
     }
 
     public StashRetriever getRetriever() {
         return retriever;
     }
 
+    public KitFulfillmentCoordinator getKitFulfillment() { return kitFulfillment; }
+    public KitWorksiteRecovery getKitRecovery() { return kitRecovery; }
+
+    /** Read-only live evidence for a blocked kit; indexed stock is advisory, not proof of contents. */
+    public String diagnoseKitSources() {
+        final KitFulfillmentJournalStore.Snapshot snapshot;
+        try {
+            snapshot = kitJournal.load().orElse(null);
+        } catch (IOException e) {
+            return "Kit checkpoint could not be read: " + e.getMessage();
+        }
+        if (snapshot == null) return "No kit checkpoint to diagnose.";
+        String item = snapshot.currentItem();
+        if (item == null || item.isBlank()) {
+            return "Kit checkpoint has no current retrieval item (phase " + snapshot.state() + ").";
+        }
+
+        boolean connected = Proxy.getInstance().isConnected();
+        var player = CACHE.getPlayerCache();
+        double px = player.getX(), py = player.getY(), pz = player.getZ();
+        StringBuilder out = new StringBuilder(2200);
+        out.append("Checkpoint: ").append(snapshot.kitName()).append(' ')
+                .append(snapshot.completedBoxes()).append('/').append(snapshot.requestedBoxes())
+                .append(" delivered; state=").append(snapshot.state())
+                .append("; blocker=").append(snapshot.blocker())
+                .append("\nNext item: ").append(item)
+                .append(" x").append(snapshot.currentQuantity());
+        out.append("\nBot: ").append(connected ? "connected" : "disconnected")
+                .append(Proxy.getInstance().hasActivePlayer() ? ", client attached" : ", no client")
+                .append(connected ? ", position=" + String.format(java.util.Locale.ROOT,
+                        "%.2f,%.2f,%.2f", px, py, pz) : ", position not trusted");
+
+        var inventory = player.getInventoryCache();
+        int shellSlot = snapshot.ownedShellSlot();
+        Container playerInventory = connected ? inventory.getPlayerInventory() : null;
+        ItemStack shell = playerInventory == null || shellSlot < 9 || shellSlot > 44
+                ? null : playerInventory.getItemStack(shellSlot);
+        out.append("\nKit shell: journal slot ").append(shellSlot);
+        if (!connected) out.append("; live identity unavailable while disconnected");
+        else if (shell == null || shell.getAmount() != 1) out.append("; no single live item in slot");
+        else out.append("; live item=").append(ItemIdentifier.baseItemId(
+                        ItemIdentifier.getItemId(shell)))
+                .append("; contents match journal=")
+                .append(snapshot.packedContents().equals(ItemIdentifier.readShulkerContents(shell)));
+        out.append("\nBorrowed sources pending return=").append(snapshot.sourceBoxesToReturn().size())
+                .append("; written off=").append(snapshot.writtenOffSources().size());
+
+        List<ContainerEntry> entries = index.getAll().stream()
+                .filter(entry -> config.pos1 == null || config.pos2 == null
+                        || inConfiguredRegion(entry))
+                .toList();
+        List<KitSourceDiagnostics.Source> sources = KitSourceDiagnostics.find(
+                entries, item, px, py, pz, 6);
+        out.append("\nExact indexed sources (advisory, up to 6): ")
+                .append(sources.size());
+        for (var source : sources) {
+            ContainerEntry entry = source.entry();
+            out.append("\n- ").append(entry.posString()).append(' ')
+                    .append(entry.readableBlockType()).append(": total=")
+                    .append(source.total()).append(" direct=").append(source.direct())
+                    .append(" nested=").append(source.nested())
+                    .append(" in ").append(source.matchingShulkers()).append(" physical shulker(s)")
+                    .append("; ").append(kitTargetAccessSummary(
+                            entry.x(), entry.y(), entry.z(), connected, px, py, pz));
+            if (index.isBlacklistedChest(entry) || index.isExportChest(entry)) {
+                out.append("; reserved/blacklisted");
+            }
+        }
+        out.append("\nNo container was opened and no item, path, or checkpoint was changed.");
+        return out.toString();
+    }
+
+    /** Probe one block's cached geometry without pathing or interacting with it. */
+    public String diagnoseKitTarget(int x, int y, int z) {
+        if (!Proxy.getInstance().isConnected()) return "Bot is disconnected; live geometry is unavailable.";
+        if (!World.isInWorldBounds(x, y, z)) return "Target is outside world bounds.";
+        var player = CACHE.getPlayerCache();
+        try {
+            String detail = WorldGeometrySnapshot.capture(x, y, z, null,
+                    player.getX(), player.getY(), player.getZ(),
+                    player.getYaw(), player.getPitch());
+            geometryRecorder.record("kit_manual_probe", detail);
+            return detail.length() <= 3200 ? detail
+                    : detail.substring(0, 3200) + "… Full snapshot: /stash debug geometry export.";
+        } catch (RuntimeException e) {
+            return "Live geometry probe failed: " + e.getClass().getSimpleName();
+        }
+    }
+
+    private static String kitTargetAccessSummary(int x, int y, int z, boolean connected,
+                                                 double px, double py, double pz) {
+        if (!connected) return "live block unavailable";
+        if (!World.isChunkLoadedBlockPos(x, z)
+                || World.getChunkSection(x, y, z) == null) return "chunk/section not loaded";
+        try {
+            var block = World.getBlock(x, y, z);
+            return "live=" + (block == null ? "unknown" : block.name())
+                    + " distance=" + String.format(java.util.Locale.ROOT, "%.1f",
+                            Math.sqrt(Math.pow(px - (x + 0.5), 2)
+                                    + Math.pow(py - (y + 0.5), 2)
+                                    + Math.pow(pz - (z + 0.5), 2)))
+                    + " access=" + ContainerApproach.isAtAccessPosition(px, py, pz, x, y, z)
+                    + " reach=" + ContainerApproach.isWithinVanillaReach(px, py, pz, x, y, z)
+                    + " visible=" + ContainerAccessPlanner.visible(px, py, pz, x, y, z);
+        } catch (RuntimeException e) {
+            return "live geometry unavailable (" + e.getClass().getSimpleName() + ')';
+        }
+    }
+
+    /** Inspect the currently open GUI only; never clicks, moves, or journals an item. */
+    public String inspectOpenKitSource() {
+        final KitFulfillmentJournalStore.Snapshot snapshot;
+        try {
+            snapshot = kitJournal.load().orElse(null);
+        } catch (IOException e) {
+            return "Checkpoint could not be read: " + e.getMessage();
+        }
+        if (snapshot == null || snapshot.sourceBoxesToReturn() == null
+                || snapshot.sourceBoxesToReturn().size() != 1) {
+            return "No checkpoint with exactly one journaled borrowed source box.";
+        }
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        int openId = inventory.getOpenContainerId();
+        Container open = inventory.getOpenContainer();
+        if (openId <= 0 || open == null || open.getContainerId() != openId) {
+            return "No live container GUI is open. Open the candidate chest and retry.";
+        }
+        int chestSlots = open.getSize() - 36;
+        if (chestSlots != 27 && chestSlots != 54) {
+            return "The open GUI has " + chestSlots + " container slots, not a chest.";
+        }
+        var source = snapshot.sourceBoxesToReturn().getFirst();
+        List<KitSourceGuiAudit.Box> boxes = new ArrayList<>();
+        int readable = 0;
+        for (int slot = 0; slot < chestSlots; slot++) {
+            ItemStack stack = open.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0) continue;
+            String itemId = ItemIdentifier.getItemId(stack);
+            if (!ItemIdentifier.baseItemId(itemId).contains("shulker_box")) continue;
+            Map<String, Integer> contents = ItemIdentifier.readShulkerContents(stack);
+            if (!contents.isEmpty()) readable++;
+            boxes.add(new KitSourceGuiAudit.Box(slot, itemId, stack.getAmount(), contents));
+        }
+        List<Integer> matches = KitSourceGuiAudit.exactMatches(
+                boxes, source.itemId(), source.contents());
+        List<KitSourceGuiAudit.Candidate> nearest = matches.isEmpty()
+                ? KitSourceGuiAudit.nearestCandidates(boxes, source.itemId(), source.contents(), 5)
+                : List.of();
+        String nearestReport = nearest.isEmpty() ? ""
+                : " Closest contents (not verified identities): " + nearest.stream()
+                .map(candidate -> "slot " + candidate.slot() + " [shared " + candidate.shared()
+                        + ", missing " + candidate.missing() + ", extra " + candidate.extra()
+                        + ", same box item " + candidate.sameBoxItem() + "]")
+                .collect(java.util.stream.Collectors.joining("; ")) + ".";
+        String crystalReport = "";
+        Container player = inventory.getPlayerInventory();
+        int shellRaw = snapshot.ownedShellSlot();
+        ItemStack shell = player == null || shellRaw < 9 || shellRaw > 44
+                ? null : player.getItemStack(shellRaw);
+        if (shell != null && shell.getAmount() == 1
+                && snapshot.packedContents().equals(ItemIdentifier.readShulkerContents(shell))) {
+            List<ItemStack> crystals = new ArrayList<>();
+            int crystalTotal = 0;
+            for (ItemStack stack : ItemIdentifier.readShulkerPhysicalStacks(shell)) {
+                if ("end_crystal".equals(ItemIdentifier.getItemId(stack))) {
+                    crystals.add(stack);
+                    crystalTotal += stack.getAmount();
+                }
+            }
+            if (crystals.size() == 5 && crystalTotal == 256) {
+                ItemStack exemplar = crystals.getFirst();
+                int targetInShell = 0;
+                for (ItemStack stack : crystals) {
+                    if (stack.getId() == exemplar.getId()
+                            && java.util.Objects.equals(stack.getDataComponents(),
+                                    exemplar.getDataComponents())) {
+                        targetInShell += stack.getAmount();
+                    }
+                }
+                if (targetInShell == 113) {
+                    List<String> candidates = new ArrayList<>();
+                    int matchingTotal = 0;
+                    int matchingSlots = 0;
+                    for (int slot = 0; slot < chestSlots; slot++) {
+                        ItemStack stack = open.getItemStack(slot);
+                        if (stack == null || stack.getAmount() <= 0) continue;
+                        List<ItemStack> physical = "end_crystal".equals(ItemIdentifier.getItemId(stack))
+                                ? List.of(stack) : ItemIdentifier.readShulkerPhysicalStacks(stack);
+                        int matching = 0;
+                        for (ItemStack inner : physical) {
+                            if (inner.getId() == exemplar.getId()
+                                    && java.util.Objects.equals(inner.getDataComponents(),
+                                            exemplar.getDataComponents())) {
+                                matching += inner.getAmount();
+                            }
+                        }
+                        if (matching > 0) {
+                            matchingTotal += matching;
+                            matchingSlots++;
+                            if (candidates.size() < 15) candidates.add("slot " + slot + " x" + matching);
+                        }
+                    }
+                    crystalReport = " Live component-exact matches for the kit shell's 113-crystal "
+                            + "variant: " + matchingTotal + " in " + matchingSlots
+                            + " slot(s), first " + candidates.size() + ": "
+                            + candidates + ". These are read-only GUI observations, not reserved stock.";
+                } else {
+                    crystalReport = " Kit crystal variant totals changed; no source comparison made.";
+                }
+            } else {
+                crystalReport = " Kit crystal stack count changed; no source comparison made.";
+            }
+        } else {
+            crystalReport = " Owned kit shell did not match the checkpoint; no source comparison made.";
+        }
+        return "Read-only inspection of " + chestSlots + " GUI slots: " + boxes.size()
+                + " shulker stacks, " + readable + " with readable contents. "
+                + (matches.isEmpty() ? "No exact journaled source match."
+                : "Exact journaled source match at zero-based chest slot(s) " + matches + ".")
+                + nearestReport
+                + crystalReport
+                + " No items or checkpoint state were changed.";
+    }
+
+    /** Read-only comparison of a live shulker window with the journaled kit worksite. */
+    public String inspectOpenKitWorksite() {
+        final KitFulfillmentJournalStore.Snapshot snapshot;
+        try {
+            snapshot = kitJournal.load().orElse(null);
+        } catch (IOException e) {
+            return "Checkpoint could not be read: " + e.getMessage();
+        }
+        if (snapshot == null || snapshot.kitWorksite() == null) {
+            return "No journaled kit worksite exists.";
+        }
+        int[] position = snapshot.kitWorksite();
+        if (!World.isChunkLoadedBlockPos(position[0], position[2])
+                || !World.getBlock(position[0], position[1], position[2])
+                        .name().contains("shulker_box")) {
+            return "The journaled worksite is not a loaded placed shulker.";
+        }
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        int openId = inventory.getOpenContainerId();
+        Container open = inventory.getOpenContainer();
+        if (openId <= 0 || open == null || open.getContainerId() != openId
+                || open.getSize() - 36 != 27) {
+            return "Open the placed kit shulker before inspecting its live contents.";
+        }
+        if (!ContainerApproach.isAtAccessPosition(CACHE.getPlayerCache().getX(),
+                CACHE.getPlayerCache().getY(), CACHE.getPlayerCache().getZ(),
+                position[0], position[1], position[2])) {
+            return "Bot is not at the journaled worksite; the open GUI cannot be associated with it.";
+        }
+        Map<String, Integer> observed = new LinkedHashMap<>();
+        int occupied = 0;
+        for (int slot = 0; slot < 27; slot++) {
+            ItemStack stack = open.getItemStack(slot);
+            if (stack == null || stack.getAmount() <= 0) continue;
+            occupied++;
+            observed.merge(ItemIdentifier.getItemId(stack), stack.getAmount(), Integer::sum);
+        }
+        Map<String, Integer> expected = snapshot.packedContents();
+        Map<String, Integer> missing = new LinkedHashMap<>();
+        Map<String, Integer> extra = new LinkedHashMap<>();
+        java.util.Set<String> ids = new java.util.TreeSet<>(expected.keySet());
+        ids.addAll(observed.keySet());
+        for (String id : ids) {
+            int difference = observed.getOrDefault(id, 0) - expected.getOrDefault(id, 0);
+            if (difference < 0) missing.put(id, -difference);
+            if (difference > 0) extra.put(id, difference);
+        }
+        return "Journaled worksite=" + position[0] + "," + position[1] + "," + position[2]
+                + "; open window=" + openId + " (association inferred from pose and placed block)"
+                + "; occupied slots=" + occupied + "/27; exact item-ID totals match="
+                + (missing.isEmpty() && extra.isEmpty())
+                + "; missing=" + missing + "; extra=" + extra
+                + "; observed=" + observed + ". No inventory or checkpoint action was taken.";
+    }
+
+    /** Explicit operator write-off after the misplaced borrowed box cannot be found. */
+    public @Nullable String acknowledgeLostKitSource(int declaredUnits) {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be online, alive, and free of client control";
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive()) {
+            return "another movement or inventory job is active";
+        }
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventoryCache.getMouseStack();
+        if (inventoryCache.getOpenContainerId() > 0
+                || cursor != null && cursor.getAmount() > 0) {
+            return "close the container and clear the cursor first";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || snapshot.kitWorksite() == null) {
+                return "no journaled kit worksite to reconcile";
+            }
+            int[] site = snapshot.kitWorksite();
+            boolean loaded = World.isChunkLoadedBlockPos(site[0], site[2])
+                    && World.getChunkSection(site[0], site[1], site[2]) != null;
+            boolean air = loaded && BlockCompat.isAir(World.getBlock(site[0], site[1], site[2]));
+            int sourceMatches = -1;
+            if (snapshot.sourceBoxesToReturn() != null
+                    && snapshot.sourceBoxesToReturn().size() == 1) {
+                var source = snapshot.sourceBoxesToReturn().getFirst();
+                sourceMatches = 0;
+                Container player = inventoryCache.getPlayerInventory();
+                if (player == null) sourceMatches = -1;
+                else for (int raw = 9; raw <= 44; raw++) {
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack != null && stack.getAmount() > 0
+                            && source.itemId().equals(ItemIdentifier.getItemId(stack))
+                            && source.contents().equals(ItemIdentifier.readShulkerContents(stack))) {
+                        sourceMatches += stack.getAmount();
+                    }
+                }
+            }
+            String unsafe = KitLostSourcePolicy.blocker(snapshot, declaredUnits,
+                    loaded, air, KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot),
+                    KitFulfillmentCoordinator.uniqueCurrentLooseCargoSlot(snapshot),
+                    sourceMatches, kitRecovery.blocker());
+            if (unsafe != null || !kitRecovery.canAcknowledgeAbsentKitBox()) {
+                return unsafe == null ? "worksite recovery state changed" : unsafe;
+            }
+            var source = snapshot.sourceBoxesToReturn().getFirst();
+            var writtenOff = new ArrayList<>(snapshot.writtenOffSources());
+            writtenOff.add(source);
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                    Map.of(), "lost_borrowed_source_operator_attested",
+                    System.currentTimeMillis(), null, 0, List.of(),
+                    snapshot.auditedCargoSlot(), writtenOff, snapshot.auditedCargoSlots(),
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots()));
+            kitRecovery.acknowledgeAbsentKitBox();
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_borrowed_source_written_off",
+                    "kit=" + snapshot.kitName() + ", source=" + Arrays.toString(source.sourcePosition())
+                            + ", item=" + source.itemId() + ", units=" + declaredUnits
+                            + ", completed_boxes=" + snapshot.completedBoxes());
+            return null;
+        } catch (Exception e) {
+            return "lost-source reconciliation failed: " + e.getMessage();
+        }
+    }
+
+    /** Pin one operator-identified, otherwise unowned empty source shell at the
+     * already-packed boundary. This never admits other shulkers or moves inventory. */
+    public @Nullable String auditRetainedKitShell(int rawSlot) {
+        if (rawSlot < 9 || rawSlot > 44) return "inventory slot is outside the player inventory";
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)) {
+            return "another stash movement is active";
+        }
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+            return "bot must be online in-world with no client controller attached";
+        }
+        if (config.pos1 == null || config.pos2 == null
+                || database == null || !database.isInitialized()) {
+            return "stash region or database is unavailable";
+        }
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = inventoryCache.getMouseStack();
+        if (inventoryCache.getOpenContainerId() > 0
+                || (cursor != null && cursor.getAmount() > 0)
+                || INVENTORY.hasActiveRequest()) {
+            return "inventory transaction is open; close the container and clear the cursor";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (!KitResumePolicy.canAuditUnjournaledBorrowedSource(snapshot)
+                    || snapshot.retainedShell() != null || snapshot.auditedCargoSlot() >= 0
+                    || !snapshot.auditedCargoSlots().isEmpty()) {
+                return "checkpoint is not the exact packed-box recycled-shell boundary";
+            }
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())) {
+                return "fresh trusted scan is required before kit recovery";
+            }
+            int owned = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            if (owned < 0 || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                    snapshot.displacedAppleSlots())) {
+                return "owned kit shell or protected apples no longer match the checkpoint";
+            }
+            Set<Integer> admitted = new HashSet<>(snapshot.displacedAppleSlots().keySet());
+            admitted.add(owned);
+            var admission = KitInventoryAdmissionPolicy.inspectLive(
+                    database.loadKeepItems(), admitted);
+            if (admission == null || admission.unexpectedSlots().size() != 1
+                    || admission.unexpectedSlots().getFirst() != rawSlot) {
+                return "selected shell is not the only unexpected inventory item";
+            }
+            Container player = inventoryCache.getPlayerInventory();
+            var shell = player == null ? null : player.getItemStack(rawSlot);
+            var reserved = KitRetainedShell.evidence(rawSlot, shell);
+            if (reserved == null) return "selected slot is not one verified empty shulker";
+            Map<Integer, ItemStack> live = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+            if (KitRetainedShell.uniqueSlot(reserved, live, owned) != rawSlot) {
+                return "empty shulker identity is ambiguous in live inventory";
+            }
+            long now = System.currentTimeMillis();
+            long due = now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    owned, snapshot.exportPosition(), null, null, null, Map.of(),
+                    "resume_verified_recycled_shell", now, "NEED_CARGO", due,
+                    List.of(), -1, snapshot.writtenOffSources(), Map.of(),
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(), reserved));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_recycled_shell_audited", "kit=" + snapshot.kitName()
+                    + ", raw_slot=" + rawSlot + ", cooldown_seconds="
+                    + Math.max(1, config.scanPreemptionCooldownSeconds));
+            return null;
+        } catch (Exception e) {
+            return "could not audit recycled shell: " + e.getMessage();
+        }
+    }
+
+    /** Attest one absent borrowed source without claiming that loose cargo was lost. */
+    public @Nullable String acknowledgeLostBorrowedKitSource(int declaredLastKnownUnits) {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be online, alive, and free of client control";
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive()) {
+            return "another movement or inventory job is active";
+        }
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventoryCache.getMouseStack();
+        if (inventoryCache.getOpenContainerId() > 0
+                || cursor != null && cursor.getAmount() > 0) {
+            return "close the container and clear the cursor first";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || snapshot.borrowedSourceWorksite() == null
+                    || snapshot.borrowedSourceItemId() == null) {
+                return "no journaled borrowed source worksite to reconcile";
+            }
+            int[] site = snapshot.borrowedSourceWorksite();
+            boolean loaded = World.isChunkLoadedBlockPos(site[0], site[2])
+                    && World.getChunkSection(site[0], site[1], site[2]) != null;
+            boolean air = loaded && BlockCompat.isAir(World.getBlock(site[0], site[1], site[2]));
+            int sourceMatches = -1;
+            Container player = inventoryCache.getPlayerInventory();
+            if (player != null) {
+                sourceMatches = 0;
+                for (int raw = 9; raw <= 45; raw++) {
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack != null && stack.getAmount() > 0
+                            && snapshot.borrowedSourceItemId().equals(
+                                    ItemIdentifier.getItemId(stack))
+                            && snapshot.borrowedSourceContents().equals(
+                                    ItemIdentifier.readShulkerContents(stack))) {
+                        sourceMatches += stack.getAmount();
+                    }
+                }
+            }
+            ContainerEntry origin = KitLostSourcePolicy.borrowedOrigin(
+                    index.getAll().stream().filter(this::inConfiguredRegion).toList(),
+                    snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents());
+            if (origin != null && (index.isExportChest(origin)
+                    || !World.isChunkLoadedBlockPos(origin.x(), origin.z())
+                    || World.getChunkSection(origin.x(), origin.y(), origin.z()) == null
+                    || !World.getBlock(origin.x(), origin.y(), origin.z()).name()
+                            .contains("chest"))) {
+                origin = null;
+            }
+            String unsafe = KitLostSourcePolicy.borrowedBlocker(snapshot,
+                    declaredLastKnownUnits, loaded, air,
+                    kitFulfillment.hasVerifiedOwnedShell(snapshot), sourceMatches,
+                    kitRecovery.blocker(), origin);
+            if (unsafe != null || !kitRecovery.canAcknowledgeAbsentBorrowedSource()) {
+                return unsafe == null ? "worksite recovery state changed" : unsafe;
+            }
+            int[] sourcePosition = {origin.x(), origin.y(), origin.z()};
+            var writtenOff = new ArrayList<>(snapshot.writtenOffSources());
+            writtenOff.add(new KitFulfillmentJournalStore.BorrowedBox(sourcePosition,
+                    snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents()));
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                    Map.of(), "lost_borrowed_source_operator_attested_needs_cargo_audit",
+                    System.currentTimeMillis(), null, 0, List.of(), -1, writtenOff,
+                    Map.of(), snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots()));
+            kitRecovery.acknowledgeAbsentBorrowedSource();
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_borrowed_source_written_off",
+                    "kit=" + snapshot.kitName() + ", indexed_source="
+                            + Arrays.toString(sourcePosition) + ", item="
+                            + snapshot.borrowedSourceItemId() + ", last_known_units="
+                            + declaredLastKnownUnits + ", completed_boxes="
+                            + snapshot.completedBoxes() + ", loose_cargo_not_audited=true");
+            return null;
+        } catch (Exception e) {
+            return "borrowed-source loss reconciliation failed: " + e.getMessage();
+        }
+    }
+
+    /** Operator-attested no-cargo boundary after incomplete retrieval or a lost
+     * borrowed source. Every same-item stack is explicitly kept supply, not newly
+     * owned kit cargo. This never transfers items or clears source-loss records. */
+    public @Nullable String scheduleKitLostBorrowedNoCargoAudit(int keptSlot, int keptCount) {
+        return scheduleKitLostBorrowedNoCargoAudit(Map.of(keptSlot, keptCount));
+    }
+
+    public @Nullable String scheduleKitLostBorrowedNoCargoBatchAudit(String slots) {
+        if (slots == null || slots.isBlank()) return "use slot:count pairs, for example 12:8 16:64";
+        Map<Integer, Integer> declared = new LinkedHashMap<>();
+        try {
+            for (String token : slots.trim().split("\\s+")) {
+                String[] pair = token.split(":", -1);
+                if (pair.length != 2) return "use slot:count pairs, for example 12:8 16:64";
+                int raw = Integer.parseInt(pair[0]);
+                int count = Integer.parseInt(pair[1]);
+                if (declared.putIfAbsent(raw, count) != null) return "duplicate inventory slot: " + raw;
+            }
+        } catch (NumberFormatException e) {
+            return "use numeric slot:count pairs, for example 12:8 16:64";
+        }
+        return scheduleKitLostBorrowedNoCargoAudit(declared);
+    }
+
+    private @Nullable String scheduleKitLostBorrowedNoCargoAudit(Map<Integer, Integer> declaredKept) {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be online, alive, and free of client control";
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive()) {
+            return "another movement or inventory job is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            boolean lostBorrowedSource = KitResumePolicy.canAuditLostBorrowedNoCargo(snapshot);
+            if (!lostBorrowedSource
+                    && !KitResumePolicy.canAuditKeptNoCargoRetrieval(snapshot)) {
+                return "checkpoint is not at an exact kept-stock no-cargo boundary";
+            }
+            var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = inventoryCache.getMouseStack();
+            if (inventoryCache.getOpenContainerId() > 0
+                    || (cursor != null && cursor.getAmount() > 0)) {
+                return "close the container and clear the cursor before auditing";
+            }
+            if (!kitFulfillment.hasVerifiedOwnedShell(snapshot)) {
+                return "packed kit shulker no longer matches the checkpoint";
+            }
+            Container player = inventoryCache.getPlayerInventory();
+            if (player == null) return "player inventory unavailable";
+            Map<Integer, KitCargoAudit.Stack> observed = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack != null && stack.getAmount() > 0) observed.put(raw,
+                        new KitCargoAudit.Stack(ItemIdentifier.getItemId(stack), stack.getAmount()));
+            }
+            Map<String, Integer> keepRules = database.loadKeepItems();
+            var admission = KitInventoryAdmissionPolicy.inspectLive(
+                    keepRules, Set.of(snapshot.ownedShellSlot()));
+            if (admission == null) return "inventory keep-policy check unavailable";
+            if (!admission.accepted()) {
+                return "unexpected inventory slots " + admission.unexpectedSlots()
+                        + "; " + kitUnexpectedInventoryDisposition(admission);
+            }
+            if (!KitNoCargoKeepAudit.matches(observed, snapshot.currentItem(),
+                    snapshot.ownedShellSlot(), declaredKept)) {
+                return "declared kept slots do not exactly match every live same-item stack";
+            }
+            long due = System.currentTimeMillis()
+                    + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                    Map.of(), lostBorrowedSource
+                            ? "resume_retrieve_after_attested_no_cargo"
+                            : "resume_retrieve_after_kept_stock_audit",
+                    System.currentTimeMillis(), "NEED_CARGO", due, List.of(), -1,
+                    snapshot.writtenOffSources(), Map.of(), snapshot.incompleteBoxes(),
+                    snapshot.missingTotals(), snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots()));
+            kitResumeCadence.reset();
+            debugRecorder.record(lostBorrowedSource
+                            ? "kit_lost_borrowed_no_cargo_audited"
+                            : "kit_kept_stock_no_cargo_audited",
+                    "kit=" + snapshot.kitName() + ", kept_slots=" + declaredKept
+                            + ", source_writeoffs="
+                            + snapshot.writtenOffSources().size()
+                            + ", next=NEED_CARGO");
+            return null;
+        } catch (Exception e) {
+            return "could not audit no-cargo boundary: " + e.getMessage();
+        }
+    }
+
+    /** Pin only an exactly witnessed apple exchange; no inventory item is moved by this audit. */
+    public @Nullable String scheduleKitAppleOverflowAudit(int keptSlot, int keptCount,
+                                                           String displacedDeclaration) {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive())
+            return "bot must be online, alive, and free of client control";
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive())
+            return "another movement or inventory job is active";
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (!KitResumePolicy.canAuditAppleOverflow(snapshot))
+                return "checkpoint is not at the exact packed-apple overflow boundary";
+            var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = inventoryCache.getMouseStack();
+            if (inventoryCache.getOpenContainerId() > 0
+                    || (cursor != null && cursor.getAmount() > 0))
+                return "close the container and clear the cursor before auditing";
+            if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot))
+                return "packed kit shulker no longer matches the checkpoint";
+            Container player = inventoryCache.getPlayerInventory();
+            if (player == null || keptSlot < 9 || keptSlot > 44 || keptSlot == snapshot.ownedShellSlot())
+                return "kept apple slot is invalid";
+            ItemStack kept = player.getItemStack(keptSlot);
+            var keptEvidence = KitInventoryAppleOwnership.evidence(kept);
+            if (keptEvidence == null || keptEvidence.amount() != keptCount)
+                return "declared kept apple stack does not match the live slot";
+            Map<Integer, KitInventoryAppleOwnership.Slot> displaced = new LinkedHashMap<>();
+            for (String part : displacedDeclaration.split(",")) {
+                String[] pair = part.trim().split(":", -1);
+                if (pair.length != 2) return "expected displaced slots as raw:count,raw:count";
+                int raw = Integer.parseInt(pair[0].trim());
+                int count = Integer.parseInt(pair[1].trim());
+                if (raw < 9 || raw > 44 || raw == keptSlot
+                        || raw == snapshot.ownedShellSlot() || displaced.containsKey(raw))
+                    return "displaced apple slot is invalid or repeated";
+                var evidence = KitInventoryAppleOwnership.evidence(player.getItemStack(raw));
+                if (evidence == null || !evidence.customPresentation() || evidence.amount() != count)
+                    return "declared displaced apple stack does not match live slot " + raw;
+                displaced.put(raw, evidence);
+            }
+            if (displaced.isEmpty()) return "no displaced apple slots declared";
+            Set<Integer> declared = new HashSet<>(displaced.keySet());
+            declared.add(keptSlot);
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack != null && stack.getAmount() > 0
+                        && "enchanted_golden_apple".equals(ItemIdentifier.getItemId(stack))
+                        && !declared.contains(raw))
+                    return "undeclared apple stack at raw slot " + raw;
+            }
+            Set<Integer> admitted = new HashSet<>(displaced.keySet());
+            admitted.add(snapshot.ownedShellSlot());
+            var admission = KitInventoryAdmissionPolicy.inspectLive(database.loadKeepItems(), admitted);
+            if (admission == null || !admission.accepted())
+                return "inventory admission still rejects "
+                        + (admission == null ? "unavailable inventory" : admission.unexpectedSlots());
+            long due = System.currentTimeMillis()
+                    + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                    Map.of(), "resume_verified_apple_overflow", System.currentTimeMillis(),
+                    "NEED_CARGO", due, List.of(), -1, snapshot.writtenOffSources(),
+                    Map.of(), snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing(), displaced));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_apple_overflow_audited", "kit=" + snapshot.kitName()
+                    + ", kept=" + keptSlot + ":" + keptCount
+                    + ", displaced=" + displaced.keySet() + ", next=NEED_CARGO");
+            return null;
+        } catch (Exception e) {
+            return "apple overflow audit failed: " + e.getMessage();
+        }
+    }
+
+    /** Reconcile non-kept player cargo before a new kit, or while a reviewed kit journal
+     * retains its owned shell. The organizer uses its own durable inventory-only
+     * transaction and never plans scanned stash source moves. */
+    public @Nullable String startKitInventoryReconciliation() {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be online, alive, and free of client control";
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || organizer == null || organizer.isActive() || organizer.hasDurableCheckpoint()
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive()) {
+            return "another automation or organizer checkpoint is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            var boundary = KitInventoryReconciliationBoundary.select(snapshot);
+            if (boundary == null) {
+                return "kit checkpoint is not at the attested borrowed-source no-cargo review boundary";
+            }
+            boolean reviewedKitBoundary = boundary.hasOwnedShell();
+            var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = inventoryCache.getMouseStack();
+            if (inventoryCache.getOpenContainerId() > 0
+                    || (cursor != null && cursor.getAmount() > 0)) {
+                return "close the container and clear the cursor before reconciliation";
+            }
+            if (reviewedKitBoundary && !kitFulfillment.hasVerifiedOwnedShell(snapshot)) {
+                return "owned kit shell no longer matches the saved checkpoint";
+            }
+            if (!organizer.hasScopedImportStaging()) {
+                return "no registered, indexed import chest is available for reconciliation";
+            }
+            Set<Integer> pinnedSlots = boundary.pinnedSlots();
+            var admission = KitInventoryAdmissionPolicy.inspectLive(
+                    database.loadKeepItems(), pinnedSlots);
+            if (admission == null) return "inventory keep-policy check unavailable";
+            if (admission.accepted()) return "inventory already contains only kept or kit-owned items";
+            if (admission.unexpectedSlots().stream().anyMatch(raw -> raw < 9 || raw > 44)) {
+                return "crafting-grid or non-transferable cargo requires manual review";
+            }
+            organizerPreemptionGate = newOrganizerPreemptionGate();
+            organizerPreemptionCount = 0;
+            organizerPickupRecoveryDeferred = false;
+            lastOrganizerRecoveryBlocker = null;
+            if (!organizer.startInventoryReconciliation(pinnedSlots)) {
+                return "scoped inventory reconciliation could not start; see organizer diagnostics";
+            }
+            requestFoodContingency("organize_started");
+            debugRecorder.record("kit_inventory_reconciliation_started",
+                    "kit=" + (reviewedKitBoundary ? snapshot.kitName() : "none")
+                            + ", owned_shell=" + (reviewedKitBoundary
+                            ? snapshot.ownedShellSlot() : "none")
+                            + ", unexpected_slots=" + admission.unexpectedSlots());
+            return null;
+        } catch (Exception e) {
+            debugRecorder.record("kit_inventory_reconciliation_start_error",
+                    "reason=" + e.getMessage(), e);
+            return "inventory reconciliation preflight failed: " + e.getMessage();
+        }
+    }
+
+    /** Stage the abandoned, partially packed shell intact before retiring its checkpoint.
+     * This uses the organizer's durable inventory-only transaction; it never plans moves
+     * from the old stash scan and leaves configured keep supplies in inventory. */
+    public @Nullable String startKitRetirementStaging() {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be online, alive, and free of client control";
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || organizer == null || organizer.isActive() || organizer.hasDurableCheckpoint()
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || INVENTORY.hasActiveRequest() || BARITONE.isActive()) {
+            return "another automation or organizer checkpoint is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || !(KitResumePolicy.canAuditLostBorrowedNoCargo(snapshot)
+                    || ("BLOCKED".equals(snapshot.state())
+                    && "kit_retirement_inventory_staging".equals(snapshot.blocker())
+                    && snapshot.resumeState() == null))) {
+                return "kit is not at the attested no-cargo retirement boundary";
+            }
+            if (snapshot.borrowedSourceWorksite() != null || snapshot.kitWorksite() != null
+                    || !snapshot.sourceBoxesToReturn().isEmpty()) {
+                return "a borrowed source or worksite still requires recovery";
+            }
+            var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = inventoryCache.getMouseStack();
+            if (inventoryCache.getOpenContainerId() > 0
+                    || (cursor != null && cursor.getAmount() > 0)) {
+                return "close the container and clear the cursor before staging";
+            }
+            if (!kitFulfillment.hasVerifiedOwnedShell(snapshot)
+                    || KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot)
+                    != snapshot.ownedShellSlot()) {
+                return "the exact owned kit shell is not unique at its journaled slot";
+            }
+            if (!organizer.hasScopedImportStaging()) {
+                return "no registered, indexed import chest is available for staging";
+            }
+            var admission = KitInventoryAdmissionPolicy.inspectLive(database.loadKeepItems(),
+                    Set.of());
+            if (admission == null || !admission.unexpectedSlots().contains(snapshot.ownedShellSlot())) {
+                return "keep policy would protect the owned shell from inventory staging";
+            }
+            organizerPreemptionGate = newOrganizerPreemptionGate();
+            organizerPreemptionCount = 0;
+            organizerPickupRecoveryDeferred = false;
+            lastOrganizerRecoveryBlocker = null;
+            if (!organizer.startInventoryReconciliation(Set.of())) {
+                return "inventory-only staging could not start; see organizer diagnostics";
+            }
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), snapshot.kitWorksite(),
+                    snapshot.borrowedSourceWorksite(), snapshot.borrowedSourceItemId(),
+                    snapshot.borrowedSourceContents(), "kit_retirement_inventory_staging",
+                    System.currentTimeMillis(), null, 0L, snapshot.sourceBoxesToReturn(),
+                    snapshot.auditedCargoSlot(), snapshot.writtenOffSources(),
+                    snapshot.auditedCargoSlots(), snapshot.incompleteBoxes(),
+                    snapshot.missingTotals(), snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell()));
+            requestFoodContingency("organize_started");
+            debugRecorder.record("kit_retirement_staging_started",
+                    "kit=" + snapshot.kitName() + ", shell=" + snapshot.ownedShellSlot());
+            return null;
+        } catch (Exception e) {
+            debugRecorder.record("kit_retirement_staging_error", "reason=" + e.getMessage(), e);
+            return "retirement staging preflight failed: " + e.getMessage();
+        }
+    }
+
+    /** Read-only preview: no inventory click, pathing, or checkpoint mutation. */
+    public String previewKitInventoryReconciliation() {
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            var boundary = KitInventoryReconciliationBoundary.select(snapshot);
+            if (boundary == null) {
+                return "The kit is not at the guarded no-cargo reconciliation boundary.";
+            }
+            boolean reviewedKitBoundary = boundary.hasOwnedShell();
+            if (reviewedKitBoundary && !kitFulfillment.hasVerifiedOwnedShell(snapshot)) {
+                return "The kit-owned shell does not match its saved slot and contents.";
+            }
+            Set<Integer> pinnedSlots = boundary.pinnedSlots();
+            var admission = KitInventoryAdmissionPolicy.inspectLive(database.loadKeepItems(),
+                    pinnedSlots);
+            if (admission == null) return "The live inventory is unavailable.";
+            var decisions = KitInventoryDispositionPolicy.plan(admission.unexpectedItems(),
+                    database.loadColumnAssignments(), database.loadImportChests());
+            Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+            StringBuilder detail = new StringBuilder();
+            if (reviewedKitBoundary) {
+                detail.append("Kit-owned shell raw ").append(snapshot.ownedShellSlot())
+                        .append(" remains pinned; ");
+            } else {
+                detail.append("No kit checkpoint; ");
+            }
+            detail.append(decisions.size()).append(" unexpected inventory slots.\n");
+            for (var decision : decisions) {
+                detail.append("raw ").append(decision.rawSlot()).append(' ')
+                        .append(decision.itemId()).append(" -> ")
+                        .append(decision.route());
+                ItemStack stack = player == null ? null : player.getItemStack(decision.rawSlot());
+                if (stack != null && decision.route()
+                        == KitInventoryDispositionPolicy.Route.SHULKER_IDENTITY_REVIEW) {
+                    detail.append(" contents=")
+                            .append(ItemIdentifier.readShulkerContents(stack))
+                            .append(" (bulk: saved lane if assigned, otherwise import; "
+                                    + "mixed/empty: import intact)");
+                }
+                detail.append('\n');
+            }
+            detail.append("Lane-less loose stacks require same-item shulker packing before import; "
+                    + "all transfers require live identity and destination verification.");
+            return detail.toString();
+        } catch (Exception e) {
+            return "Read-only reconciliation preview failed: " + e.getMessage();
+        }
+    }
+
+    public boolean stopKitFulfillment() {
+        if (kitFulfillment.isActive()) {
+            kitFulfillment.interruptForRecovery("manual_stop");
+            return true;
+        }
+        return cancelKitScheduledResume();
+    }
+
+    public String kitFulfillmentStatus() {
+        if (kitFulfillment.isActive()) {
+            return "Building " + kitFulfillment.kitName() + ": "
+                    + kitFulfillment.deliveredBoxes() + "/"
+                    + kitFulfillment.requestedBoxes() + " delivered ("
+                    + kitFulfillment.completedBoxes() + " complete, "
+                    + kitFulfillment.incompleteBoxes() + " incomplete), phase "
+                    + kitFulfillment.state().name().toLowerCase();
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null) return "No kit fulfillment job or checkpoint.";
+            String liveResumeGate = null;
+            if (snapshot.resumeState() != null && snapshot.resumeNotBeforeEpochMilli() > 0
+                    && System.currentTimeMillis() >= snapshot.resumeNotBeforeEpochMilli()) {
+                if (kitRecovery.state() != KitWorksiteRecovery.State.DONE) {
+                    liveResumeGate = "worksite_recovery_pending";
+                } else {
+                    liveResumeGate = KitResumePolicy.blocker(snapshot);
+                    if (liveResumeGate == null) liveResumeGate = kitResumeQuietBlocker();
+                    if (liveResumeGate == null) liveResumeGate = "clear";
+                }
+            }
+            return "Checkpoint for " + snapshot.kitName() + ": "
+                    + (snapshot.completedBoxes() + snapshot.incompleteBoxes()) + "/"
+                    + snapshot.requestedBoxes() + " delivered ("
+                    + snapshot.completedBoxes() + " complete, "
+                    + snapshot.incompleteBoxes() + " incomplete), last phase "
+                    + snapshot.state().toLowerCase()
+                    + (snapshot.missingTotals().isEmpty() ? ""
+                        : ", missing to fill: " + snapshot.missingTotals())
+                    + (snapshot.writtenOffSources().isEmpty() ? ""
+                        : ", operator-attested lost source boxes "
+                            + snapshot.writtenOffSources().size())
+                    + (snapshot.resumeState() == null ? ""
+                        : snapshot.resumeNotBeforeEpochMilli() == 0
+                            ? ", paused from " + snapshot.resumeState().toLowerCase()
+                                + (KitResumePolicy.blocker(snapshot) == null
+                                    ? "; use /stash kit resume after review"
+                                    : "; manual cargo/worksite review required ("
+                                        + KitResumePolicy.blocker(snapshot) + ")")
+                            : ", resume scheduled from " + snapshot.resumeState().toLowerCase()
+                                + " in " + Math.max(0L,
+                                    (snapshot.resumeNotBeforeEpochMilli()
+                                        - System.currentTimeMillis() + 999) / 1000)
+                                + " seconds (then a quiet window)")
+                    + (liveResumeGate == null ? "" : ", live resume gate=" + liveResumeGate)
+                    + ", recovery " + kitRecovery.state().name().toLowerCase()
+                    + (kitRecovery.blocker() == null ? "" : " (" + kitRecovery.blocker() + ")")
+                    + ("kit_displaced_apples_require_reconciliation".equals(snapshot.blocker())
+                        ? ". Use /stash kit return preview; preserve the checkpoint until "
+                            + "the saved apple lane and every excess stack are verified."
+                        : ". Inspect inventory and export chest before clearing the checkpoint.");
+        } catch (Exception e) {
+            return "Kit checkpoint cannot be read: " + e.getMessage();
+        }
+    }
+
+    /** Read-only terminal return review against the persisted apple lane. */
+    public String previewKitReturn() {
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null) return "No kit checkpoint exists.";
+            Container player = Proxy.getInstance().isConnected()
+                    ? CACHE.getPlayerCache().getInventoryCache().getPlayerInventory() : null;
+            Map<Integer, ItemStack> live = null;
+            if (player != null) {
+                Map<Integer, ItemStack> slots = new LinkedHashMap<>();
+                for (int raw : snapshot.displacedAppleSlots().keySet()) {
+                    slots.put(raw, player.getItemStack(raw));
+                }
+                live = slots;
+            }
+            int[] lane = database == null || !database.isInitialized() ? null
+                    : database.loadColumnAssignments().get(
+                            StorageClassPolicy.route("enchanted_golden_apple"));
+            ContainerEntry laneEntry = lane == null || lane.length != 3 ? null
+                    : index.get(lane[0], lane[1], lane[2]);
+            boolean laneIndexed = laneEntry != null && laneEntry.inventoryFootprintKnown()
+                    && !index.isOrganizerExcluded(laneEntry);
+            var plan = KitReturnPlaybook.inspect(
+                    snapshot.completedBoxes() + snapshot.incompleteBoxes(),
+                    snapshot.requestedBoxes(), snapshot.displacedAppleSlots(), lane,
+                    latestScanTrusted && laneIndexed, live);
+            if (plan.status() == KitReturnPlaybook.Status.WAITING_FOR_JOB) {
+                return "Kit delivery is still in progress; no terminal return is authorized.";
+            }
+            if (plan.status() == KitReturnPlaybook.Status.NO_EXCESS) {
+                return "No kit-owned displaced apples are recorded in this checkpoint.";
+            }
+            StringBuilder out = new StringBuilder("Return playbook: ")
+                    .append(plan.totalUnits()).append(" displaced enchanted golden apples in ")
+                    .append(plan.entries().size()).append(" slots; status=")
+                    .append(plan.status().name().toLowerCase()).append(". ");
+            if (lane != null && lane.length == 3) {
+                out.append("Saved apple lane=").append(lane[0]).append(',')
+                        .append(lane[1]).append(',').append(lane[2])
+                        .append("; indexed footprint=").append(laneIndexed).append(". ");
+            }
+            for (var entry : plan.entries()) {
+                out.append("raw ").append(entry.rawSlot()).append('=')
+                        .append(entry.expected().amount()).append(' ')
+                        .append(entry.status().name().toLowerCase()).append("; ");
+            }
+            out.append("The saved lane is a proposed destination, not proof of live capacity. "
+                    + "No item moves until a checkpointed return verifies every slot, "
+                    + "the live lane window, and each transfer.");
+            return out.toString();
+        } catch (Exception e) {
+            return "Return preview unavailable: " + e.getMessage();
+        }
+    }
+
+    public boolean retryKitRecovery() {
+        return !kitFulfillment.isActive() && !retriever.isActive()
+                && (organizer == null || !organizer.isActive())
+                && (state == ScanState.IDLE || state == ScanState.DONE)
+                && kitRecovery.retry();
+    }
+
+    public @Nullable String scheduleKitFulfillmentResume() {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()) {
+            return "kit movement or worksite recovery is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null) return "no kit checkpoint exists";
+            String resumeState = snapshot.resumeState();
+            boolean retryNoCargo = KitResumePolicy.canRetryNoCargoRetrieval(snapshot)
+                    && KitFulfillmentCoordinator.hasNoUnclaimedCurrentCargo(snapshot);
+            boolean retryBorrowedInventory = !retryNoCargo
+                    && KitResumePolicy.canRetryBorrowedInventoryCargo(snapshot);
+            boolean retryAuditedMultiSource =
+                    KitResumePolicy.canRetryAuditedMultiSourcePreflight(snapshot);
+            boolean resumeAuditedCargo = KitResumePolicy.canResumeAuditedCargo(snapshot)
+                    || KitResumePolicy.canResumeReconciledLoss(snapshot)
+                    || retryAuditedMultiSource;
+            boolean resumeMainHeadroom = KitResumePolicy.canRetryAfterMainHeadroom(snapshot);
+            boolean resumeCompactedBudget =
+                    KitResumePolicy.canRetryCompactedPhysicalBudget(snapshot);
+            boolean resumePackedBatch = KitResumePolicy.canResumeRecoveredPackedBatch(snapshot);
+            boolean verifyCompletedReturn =
+                    KitResumePolicy.canAuditCompletedSourceReturn(snapshot)
+                    && KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot) < 0;
+            boolean resumeSourceReturn = !verifyCompletedReturn
+                    && KitResumePolicy.canRerouteSourceReturn(snapshot);
+            boolean resumeAuditedExport = KitResumePolicy.canResumeAuditedExport(snapshot);
+            if (verifyCompletedReturn) {
+                if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+                    return "bot must be online with no client controller attached";
+                }
+                var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+                var cursor = inventoryCache.getMouseStack();
+                if (inventoryCache.getOpenContainerId() > 0
+                        || (cursor != null && cursor.getAmount() > 0)
+                        || INVENTORY.hasActiveRequest()) {
+                    return "close the container and clear the cursor before auditing the return";
+                }
+                if (!kitFulfillment.hasVerifiedOwnedShell(snapshot)
+                        || KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot) >= 0) {
+                    return "owned shell is unverified or the borrowed box remains in inventory";
+                }
+                if (config.pos1 == null || config.pos2 == null
+                        || database == null || !database.isInitialized()) {
+                    return "stash region or database is unavailable";
+                }
+                var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+                if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                        scan.found(), scan.indexed(), scan.failed())) {
+                    return "fresh trusted scan required for the return chest";
+                }
+                var source = snapshot.sourceBoxesToReturn().getFirst();
+                List<ContainerEntry> scanned = new ArrayList<>();
+                for (ContainerEntry entry : database.getAllContainers()) {
+                    if (inConfiguredRegion(entry)
+                            && entry.timestamp() >= scan.startedAtEpochMilli()) {
+                        scanned.add(entry);
+                    }
+                }
+                if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                        index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                        config.pos2, source.sourcePosition(), snapshot.exportPosition(),
+                        source.returnPosition())) {
+                    return "saved return chest is not a freshly scanned registered import";
+                }
+                resumeState = "VERIFY_RETURN";
+            }
+            if (resumeAuditedExport) {
+                if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+                    return "bot must be online with no client controller attached";
+                }
+                var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+                var cursor = inventoryCache.getMouseStack();
+                if (inventoryCache.getOpenContainerId() > 0
+                        || (cursor != null && cursor.getAmount() > 0)) {
+                    return "close the export chest and clear the cursor before resuming";
+                }
+                resumeState = "NEED_SHELL";
+            }
+            if (KitResumePolicy.canRetryUnverifiedCargo(snapshot)
+                    || KitResumePolicy.canRetryAfterHotbarClear(snapshot)
+                    || resumeMainHeadroom
+                    || retryBorrowedInventory || retryNoCargo || resumeAuditedCargo
+                    || resumePackedBatch || resumeCompactedBudget) {
+                var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+                var cursor = inventoryCache.getMouseStack();
+                if (inventoryCache.getOpenContainerId() > 0
+                        || (cursor != null && cursor.getAmount() > 0)) {
+                    return "inventory transaction is still open; inspect the cursor and container";
+                }
+                if (!kitFulfillment.hasVerifiedOwnedShell(snapshot)) {
+                    return "packed kit shulker no longer matches the checkpoint";
+                }
+                if (resumeCompactedBudget) {
+                    if (!Proxy.getInstance().isConnected()
+                            || Proxy.getInstance().hasActivePlayer()) {
+                        return "bot must be online with no client controller attached";
+                    }
+                    if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            snapshot.displacedAppleSlots())
+                            || snapshot.retainedShell() != null
+                                && KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot) < 9) {
+                        return "displaced apples or retained shell changed";
+                    }
+                    var player = inventoryCache.getPlayerInventory();
+                    ItemStack shell = player == null ? null
+                            : player.getItemStack(snapshot.ownedShellSlot());
+                    if (shell == null || !KitPhysicalSlotBudget.fitsAfterCompaction(
+                            ItemIdentifier.readShulkerOccupiedSlots(shell),
+                            ItemIdentifier.readShulkerPhysicalStacks(shell),
+                            snapshot.recipe(), snapshot.packedContents())) {
+                        return "kit shell has no exact-component compaction route";
+                    }
+                }
+                if (KitResumePolicy.canRetryAfterHotbarClear(snapshot)
+                        && KitFulfillmentCoordinator.freeHotbarSlots() == 0) {
+                    return "free a hotbar slot before retrying the kit";
+                }
+                if (retryBorrowedInventory
+                        && KitFulfillmentCoordinator.uniqueBorrowedInventorySourceSlot(snapshot) < 0) {
+                    return "borrowed source shulker is missing or ambiguous, or loose cargo needs review";
+                }
+                if (resumeAuditedCargo
+                        && !KitFulfillmentCoordinator.verifiedAuditedCargo(snapshot)) {
+                    return "recovered cargo is missing or ambiguous; inspect inventory before resuming";
+                }
+                if (retryAuditedMultiSource) {
+                    if (!Proxy.getInstance().isConnected()
+                            || Proxy.getInstance().hasActivePlayer()) {
+                        return "bot must be online with no client controller attached";
+                    }
+                    if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            snapshot.displacedAppleSlots())
+                            || KitFulfillmentCoordinator.verifiedPendingSourceSlots(snapshot)
+                                    .size() != snapshot.sourceBoxesToReturn().size()) {
+                        return "pending borrowed boxes or displaced apples are missing or ambiguous";
+                    }
+                }
+                resumeState = resumeAuditedCargo ? "WAIT_CARGO" : "NEED_CARGO";
+            }
+            if (resumeSourceReturn) {
+                var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+                var cursor = inventoryCache.getMouseStack();
+                if (inventoryCache.getOpenContainerId() > 0
+                        || (cursor != null && cursor.getAmount() > 0)
+                        || INVENTORY.hasActiveRequest()) {
+                    return "inventory transaction is still open; inspect the cursor and container";
+                }
+                if (!kitFulfillment.hasVerifiedOwnedShell(snapshot)
+                        || KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot) < 0) {
+                    return "packed kit shell or borrowed source shulker no longer matches the checkpoint";
+                }
+                if (snapshot.sourceBoxesToReturn().size() > 1
+                        && KitFulfillmentCoordinator.verifiedPendingSourceSlots(snapshot)
+                                .size() != snapshot.sourceBoxesToReturn().size()) {
+                    return "pending borrowed source boxes no longer match the checkpoint";
+                }
+                resumeState = "RETURNING_SOURCE";
+            }
+            String unsafe = resumeAuditedCargo || resumeSourceReturn || verifyCompletedReturn
+                    ? null : KitResumePolicy.blocker(snapshot, resumeState);
+            if (unsafe != null) return "checkpoint needs manual review: " + unsafe;
+            long due = System.currentTimeMillis()
+                    + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), snapshot.kitWorksite(),
+                    snapshot.borrowedSourceWorksite(), snapshot.borrowedSourceItemId(),
+                    snapshot.borrowedSourceContents(), resumeAuditedCargo
+                            ? "resume_audited_inventory_cargo" : retryBorrowedInventory
+                                ? "resume_borrowed_inventory_source" : retryNoCargo
+                                    ? "resume_retrieve_after_no_cargo" : resumePackedBatch
+                                    ? "resume_verified_packed_batch" : resumeSourceReturn
+                                    ? "resume_source_return" : verifyCompletedReturn
+                                    ? "resume_audit_completed_source_return" : resumeAuditedExport
+                                    ? "resume_audited_export" : resumeMainHeadroom
+                    ? "resume_main_headroom" : resumeCompactedBudget
+                    ? "resume_physical_compaction" : "resume_requested",
+                    System.currentTimeMillis(),
+                    resumeState, due, snapshot.sourceBoxesToReturn(),
+                    snapshot.auditedCargoSlot(), snapshot.writtenOffSources(),
+                    snapshot.auditedCargoSlots(), snapshot.incompleteBoxes(),
+                    snapshot.missingTotals(), snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell())
+                    .withProtectedLoose(resumeAuditedCargo
+                            ? snapshot.protectedLoose() : null));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_resume_scheduled", "kit=" + snapshot.kitName()
+                    + ", phase=" + resumeState
+                    + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
+            return null;
+        } catch (Exception e) {
+            return "could not schedule kit resume: " + e.getMessage();
+        }
+    }
+
+    /** Journal one exact full-shell crystal exchange; no inventory action happens here. */
+    public @Nullable String scheduleKitVariantRepairToImport(int[] target) {
+        if (target == null || target.length != 3) return "import target is invalid";
+        try {
+            var checkpoint = kitJournal.load().orElse(null);
+            if (checkpoint != null && "BLOCKED".equals(checkpoint.state())
+                    && "kit_packer_start_failed".equals(checkpoint.blocker())
+                    && "end_crystal".equals(checkpoint.currentItem())
+                    && checkpoint.currentQuantity() == 256
+                    && checkpoint.completedBoxes() == 22)
+                return scheduleKitCrystalOverflowReturnToImport(target, checkpoint);
+        } catch (Exception e) {
+            return "crystal checkpoint unavailable: " + e.getMessage();
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)) {
+            return "another stash movement is active";
+        }
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be alive and online with no client controller attached";
+        }
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = inventoryCache.getMouseStack();
+        if (inventoryCache.getOpenContainerId() > 0
+                || (cursor != null && cursor.getAmount() > 0)
+                || INVENTORY.hasActiveRequest()) {
+            return "close the container and clear the cursor before scheduling repair";
+        }
+        if (config.pos1 == null || config.pos2 == null
+                || database == null || !database.isInitialized()) {
+            return "stash region or database is unavailable";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (KitPackedStackCapacityRepair.blockedBoundary(snapshot)) {
+                return scheduleKitObsidianCapacityRepairToImport(target, snapshot);
+            }
+            if (snapshot != null && "kit_packer_start_failed".equals(snapshot.blocker())
+                    && "enchanted_golden_apple".equals(snapshot.currentItem())
+                    && snapshot.currentQuantity() == 128
+                    && snapshot.auditedCargoSlots().size() == 2) {
+                String pinned = snapshot.auditedCargoSlots().entrySet().stream()
+                        .sorted(Map.Entry.comparingByKey())
+                        .map(e -> e.getKey() + ":" + e.getValue())
+                        .collect(java.util.stream.Collectors.joining(" "));
+                return scheduleKitPhysicalBudgetRepairToImport(target, pinned);
+            }
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || !"kit_packer_start_failed".equals(snapshot.blocker())
+                    || snapshot.resumeState() != null || snapshot.variantRepair() != null
+                    || snapshot.kitWorksite() != null
+                    || snapshot.borrowedSourceWorksite() != null
+                    || !("diamond_helmet".equals(
+                            ItemIdentifier.baseItemId(snapshot.currentItem()))
+                        || "diamond_chestplate".equals(
+                            ItemIdentifier.baseItemId(snapshot.currentItem())))
+                    || snapshot.currentQuantity() != 1
+                    || snapshot.packedContents().getOrDefault("end_crystal", 0) != 256
+                    || snapshot.completedBoxes() >= snapshot.requestedBoxes()) {
+                return "checkpoint is not at the exact full-shell helmet boundary";
+            }
+            if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                    || !KitFulfillmentCoordinator.verifiedVariantPendingSources(snapshot)
+                    || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            snapshot.displacedAppleSlots())) {
+                return "owned shell, borrowed source boxes, or protected apples changed";
+            }
+            int cargoRaw = KitFulfillmentCoordinator.uniqueCurrentLooseCargoSlot(snapshot);
+            if (cargoRaw < 9 || cargoRaw > 44) return "loose helmet cargo is not unique";
+            Container player = inventoryCache.getPlayerInventory();
+            ItemStack shell = player == null ? null : player.getItemStack(snapshot.ownedShellSlot());
+            ItemStack cargo = player == null ? null : player.getItemStack(cargoRaw);
+            if (shell == null || cargo == null || cargo.getAmount() != 1) {
+                return "owned shell or exact helmet cargo is missing";
+            }
+            var shellSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+            if (shellSlots.size() != 27) return "kit shell is not physically full";
+            var physical = shellSlots.entrySet().stream()
+                    .map(e -> new KitVariantExchangePlan.SlotStack(e.getKey(), e.getValue()))
+                    .toList();
+            boolean crystalNormalization = "diamond_chestplate".equals(
+                    ItemIdentifier.baseItemId(snapshot.currentItem()));
+            var step = crystalNormalization
+                    ? KitCrystalNormalizationPlan.next(shellSlots) : null;
+            var opportunity = crystalNormalization ? null
+                    : KitVariantExchangePlan.shellOpportunity(physical,
+                            "end_crystal", 256, 26);
+            if (crystalNormalization ? step == null || step.number() != 1
+                    : opportunity == null || opportunity.amount() != 15
+                            || opportunity.slotsAfter() != 26) {
+                return "no exact crystal exchange is available at this shell boundary";
+            }
+            Set<Integer> owned = new HashSet<>(
+                    KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot));
+            if (owned.size() != snapshot.sourceBoxesToReturn().size()) {
+                return "borrowed source box identities are ambiguous";
+            }
+            owned.add(snapshot.ownedShellSlot());
+            owned.add(cargoRaw);
+            owned.addAll(snapshot.displacedAppleSlots().keySet());
+            if (snapshot.retainedShell() != null) {
+                int retainedSlot = KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+                if (retainedSlot < 0) return "reserved empty kit shell is missing";
+                owned.add(retainedSlot);
+            }
+            var admission = KitInventoryAdmissionPolicy.inspectLive(database.loadKeepItems(), owned);
+            if (admission == null || !admission.accepted()) {
+                return "unexpected inventory slots: "
+                        + (admission == null ? "unavailable" : admission.unexpectedSlots());
+            }
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())) {
+                return "fresh trusted scan required for source and import footprints";
+            }
+            List<ContainerEntry> scanned = database.getAllContainers().stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli())
+                    .toList();
+            if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                    index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                    config.pos2, null, snapshot.exportPosition(), target)) {
+                return "target is not an eligible scanned and fully registered import chest";
+            }
+            ContainerEntry entry = scanned.stream()
+                    .filter(e -> e.x() == target[0] && e.y() == target[1]
+                            && e.z() == target[2])
+                    .findFirst().orElse(null);
+            if (entry == null) return "import footprint is missing from the trusted scan";
+            String shellHash = KitVariantFingerprint.canonicalShell(shellSlots);
+            String cargoHash = KitVariantFingerprint.canonicalVariant(cargo);
+            String sourceHash = KitVariantFingerprint.canonicalVariant(
+                    crystalNormalization ? step.anchor() : opportunity.mergeTargetStack());
+            String outgoingHash = KitVariantFingerprint.canonicalVariant(
+                    crystalNormalization ? step.outgoing() : opportunity.outgoingStack());
+            if (shellHash == null || cargoHash == null || sourceHash == null
+                    || outgoingHash == null) return "physical component fingerprint unavailable";
+            var repair = new KitFulfillmentJournalStore.VariantRepair(target,
+                    entry.isDouble() ? 54 : 27, cargoRaw, cargoHash, "end_crystal",
+                    crystalNormalization ? step.amount() : opportunity.amount(),
+                    crystalNormalization ? step.outgoingSlot() : opportunity.outgoingSlot(),
+                    crystalNormalization ? step.anchorSlot() : opportunity.mergeTargetSlot(),
+                    sourceHash, outgoingHash, shellHash,
+                    -1, null, null, 0, 2, crystalNormalization);
+            long now = System.currentTimeMillis();
+            long due = now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null,
+                    snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                    "resume_variant_exchange", now, "VARIANT_NEED_SOURCE", due,
+                    snapshot.sourceBoxesToReturn(), snapshot.auditedCargoSlot(),
+                    snapshot.writtenOffSources(), snapshot.auditedCargoSlots(),
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(),
+                    snapshot.retainedShell(), repair));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_variant_repair_scheduled", "kit=" + snapshot.kitName()
+                    + ", amount=" + repair.amount() + ", import=" + Arrays.toString(target)
+                    + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
+            return null;
+        } catch (Exception e) {
+            debugRecorder.record("kit_variant_repair_schedule_failed",
+                    "target=" + Arrays.toString(target), e);
+            return "could not schedule variant repair: " + e.getMessage();
+        }
+    }
+
+    /** Return only the witnessed six-crystal overflow, then pack the exact retained 250. */
+    private @Nullable String scheduleKitCrystalOverflowReturnToImport(int[] target,
+            KitFulfillmentJournalStore.Snapshot snapshot) {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || kitExporter.isActive() || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)
+                || com.zenith.plugin.stashmanager.kit.KitCrystalOverflowReturn.pending())
+            return "another stash movement or crystal return is active";
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive())
+            return "bot must be alive, online, and without a controller";
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = cache.getMouseStack();
+        if (cache.getOpenContainerId() > 0 || INVENTORY.hasActiveRequest()
+                || (cursor != null && cursor.getAmount() > 0))
+            return "container or inventory cursor is active";
+        if (snapshot.resumeState() != null || snapshot.variantRepair() != null
+                || snapshot.protectedLoose() != null
+                || !snapshot.auditedCargoSlots().isEmpty()
+                || snapshot.kitWorksite() != null || snapshot.borrowedSourceWorksite() != null
+                || snapshot.packedContents().containsKey("end_crystal")
+                || snapshot.sourceBoxesToReturn().size() != 1
+                || !KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                || !KitFulfillmentCoordinator.verifiedVariantPendingSources(snapshot)
+                || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                        snapshot.displacedAppleSlots()))
+            return "kit 23 cargo or source ownership is not at the witnessed boundary";
+        Container player = cache.getPlayerInventory();
+        if (player == null) return "player inventory unavailable";
+        ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+        if (shell == null || ItemIdentifier.readShulkerOccupiedSlots(shell) != 24)
+            return "kit shell differs from the witnessed 24-slot state";
+        Map<Integer, ItemStack> relevant = new LinkedHashMap<>();
+        relevant.put(snapshot.ownedShellSlot(), shell);
+        int sourceRaw = KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot);
+        if (sourceRaw < 9 || sourceRaw > 44) return "borrowed crystal source is ambiguous";
+        ItemStack source = player.getItemStack(sourceRaw);
+        if (source == null || ItemIdentifier.readShulkerContents(source)
+                .getOrDefault("end_crystal", 0) != 1362)
+            return "borrowed crystal source contents changed";
+        relevant.put(sourceRaw, source);
+        Map<Integer, ItemStack> loose = new LinkedHashMap<>();
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack != null && stack.getAmount() > 0
+                    && "end_crystal".equals(ItemIdentifier.getItemId(stack))) {
+                loose.put(raw, stack);
+                relevant.put(raw, stack);
+            }
+        }
+        if (loose.size() != 5 || loose.values().stream()
+                .mapToInt(ItemStack::getAmount).sum() != 256)
+            return "live crystal cargo is not five stacks totaling 256";
+        int outgoingRaw = -1;
+        Map<Integer, Integer> retained = new LinkedHashMap<>();
+        for (var entry : loose.entrySet()) {
+            if (entry.getValue().getAmount() == 6) {
+                if (outgoingRaw >= 0) return "six-crystal stack is not unique";
+                outgoingRaw = entry.getKey();
+            } else retained.put(entry.getKey(), entry.getValue().getAmount());
+        }
+        if (outgoingRaw < 0 || retained.size() != 4 || retained.values().stream()
+                .mapToInt(Integer::intValue).sum() != 250)
+            return "exact six-crystal overflow is unavailable";
+        ItemStack overflow = loose.get(outgoingRaw);
+        String overflowHash = KitVariantFingerprint.canonicalVariant(overflow);
+        Map<String, Integer> groups = new HashMap<>();
+        for (ItemStack stack : loose.values()) groups.merge(
+                KitVariantFingerprint.canonicalVariant(stack), stack.getAmount(), Integer::sum);
+        if (overflowHash == null || groups.size() != 2
+                || groups.getOrDefault(overflowHash, 0) != 70
+                || !groups.containsValue(186))
+            return "crystal component split is not the witnessed 70/186";
+        ItemStack majority = loose.values().stream()
+                .filter(stack -> !overflowHash.equals(
+                        KitVariantFingerprint.canonicalVariant(stack)))
+                .findFirst().orElse(null);
+        if (majority == null || ItemIdentifier.readShulkerPhysicalStacks(source).stream()
+                .filter(stack -> KitItemSourcePolicy.CRYSTALS.accepts(stack, majority))
+                .mapToInt(ItemStack::getAmount).sum() < 6)
+            return "borrowed source lacks six matching replacement crystals";
+        Set<Integer> owned = new HashSet<>(relevant.keySet());
+        owned.addAll(snapshot.displacedAppleSlots().keySet());
+        if (snapshot.retainedShell() != null) {
+            int retainedRaw = KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+            if (retainedRaw < 9) return "retained empty shell is ambiguous";
+            owned.add(retainedRaw);
+        }
+        try {
+            var admission = KitInventoryAdmissionPolicy.inspectLive(
+                    database.loadKeepItems(), owned);
+            if (admission == null || !admission.accepted())
+                return "unexpected inventory slots: "
+                        + (admission == null ? "unavailable" : admission.unexpectedSlots());
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed()))
+                return "fresh trusted scan required";
+            List<ContainerEntry> scanned = database.getAllContainers().stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli()).toList();
+            if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                    index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                    config.pos2, snapshot.sourceBoxesToReturn().getFirst().sourcePosition(),
+                    snapshot.exportPosition(), target))
+                return "target is not an eligible registered import chest";
+        } catch (Exception e) {
+            return "crystal return preflight unavailable: " + e.getMessage();
+        }
+        return com.zenith.plugin.stashmanager.kit.KitCrystalOverflowReturn.schedule(
+                snapshot, relevant, retained, outgoingRaw, target, kitExporter,
+                Math.max(1, config.scanPreemptionCooldownSeconds) * 1000L);
+    }
+
+    /** Schedule one component-exact packed stack replacement; no item moves here. */
+    private @Nullable String scheduleKitObsidianCapacityRepairToImport(int[] target,
+            KitFulfillmentJournalStore.Snapshot snapshot) throws Exception {
+        var profile = KitPackedStackCapacityRepair.profile(snapshot.currentItem());
+        if (!KitPackedStackCapacityRepair.blockedBoundary(snapshot)
+                || !KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                        snapshot.displacedAppleSlots()))
+            return "packed stack shell or checkpoint boundary changed";
+        int retained = snapshot.retainedShell() == null ? -1
+                : KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+        if (snapshot.retainedShell() != null && retained < 9)
+            return "reserved empty shell identity changed";
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        Container player = cache.getPlayerInventory();
+        ItemStack shell = player == null ? null : player.getItemStack(snapshot.ownedShellSlot());
+        var shellSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+        if (profile == null || shellSlots.size() != profile.physicalSlots()
+                || KitPhysicalSlotBudget.fitsAfterCompaction(
+                shellSlots.size(), List.copyOf(shellSlots.values()),
+                snapshot.recipe(), snapshot.packedContents()))
+            return "shell no longer has the exact incompatible stack capacity boundary";
+        var opportunity = KitPackedStackCapacityRepair.opportunity(shellSlots,
+                profile.itemId());
+        if (opportunity == null) return "no unique one-stack replacement route";
+        Set<Integer> owned = new HashSet<>(snapshot.displacedAppleSlots().keySet());
+        owned.add(snapshot.ownedShellSlot());
+        if (retained >= 9) owned.add(retained);
+        var admission = KitInventoryAdmissionPolicy.inspectLive(
+                database.loadKeepItems(), owned);
+        if (admission == null || !admission.accepted())
+            return "unexpected inventory slots: "
+                    + (admission == null ? "unavailable" : admission.unexpectedSlots());
+        var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+        if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                scan.found(), scan.indexed(), scan.failed()))
+            return "fresh trusted scan required for import footprint";
+        List<ContainerEntry> scanned = database.getAllContainers().stream()
+                .filter(this::inConfiguredRegion)
+                .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli()).toList();
+        if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                config.pos2, null, snapshot.exportPosition(), target))
+            return "target is not an eligible scanned and registered import chest";
+        ContainerEntry entry = scanned.stream()
+                .filter(e -> e.x() == target[0] && e.y() == target[1] && e.z() == target[2])
+                .findFirst().orElse(null);
+        if (entry == null) return "import footprint missing from trusted scan";
+        String shellHash = KitVariantFingerprint.canonicalShell(shellSlots);
+        String sourceHash = KitVariantFingerprint.canonicalVariant(
+                opportunity.mergeTargetStack());
+        String outgoingHash = KitVariantFingerprint.canonicalVariant(
+                opportunity.outgoingStack());
+        if (shellHash == null || sourceHash == null || outgoingHash == null)
+            return "packed stack component fingerprint unavailable";
+        var repair = new KitFulfillmentJournalStore.VariantRepair(target,
+                entry.isDouble() ? 54 : 27, -1, sourceHash, profile.itemId(),
+                opportunity.amount(), opportunity.outgoingSlot(),
+                opportunity.mergeTargetSlot(), sourceHash, outgoingHash, shellHash,
+                -1, null, null, 0, 2, true);
+        long now = System.currentTimeMillis();
+        long due = now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+        var scheduled = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null,
+                snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                "resume_variant_exchange", now, "VARIANT_NEED_SOURCE", due,
+                snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(),
+                Map.of(), snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(),
+                snapshot.retainedShell(), repair);
+        String boundary = KitFulfillmentCoordinator.variantRepairBoundaryFailure(scheduled);
+        if (boundary != null || KitResumePolicy.blocker(scheduled) != null
+                || !KitFulfillmentCoordinator.verifiedVariantPendingSources(scheduled))
+            return "scheduled packed stack exchange boundary rejected: " + boundary;
+        kitJournal.save(scheduled);
+        kitResumeCadence.reset();
+        debugRecorder.record("kit_packed_stack_variant_repair_scheduled",
+                "kit=" + snapshot.kitName() + ", amount=" + repair.amount()
+                        + ", item=" + profile.itemId()
+                        + ", import=" + Arrays.toString(target));
+        return null;
+    }
+
+    /** Schedule the exact two-stack apple batch after a one-slot crystal normalization. */
+    public @Nullable String scheduleKitPhysicalBudgetRepairToImport(int[] target, String slots) {
+        if (target == null || target.length != 3 || slots == null) return "repair input is invalid";
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE))
+            return "another stash movement is active";
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive())
+            return "bot must be alive and online with no controller";
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = cache.getMouseStack();
+        if (cache.getOpenContainerId() > 0 || (cursor != null && cursor.getAmount() > 0)
+                || INVENTORY.hasActiveRequest()) return "inventory window or cursor is active";
+        if (config.pos1 == null || config.pos2 == null
+                || database == null || !database.isInitialized())
+            return "stash region or database is unavailable";
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || !"kit_packer_start_failed".equals(snapshot.blocker())
+                    || snapshot.resumeState() != null || snapshot.variantRepair() != null
+                    || snapshot.kitWorksite() != null || snapshot.borrowedSourceWorksite() != null
+                    || !"enchanted_golden_apple".equals(snapshot.currentItem())
+                    || snapshot.currentQuantity() != 128
+                    || snapshot.packedContents().getOrDefault("end_crystal", 0) != 256
+                    || snapshot.packedContents().getOrDefault("enchanted_golden_apple", 0) != 0
+                    || snapshot.sourceBoxesToReturn().size() != 1
+                    || snapshot.completedBoxes() >= snapshot.requestedBoxes())
+                return "checkpoint is not the exact blocked apple capacity boundary";
+            if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                    || !KitFulfillmentCoordinator.verifiedPendingSourceInventory(snapshot)
+                    || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                            snapshot.displacedAppleSlots()))
+                return "owned shell, borrowed source, or displaced apples changed";
+            Map<Integer, Integer> pinned = new LinkedHashMap<>();
+            for (String token : slots.trim().split("\\s+")) {
+                String[] parts = token.split(":", -1);
+                if (parts.length != 2) return "use two slot:64 pairs";
+                int raw = Integer.parseInt(parts[0]);
+                int count = Integer.parseInt(parts[1]);
+                if (pinned.putIfAbsent(raw, count) != null) return "duplicate apple slot";
+            }
+            if (pinned.size() != 2 || !pinned.equals(snapshot.auditedCargoSlots())
+                    || pinned.values().stream().anyMatch(n -> n != 64))
+                return "exactly two 64-apple slots are required";
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "player inventory unavailable";
+            Map<Integer, KitCargoAudit.Stack> observed = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack != null && stack.getAmount() > 0)
+                    observed.put(raw, new KitCargoAudit.Stack(
+                            ItemIdentifier.getItemId(stack), stack.getAmount()));
+            }
+            if (!KitCargoAudit.verifiedBatch(observed, snapshot.currentItem(), 128,
+                    snapshot.ownedShellSlot(), pinned, true))
+                return "pinned apple batch changed";
+            ItemStack first = player.getItemStack(pinned.keySet().iterator().next());
+            String cargoHash = KitVariantFingerprint.canonicalVariant(first);
+            if (cargoHash == null) return "apple component fingerprint unavailable";
+            for (int raw : pinned.keySet())
+                if (!cargoHash.equals(KitVariantFingerprint.canonicalVariant(
+                        player.getItemStack(raw)))) return "apple variants differ";
+            ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+            var shellSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+            if (shellSlots.size() != 26) return "owned shell is not at 26 physical slots";
+            var physical = shellSlots.entrySet().stream()
+                    .map(e -> new KitVariantExchangePlan.SlotStack(e.getKey(), e.getValue()))
+                    .toList();
+            var opportunity = KitVariantExchangePlan.shellOpportunity(
+                    physical, "end_crystal", 256, 25);
+            if (opportunity == null || opportunity.amount() != 10
+                    || opportunity.slotsAfter() != 25)
+                return "exact 10-crystal one-slot exchange is unavailable";
+            Set<Integer> owned = new HashSet<>(
+                    KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot));
+            if (owned.size() != 1) return "borrowed source identity is ambiguous";
+            owned.add(snapshot.ownedShellSlot());
+            owned.addAll(pinned.keySet());
+            owned.addAll(snapshot.displacedAppleSlots().keySet());
+            if (snapshot.retainedShell() != null) {
+                int retained = KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+                if (retained < 0) return "retained shell identity is ambiguous";
+                owned.add(retained);
+            }
+            var admission = KitInventoryAdmissionPolicy.inspectLive(
+                    database.loadKeepItems(), owned);
+            if (admission == null || !admission.accepted())
+                return "unexpected inventory slots: "
+                        + (admission == null ? "unavailable" : admission.unexpectedSlots());
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed()))
+                return "fresh trusted scan required";
+            List<ContainerEntry> scanned = database.getAllContainers().stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli()).toList();
+            if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                    index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                    config.pos2, null, snapshot.exportPosition(), target))
+                return "target is not an eligible registered import chest";
+            ContainerEntry entry = scanned.stream()
+                    .filter(e -> e.x() == target[0] && e.y() == target[1]
+                            && e.z() == target[2]).findFirst().orElse(null);
+            if (entry == null) return "import footprint is missing from scan";
+            String shellHash = KitVariantFingerprint.canonicalShell(shellSlots);
+            String sourceHash = KitVariantFingerprint.canonicalVariant(
+                    opportunity.mergeTargetStack());
+            String outgoingHash = KitVariantFingerprint.canonicalVariant(
+                    opportunity.outgoingStack());
+            if (shellHash == null || sourceHash == null || outgoingHash == null)
+                return "crystal component fingerprint unavailable";
+            var repair = new KitFulfillmentJournalStore.VariantRepair(target,
+                    entry.isDouble() ? 54 : 27, -1, cargoHash, "end_crystal", 10,
+                    opportunity.outgoingSlot(), opportunity.mergeTargetSlot(),
+                    sourceHash, outgoingHash, shellHash, -1, null, null, 0, 2, false);
+            long now = System.currentTimeMillis();
+            long due = now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            var scheduled = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null,
+                    snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                    "resume_variant_exchange", now, "VARIANT_NEED_SOURCE", due,
+                    snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(), pinned,
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(),
+                    snapshot.retainedShell(), repair);
+            String boundary = KitFulfillmentCoordinator.variantRepairBoundaryFailure(scheduled);
+            if (boundary != null || KitResumePolicy.blocker(scheduled) != null)
+                return "scheduled repair boundary rejected: " + boundary;
+            kitJournal.save(scheduled);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_physical_budget_repair_scheduled",
+                    "kit=" + snapshot.kitName() + ", apple_slots=" + pinned
+                            + ", crystal_amount=10, import=" + Arrays.toString(target));
+            return null;
+        } catch (NumberFormatException e) {
+            return "use numeric slot:64 pairs";
+        } catch (Exception e) {
+            debugRecorder.record("kit_physical_budget_repair_schedule_failed",
+                    "target=" + Arrays.toString(target), e);
+            return "could not schedule physical budget repair: " + e.getMessage();
+        }
+    }
+
+    /** Read-only guard breakdown for a stopped variant exchange; no recovery is scheduled. */
+    public String diagnoseKitVariantSourceCargo(int incomingRaw) {
+        if (incomingRaw < 9 || incomingRaw > 44)
+            return "Incoming raw slot must be 9-44.";
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || snapshot.variantRepair() == null)
+                return "No variant-repair checkpoint exists.";
+            if (!Proxy.getInstance().isConnected()) return "Bot disconnected; live inventory unavailable.";
+            var repair = snapshot.variantRepair();
+            var audited = snapshot.withVariantRepair(repair.withAuditedIncoming(incomingRaw));
+            String failure = KitFulfillmentCoordinator.variantReadyBoundaryFailure(audited);
+            boolean protectedApples = KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                    audited.displacedAppleSlots());
+            Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+            String canonicalMatch = "unavailable";
+            String legacyIncomingMatch = "unavailable";
+            String liveCanonicalShell = "unavailable";
+            if (player != null) {
+                ItemStack shell = player.getItemStack(audited.ownedShellSlot());
+                ItemStack incoming = player.getItemStack(incomingRaw);
+                if (shell != null) liveCanonicalShell = KitVariantFingerprint.canonicalShell(
+                        ItemIdentifier.readShulkerPhysicalSlotStacks(shell));
+                if (shell != null && incoming != null && incoming.getAmount() > 0) {
+                    ItemStack mergeTarget = ItemIdentifier.readShulkerPhysicalSlotStacks(shell)
+                            .get(repair.mergeTargetSlot());
+                    if (mergeTarget != null && repair.itemId().equals(
+                            ItemIdentifier.getItemId(incoming))) {
+                        canonicalMatch = Boolean.toString(Objects.equals(
+                                KitVariantFingerprint.canonicalVariant(mergeTarget),
+                                KitVariantFingerprint.canonicalVariant(incoming)));
+                        legacyIncomingMatch = Boolean.toString(repair.sourceHash().equals(
+                                KitVariantFingerprint.variant(incoming,
+                                        repair.fingerprintVersion())));
+                    }
+                }
+            }
+            return "Checkpoint " + audited.completedBoxes() + "/" + audited.requestedBoxes()
+                    + "; first failed guard=" + (failure == null ? "none" : failure)
+                    + "; protected apples=" + protectedApples
+                    + "; incoming canonical match to merge target=" + canonicalMatch
+                    + "; incoming legacy hash match=" + legacyIncomingMatch
+                    + "; borrowed helmet comparison="
+                    + compareBorrowedVariantHelmet(audited, player)
+                    + "; guarded canonical migration eligible="
+                    + (canonicalizeLegacyVariantRepair(snapshot, incomingRaw, null, null) != null)
+                    + "; migration guards="
+                    + diagnoseVariantMigrationGuards(snapshot, player, incomingRaw)
+                    + "; saved legacy shell=" + repair.shellHash()
+                    + "; live canonical shell=" + liveCanonicalShell
+                    + "; no checkpoint or inventory change.";
+        } catch (IOException | RuntimeException e) {
+            return "Variant diagnosis unavailable: " + e.getClass().getSimpleName()
+                    + "; no checkpoint or inventory change.";
+        }
+    }
+
+    /** Compare physical components without opening the borrowed box or trusting its item totals. */
+    private static String compareBorrowedVariantHelmet(
+            KitFulfillmentJournalStore.Snapshot snapshot, Container player) {
+        if (player == null || snapshot.currentItem() == null
+                || snapshot.variantRepair() == null) return "unavailable";
+        var repair = snapshot.variantRepair();
+        ItemStack cargo = player.getItemStack(repair.cargoRawSlot());
+        if (cargo == null || cargo.getAmount() != 1
+                || !snapshot.currentItem().equals(ItemIdentifier.getItemId(cargo))) {
+            return "loose helmet missing or changed";
+        }
+        Set<Integer> pending = KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot);
+        if (pending.size() != snapshot.sourceBoxesToReturn().size()) {
+            return "borrowed box ledger not uniquely verified";
+        }
+        List<Integer> helmetBoxes = pending.stream().sorted()
+                .filter(raw -> ItemIdentifier.readShulkerContents(player.getItemStack(raw))
+                        .getOrDefault(snapshot.currentItem(), 0) > 0)
+                .toList();
+        if (helmetBoxes.size() != 1) return "helmet source box not unique";
+        int boxRaw = helmetBoxes.getFirst();
+        Map<Integer, ItemStack> inner = ItemIdentifier.readShulkerPhysicalSlotStacks(
+                player.getItemStack(boxRaw));
+        if (inner.isEmpty()) return "helmet source physical slots unreadable";
+        String liveLegacy = KitVariantFingerprint.variant(cargo);
+        String canonical = KitVariantFingerprint.canonicalVariant(cargo);
+        var cargoComponents = cargo.getDataComponents() == null ? Map.of()
+                : cargo.getDataComponents().getDataComponents();
+        int sameItemStacks = 0;
+        int sameComponents = 0;
+        int sameCanonical = 0;
+        int sameLegacy = 0;
+        int journalLegacy = 0;
+        for (ItemStack stack : inner.values()) {
+            if (!snapshot.currentItem().equals(ItemIdentifier.getItemId(stack))) continue;
+            sameItemStacks++;
+            var sourceComponents = stack.getDataComponents() == null ? Map.of()
+                    : stack.getDataComponents().getDataComponents();
+            if (cargo.getId() == stack.getId()
+                    && cargoComponents.equals(sourceComponents)) sameComponents++;
+            String sourceCanonical = KitVariantFingerprint.canonicalVariant(stack);
+            if (Objects.equals(canonical, sourceCanonical)) sameCanonical++;
+            String sourceLegacy = KitVariantFingerprint.variant(stack);
+            if (Objects.equals(liveLegacy, sourceLegacy)) sameLegacy++;
+            if (repair.cargoHash().equals(sourceLegacy)) journalLegacy++;
+        }
+        return "source raw " + boxRaw + ", matching-ID physical stacks=" + sameItemStacks
+                + ", exact components=" + sameComponents
+                + ", canonical fingerprint=" + sameCanonical
+                + ", live legacy fingerprint=" + sameLegacy
+                + ", checkpoint legacy fingerprint=" + journalLegacy
+                + ", loose helmet checkpoint legacy="
+                + repair.cargoHash().equals(liveLegacy);
+    }
+
+    /** Upgrade only a stopped pre-click legacy checkpoint with independent physical evidence.
+     * The old hash must not identify a different helmet still in the verified source box. */
+    private static KitFulfillmentJournalStore.VariantRepair canonicalizeLegacyVariantRepair(
+            KitFulfillmentJournalStore.Snapshot snapshot, int incomingRaw,
+            String acknowledgedLegacyShell, String acknowledgedCanonicalShell) {
+        var repair = snapshot.variantRepair();
+        if (repair == null || repair.fingerprintVersion() != 0
+                || repair.displacedRawSlot() != -1
+                || repair.auditedIncomingRawSlot() != 0
+                || snapshot.kitWorksite() != null || snapshot.borrowedSourceWorksite() != null
+                || !KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                || KitFulfillmentCoordinator.uniqueCurrentLooseCargoSlot(snapshot)
+                        != repair.cargoRawSlot()) return null;
+        Container player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+        if (player == null) return null;
+        ItemStack cargo = player.getItemStack(repair.cargoRawSlot());
+        ItemStack incoming = player.getItemStack(incomingRaw);
+        ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+        if (cargo == null || cargo.getAmount() != 1
+                || !snapshot.currentItem().equals(ItemIdentifier.getItemId(cargo))
+                || incoming == null || incoming.getAmount() != repair.amount()
+                || !repair.itemId().equals(ItemIdentifier.getItemId(incoming))
+                || repair.cargoHash().equals(KitVariantFingerprint.variant(cargo))) return null;
+        Set<Integer> pending = KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot);
+        if (pending.size() != snapshot.sourceBoxesToReturn().size()) return null;
+        List<Integer> helmetBoxes = pending.stream()
+                .filter(raw -> ItemIdentifier.readShulkerContents(player.getItemStack(raw))
+                        .getOrDefault(snapshot.currentItem(), 0) > 0).toList();
+        if (helmetBoxes.size() != 1) return null;
+        Map<Integer, ItemStack> sourceSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(
+                player.getItemStack(helmetBoxes.getFirst()));
+        if (sourceSlots.isEmpty()) return null;
+        if (!KitVariantFingerprint.witnessedLegacyCargo(
+                cargo, repair.cargoHash(), sourceSlots.values())) return null;
+        Map<Integer, ItemStack> shellSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+        if (shellSlots.size() != KitCapacity.MAX_SLOTS) return null;
+        boolean oldShellMatches = repair.shellHash().equals(
+                KitVariantFingerprint.shell(shellSlots));
+        if (acknowledgedLegacyShell != null && oldShellMatches) return null;
+        if (!oldShellMatches && !KitVariantShellRebaseline.matches(shellSlots,
+                snapshot.packedContents(), snapshot.recipe(), repair.shellHash(),
+                acknowledgedLegacyShell, acknowledgedCanonicalShell))
+            return null;
+        var physical = shellSlots.entrySet().stream()
+                .map(e -> new KitVariantExchangePlan.SlotStack(e.getKey(), e.getValue()))
+                .toList();
+        var opportunity = KitVariantExchangePlan.shellOpportunity(physical,
+                repair.itemId(), snapshot.packedContents().getOrDefault(repair.itemId(), 0),
+                KitCapacity.MAX_SLOTS - 1);
+        if (opportunity == null || opportunity.amount() != repair.amount()
+                || opportunity.outgoingSlot() != repair.outgoingSlot()
+                || opportunity.mergeTargetSlot() != repair.mergeTargetSlot()
+                || !repair.sourceHash().equals(KitVariantFingerprint.variant(
+                        opportunity.mergeTargetStack()))
+                || !repair.outgoingHash().equals(KitVariantFingerprint.variant(
+                        opportunity.outgoingStack()))
+                || !repair.sourceHash().equals(KitVariantFingerprint.variant(incoming))
+                || !KitVariantFingerprint.sameComponents(incoming,
+                        opportunity.mergeTargetStack())) return null;
+        return repair.withCanonicalEvidence(
+                KitVariantFingerprint.canonicalVariant(cargo),
+                KitVariantFingerprint.canonicalVariant(opportunity.mergeTargetStack()),
+                KitVariantFingerprint.canonicalVariant(opportunity.outgoingStack()),
+                KitVariantFingerprint.canonicalShell(shellSlots));
+    }
+
+    private static String diagnoseVariantMigrationGuards(
+            KitFulfillmentJournalStore.Snapshot snapshot, Container player, int incomingRaw) {
+        if (player == null || snapshot.variantRepair() == null) return "unavailable";
+        var repair = snapshot.variantRepair();
+        ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+        Map<Integer, ItemStack> slots = ItemIdentifier.readShulkerPhysicalSlotStacks(shell);
+        var physical = slots.entrySet().stream()
+                .map(e -> new KitVariantExchangePlan.SlotStack(e.getKey(), e.getValue()))
+                .toList();
+        var opportunity = KitVariantExchangePlan.shellOpportunity(physical,
+                repair.itemId(), snapshot.packedContents().getOrDefault(repair.itemId(), 0),
+                KitCapacity.MAX_SLOTS - 1);
+        ItemStack incoming = player.getItemStack(incomingRaw);
+        return "shell=" + repair.shellHash().equals(KitVariantFingerprint.shell(slots))
+                + ", opportunity=" + (opportunity != null
+                    && opportunity.amount() == repair.amount()
+                    && opportunity.outgoingSlot() == repair.outgoingSlot()
+                    && opportunity.mergeTargetSlot() == repair.mergeTargetSlot())
+                + ", source=" + (opportunity != null && repair.sourceHash().equals(
+                    KitVariantFingerprint.variant(opportunity.mergeTargetStack())))
+                + ", outgoing=" + (opportunity != null && repair.outgoingHash().equals(
+                    KitVariantFingerprint.variant(opportunity.outgoingStack())))
+                + ", incomingComponents=" + (opportunity != null
+                    && KitVariantFingerprint.sameComponents(incoming,
+                            opportunity.mergeTargetStack()));
+    }
+
+    /** Audit the exact 15 crystals already retrieved by a stopped variant exchange.
+     * This journals a pack-only continuation and must never repeat retrieval. */
+    public @Nullable String auditKitVariantSourceCargo(int incomingRaw) {
+        return auditKitVariantSourceCargo(incomingRaw, null, null);
+    }
+
+    /** Explicitly acknowledge a changed legacy shell representation at this one boundary. */
+    public @Nullable String auditKitVariantSourceCargoRebaseline(int incomingRaw,
+            String savedLegacyShell, String liveCanonicalShell) {
+        if (savedLegacyShell == null || liveCanonicalShell == null
+                || !savedLegacyShell.matches("[0-9a-f]{64}")
+                || !liveCanonicalShell.matches("[0-9a-f]{64}")) {
+            return "both shell fingerprints must be lowercase SHA-256 values";
+        }
+        return auditKitVariantSourceCargo(incomingRaw, savedLegacyShell, liveCanonicalShell);
+    }
+
+    static boolean recoveredPackedStackSourceAuditBoundary(
+            KitFulfillmentJournalStore.Snapshot snapshot, int incomingRaw,
+            String savedLegacyShell, String liveCanonicalShell) {
+        return snapshot != null
+                && "kit_variant_source_cargo_unverified".equals(snapshot.blocker())
+                && KitPackedStackCapacityRepair.repairCheckpoint(snapshot)
+                && snapshot.sourceBoxesToReturn().size() == 1
+                && snapshot.variantRepair().auditedIncomingRawSlot() == incomingRaw
+                && incomingRaw >= 9 && incomingRaw <= 44
+                && savedLegacyShell == null && liveCanonicalShell == null;
+    }
+
+    private @Nullable String auditKitVariantSourceCargo(int incomingRaw,
+            String savedLegacyShell, String liveCanonicalShell) {
+        if (incomingRaw != 0 && (incomingRaw < 9 || incomingRaw > 44))
+            return "source cargo slot is invalid";
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())
+                || (state != ScanState.IDLE && state != ScanState.DONE)) {
+            return "another stash movement is active";
+        }
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be alive and online with no client controller attached";
+        }
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = inventoryCache.getMouseStack();
+        if (inventoryCache.getOpenContainerId() > 0
+                || (cursor != null && cursor.getAmount() > 0)
+                || INVENTORY.hasActiveRequest()) {
+            return "close the container and clear the cursor before auditing cargo";
+        }
+        if (config.pos1 == null || config.pos2 == null
+                || database == null || !database.isInitialized()) {
+            return "stash region or database is unavailable";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            boolean movedCrystalShell = snapshot != null
+                    && "kit_variant_owned_shell_changed".equals(snapshot.blocker())
+                    && snapshot.variantRepair() != null
+                    && snapshot.variantRepair().replacementOnly()
+                    && snapshot.variantRepair().amount() == 60
+                    && snapshot.sourceBoxesToReturn().size() == 1
+                    && incomingRaw == 0 && savedLegacyShell == null
+                    && liveCanonicalShell == null;
+            boolean packedStackPackerPreflight = snapshot != null
+                    && "kit_variant_packer_start_failed:variant_exchange_preflight_mismatch"
+                            .equals(snapshot.blocker())
+                    && KitPackedStackCapacityRepair.repairCheckpoint(snapshot)
+                    && snapshot.sourceBoxesToReturn().size() == 1
+                    && incomingRaw >= 9 && incomingRaw <= 44
+                    && savedLegacyShell == null && liveCanonicalShell == null;
+            boolean packedStackRecoveredPreflight = recoveredPackedStackSourceAuditBoundary(
+                    snapshot, incomingRaw, savedLegacyShell, liveCanonicalShell);
+            if (movedCrystalShell) {
+                var repair = snapshot.variantRepair();
+                int shellRaw = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+                Container player = inventoryCache.getPlayerInventory();
+                if (shellRaw < 9 || player == null) return "owned shell is not unique";
+                var shellSlots = ItemIdentifier.readShulkerPhysicalSlotStacks(
+                        player.getItemStack(shellRaw));
+                var next = KitCrystalNormalizationPlan.next(shellSlots);
+                if (next == null || next.number() != 2
+                        || next.amount() != repair.amount()
+                        || next.outgoingSlot() != repair.outgoingSlot()
+                        || next.anchorSlot() != repair.mergeTargetSlot()
+                        || !repair.shellHash().equals(KitVariantFingerprint.shell(
+                                shellSlots, repair.fingerprintVersion())))
+                    return "moved shell does not match the exact stage-two physical fingerprint";
+                int found = -1;
+                for (int raw = 9; raw <= 44; raw++) {
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack == null || !repair.itemId().equals(
+                            ItemIdentifier.getItemId(stack))) continue;
+                    if (raw < 9 || raw > 35 || found >= 0
+                            || stack.getAmount() != repair.amount()
+                            || !repair.sourceHash().equals(KitVariantFingerprint.variant(
+                                    stack, repair.fingerprintVersion())))
+                        return "retrieved crystal cargo is not a unique exact stack";
+                    found = raw;
+                }
+                if (found < 9) return "retrieved crystal cargo is missing";
+                incomingRaw = found;
+                snapshot = new KitFulfillmentJournalStore.Snapshot(
+                        snapshot.schemaVersion(), snapshot.kitName(), snapshot.state(),
+                        snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                        snapshot.completedBoxes(), snapshot.currentItem(),
+                        snapshot.currentQuantity(), shellRaw, snapshot.exportPosition(),
+                        snapshot.kitWorksite(), snapshot.borrowedSourceWorksite(),
+                        snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                        snapshot.blocker(), snapshot.updatedAtEpochMilli(),
+                        snapshot.resumeState(), snapshot.resumeNotBeforeEpochMilli(),
+                        snapshot.sourceBoxesToReturn(), snapshot.auditedCargoSlot(),
+                        snapshot.writtenOffSources(), snapshot.auditedCargoSlots(),
+                        snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                        snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(),
+                        snapshot.retainedShell(), snapshot.variantRepair(),
+                        snapshot.protectedLoose(), snapshot.heldBoxRebase());
+            }
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || !("kit_variant_source_cargo_unverified".equals(snapshot.blocker())
+                        || movedCrystalShell || packedStackPackerPreflight)
+                    || snapshot.resumeState() != null || snapshot.variantRepair() == null
+                    || snapshot.variantRepair().auditedIncomingRawSlot() != 0
+                        && !packedStackRecoveredPreflight
+                    || snapshot.variantRepair().displacedRawSlot() != -1
+                    || snapshot.kitWorksite() != null
+                    || snapshot.borrowedSourceWorksite() != null) {
+                return "checkpoint is not at the stopped variant-source boundary";
+            }
+            var repair = snapshot.variantRepair();
+            if (savedLegacyShell != null && (repair.fingerprintVersion() != 0
+                    || !repair.shellHash().equals(savedLegacyShell)
+                    || repair.shellHash().equals(liveCanonicalShell))) {
+                return "legacy shell attestation does not match this checkpoint";
+            }
+            if (repair.fingerprintVersion() == 0
+                    && "legacy_cargo_fingerprint".equals(
+                            KitFulfillmentCoordinator.variantRepairBoundaryFailure(snapshot))) {
+                repair = canonicalizeLegacyVariantRepair(snapshot, incomingRaw,
+                        savedLegacyShell, liveCanonicalShell);
+                if (repair == null) return "legacy fingerprint migration lacks exact source evidence";
+            }
+            repair = repair.withAuditedIncoming(incomingRaw);
+            var audited = snapshot.withVariantRepair(repair);
+            String variantFailure = KitFulfillmentCoordinator.variantReadyBoundaryFailure(audited);
+            if (variantFailure != null) return "variant boundary: " + variantFailure;
+            if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                    audited.displacedAppleSlots())) return "protected apple slots changed";
+            Set<Integer> owned = new HashSet<>(
+                    KitFulfillmentCoordinator.variantPendingSourceSlots(audited));
+            if (owned.size() != audited.sourceBoxesToReturn().size()) {
+                return "borrowed source box identities are ambiguous";
+            }
+            owned.add(audited.ownedShellSlot());
+            owned.add(repair.cargoRawSlot());
+            owned.add(incomingRaw);
+            owned.addAll(audited.displacedAppleSlots().keySet());
+            if (audited.retainedShell() != null) {
+                int retainedSlot = KitFulfillmentCoordinator.uniqueRetainedShellSlot(audited);
+                if (retainedSlot < 0) return "reserved empty kit shell is missing";
+                owned.add(retainedSlot);
+            }
+            var admission = KitInventoryAdmissionPolicy.inspectLive(database.loadKeepItems(), owned);
+            if (admission == null || !admission.accepted()) {
+                return "unexpected inventory slots: "
+                        + (admission == null ? "unavailable" : admission.unexpectedSlots());
+            }
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())) {
+                return "fresh trusted scan required for source and import footprints";
+            }
+            List<ContainerEntry> scanned = database.getAllContainers().stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli())
+                    .toList();
+            if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                    index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                    config.pos2, null, audited.exportPosition(), repair.importPosition())) {
+                return "import chest is no longer eligible and freshly indexed";
+            }
+            long now = System.currentTimeMillis();
+            long due = now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, audited.kitName(), "BLOCKED",
+                    audited.recipe(), audited.packedContents(), audited.requestedBoxes(),
+                    audited.completedBoxes(), audited.currentItem(), audited.currentQuantity(),
+                    audited.ownedShellSlot(), audited.exportPosition(), null, null,
+                    audited.borrowedSourceItemId(), audited.borrowedSourceContents(),
+                    "resume_variant_source_cargo", now, "VARIANT_WAIT_SOURCE", due,
+                    audited.sourceBoxesToReturn(), audited.auditedCargoSlot(),
+                    audited.writtenOffSources(), audited.auditedCargoSlots(),
+                    audited.incompleteBoxes(), audited.missingTotals(),
+                    audited.currentBoxMissing(), audited.displacedAppleSlots(),
+                    audited.retainedShell(), repair));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_variant_source_cargo_audited", "kit=" + audited.kitName()
+                    + ", raw=" + incomingRaw + ", amount=" + repair.amount()
+                    + ", shell_rebaseline=" + (savedLegacyShell != null)
+                    + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
+            return null;
+        } catch (Exception e) {
+            debugRecorder.record("kit_variant_source_cargo_audit_failed",
+                    "raw=" + incomingRaw, e);
+            return "could not audit variant source cargo: " + e.getMessage();
+        }
+    }
+
+    /** Schedule a single operator-selected source return. The saved index establishes
+     * the import role and footprint; KitExporter must prove live free capacity. */
+    public @Nullable String scheduleKitSourceReturnToCapacityImport(int[] target) {
+        if (target == null || target.length != 3) return "return target is invalid";
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())) {
+            return "another stash movement is active";
+        }
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+            return "bot must be online with no client controller attached";
+        }
+        var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = inventoryCache.getMouseStack();
+        if (inventoryCache.getOpenContainerId() > 0
+                || (cursor != null && cursor.getAmount() > 0)
+                || INVENTORY.hasActiveRequest()) {
+            return "close the container and clear the cursor before returning a source";
+        }
+        if (config.pos1 == null || config.pos2 == null
+                || database == null || !database.isInitialized()) {
+            return "stash region or database is unavailable";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            boolean unjournaled = KitResumePolicy.canAuditUnjournaledBorrowedSource(snapshot);
+            boolean failedDepositAudit = KitResumePolicy.canAuditFailedSourceReturn(snapshot);
+            if (!unjournaled && !failedDepositAudit
+                    && !KitResumePolicy.canScheduleLiveCapacityImportReturn(snapshot)) {
+                return "checkpoint is not at the no-capacity-import source-return boundary";
+            }
+            int ownedShellSlot = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            if (ownedShellSlot < 0 || (!unjournaled
+                    && KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot) < 0)) {
+                return "packed kit shell or borrowed source shulker no longer matches the checkpoint";
+            }
+            KitFulfillmentJournalStore.BorrowedBox source;
+            if (unjournaled) {
+                if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                        snapshot.displacedAppleSlots())) {
+                    return "protected apple slots no longer match the checkpoint";
+                }
+                var admission = KitInventoryAdmissionPolicy.inspectLive(
+                        database.loadKeepItems(), java.util.stream.Stream.concat(
+                                java.util.stream.Stream.of(ownedShellSlot),
+                                snapshot.displacedAppleSlots().keySet().stream())
+                                .collect(java.util.stream.Collectors.toSet()));
+                if (admission == null || admission.unexpectedSlots().size() != 1) {
+                    return "exactly one unowned source box must be the only unexpected slot";
+                }
+                int raw = admission.unexpectedSlots().getFirst();
+                Container player = inventoryCache.getPlayerInventory();
+                ItemStack stack = player == null || raw < 9 || raw > 44
+                        ? null : player.getItemStack(raw);
+                if (stack == null || stack.getAmount() != 1
+                        || !ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack))
+                                .contains("shulker_box")) {
+                    return "the sole unexpected slot is not one physical shulker box";
+                }
+                Map<String, Integer> contents = ItemIdentifier.readShulkerContents(stack);
+                if (contents.isEmpty() || contents.equals(snapshot.packedContents())) {
+                    return "unowned source box contents are empty or match the kit shell";
+                }
+                source = new KitFulfillmentJournalStore.BorrowedBox(
+                        null, ItemIdentifier.getItemId(stack), contents);
+            } else {
+                source = snapshot.sourceBoxesToReturn().getFirst();
+            }
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())) {
+                return "fresh trusted scan required for the import footprint";
+            }
+            List<ContainerEntry> scanned = database.getAllContainers().stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli())
+                    .toList();
+            if (!KitSourceReturnPolicy.registeredImportForLiveCapacityAudit(scanned,
+                    index.getImportChests(), getReservedContainerKeys(), config.pos1,
+                    config.pos2, source.sourcePosition(), snapshot.exportPosition(), target)) {
+                return "target is not an eligible scanned and fully registered import chest";
+            }
+            var selected = new KitFulfillmentJournalStore.BorrowedBox(
+                    source.sourcePosition(), source.itemId(), source.contents(), target);
+            long now = System.currentTimeMillis();
+            long due = now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    ownedShellSlot, snapshot.exportPosition(), snapshot.kitWorksite(),
+                    snapshot.borrowedSourceWorksite(), snapshot.borrowedSourceItemId(),
+                    snapshot.borrowedSourceContents(), failedDepositAudit
+                            ? "resume_audit_failed_source_return"
+                            : "resume_source_return_exact_import",
+                    now, failedDepositAudit ? "VERIFY_FAILED_RETURN" : "RETURNING_SOURCE",
+                    due, List.of(selected),
+                    snapshot.auditedCargoSlot(), snapshot.writtenOffSources(),
+                    snapshot.auditedCargoSlots(), snapshot.incompleteBoxes(),
+                    snapshot.missingTotals(), snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell()));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_source_return_exact_import_scheduled",
+                    "kit=" + snapshot.kitName() + ", target=" + Arrays.toString(target)
+                    + ", audited_unjournaled_box=" + unjournaled
+                    + ", verify_failed_deposit=" + failedDepositAudit
+                    + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
+            return null;
+        } catch (Exception e) {
+            debugRecorder.record("kit_source_return_exact_import_schedule_failed",
+                    "target=" + Arrays.toString(target), e);
+            return "could not schedule exact import return: " + e.getMessage();
+        }
+    }
+
+    /** Resume one observed loose stack without mistaking identical kept supplies for cargo. */
+    public @Nullable String scheduleKitCargoAudit(int rawSlot, int quantity) {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()) {
+            return "kit movement or worksite recovery is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            boolean partialCargo = snapshot != null
+                    && "kit_cargo_retrieval_incomplete".equals(snapshot.blocker());
+            boolean attestedLostBorrowedCargo =
+                    KitResumePolicy.canAuditLostBorrowedCargo(snapshot, rawSlot, quantity);
+            boolean swappedBorrowedShell = snapshot != null
+                    && "kit_preexisting_inventory_changed".equals(snapshot.blocker())
+                    && snapshot.sourceBoxesToReturn() != null
+                    && !snapshot.sourceBoxesToReturn().isEmpty()
+                    && quantity == snapshot.currentQuantity();
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || (!partialCargo && !swappedBorrowedShell
+                        && !attestedLostBorrowedCargo)
+                    || snapshot.resumeState() != null
+                    || snapshot.borrowedSourceWorksite() != null
+                    || snapshot.kitWorksite() != null
+                    || snapshot.currentItem() == null
+                    || quantity < 1 || quantity > snapshot.currentQuantity()
+                    || quantity > snapshot.recipe().getOrDefault(snapshot.currentItem(), 0)
+                            - snapshot.packedContents().getOrDefault(snapshot.currentItem(), 0)) {
+                return "checkpoint is not at a recoverable partial-cargo boundary";
+            }
+            var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+            var cursor = inventoryCache.getMouseStack();
+            if (inventoryCache.getOpenContainerId() > 0
+                    || (cursor != null && cursor.getAmount() > 0)) {
+                return "close the container and clear the cursor before auditing cargo";
+            }
+            int verifiedShellSlot = swappedBorrowedShell
+                    ? KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot)
+                    : snapshot.ownedShellSlot();
+            if (verifiedShellSlot < 0 || (partialCargo
+                    && !kitFulfillment.hasVerifiedOwnedShell(snapshot))) {
+                return "packed kit shulker no longer matches the checkpoint";
+            }
+            if (attestedLostBorrowedCargo
+                    && (verifiedShellSlot != snapshot.ownedShellSlot()
+                        || !kitFulfillment.hasVerifiedOwnedShell(snapshot)
+                        || KitFulfillmentCoordinator.uniqueCurrentLooseCargoSlot(snapshot)
+                            != rawSlot)) {
+                return "attested-loss cargo is not the unique exact loose task stack";
+            }
+            var audited = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), quantity,
+                    verifiedShellSlot, snapshot.exportPosition(), null, null,
+                    null, Map.of(), "resume_audited_inventory_cargo",
+                    System.currentTimeMillis(), "WAIT_CARGO",
+                    System.currentTimeMillis()
+                            + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                    snapshot.sourceBoxesToReturn(), rawSlot, snapshot.writtenOffSources(),
+                    snapshot.auditedCargoSlots(), snapshot.incompleteBoxes(),
+                    snapshot.missingTotals(), snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots());
+            if (swappedBorrowedShell
+                    && KitFulfillmentCoordinator.uniqueSourceReturnSlot(audited) < 0) {
+                return "borrowed source shulker is missing or ambiguous";
+            }
+            if (KitFulfillmentCoordinator.uniqueAuditedCargoSlot(audited) != rawSlot) {
+                return "slot does not contain the exact audited item and count";
+            }
+            kitJournal.save(audited);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_partial_cargo_audited",
+                    "kit=" + snapshot.kitName() + ", item=" + snapshot.currentItem()
+                            + ", quantity=" + quantity + ", raw_slot=" + rawSlot);
+            return null;
+        } catch (Exception e) {
+            return "could not schedule audited cargo recovery: " + e.getMessage();
+        }
+    }
+
+    /** Inventory evidence for a blocked batch; this does not mutate the checkpoint. */
+    public String diagnoseKitCargo() {
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null) return "No kit checkpoint exists.";
+            if (!Proxy.getInstance().isConnected()) return "Bot disconnected; live cargo unavailable.";
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "Player inventory unavailable.";
+            boolean shellMatches = KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot);
+            int uniqueShellSlot = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            StringBuilder out = new StringBuilder("Kit cargo: ")
+                    .append(snapshot.kitName()).append(' ')
+                    .append(snapshot.completedBoxes()).append('/')
+                    .append(snapshot.requestedBoxes()).append("; blocker=")
+                    .append(snapshot.blocker()).append("; expected=")
+                    .append(snapshot.currentItem()).append(" x")
+                    .append(snapshot.currentQuantity()).append("; shell matches=")
+                    .append(shellMatches)
+                    .append("; unique shell slot=").append(uniqueShellSlot)
+                    .append("; open container=").append(cache.getOpenContainerId());
+            if (shellMatches && snapshot.ownedShellSlot() >= 9
+                    && snapshot.ownedShellSlot() <= 44) {
+                ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+                List<ItemStack> physicalBatch = new ArrayList<>(
+                        ItemIdentifier.readShulkerPhysicalStacks(shell));
+                Map<String, Integer> cargoVariants = new LinkedHashMap<>();
+                for (int raw = 9; raw <= 44; raw++) {
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack == null || stack.getAmount() <= 0
+                            || !Objects.equals(snapshot.currentItem(),
+                                    ItemIdentifier.getItemId(stack))) continue;
+                    physicalBatch.add(stack);
+                    String fingerprint = KitVariantFingerprint.canonicalVariant(stack);
+                    cargoVariants.merge(fingerprint == null ? "unavailable" : fingerprint,
+                            stack.getAmount(), Integer::sum);
+                }
+                Map<Map.Entry<Integer, Object>, Integer> physicalTotals = new HashMap<>();
+                for (ItemStack stack : physicalBatch) {
+                    physicalTotals.merge(new java.util.AbstractMap.SimpleImmutableEntry<>(
+                            stack.getId(), stack.getDataComponents()),
+                            stack.getAmount(), Integer::sum);
+                }
+                int physicalRequired = 0;
+                for (var group : physicalTotals.entrySet()) {
+                    var data = com.zenith.mc.item.ItemRegistry.REGISTRY.get(
+                            group.getKey().getKey());
+                    int max = data == null ? 1 : Math.max(1, data.stackSize());
+                    physicalRequired += (group.getValue() + max - 1) / max;
+                }
+                out.append("; shell occupied slots=")
+                        .append(ItemIdentifier.readShulkerOccupiedSlots(shell))
+                        .append("/27; packed minimum slots=")
+                        .append(KitCapacity.requiredSlots(snapshot.packedContents()))
+                        .append("; recipe minimum slots=")
+                        .append(KitCapacity.requiredSlots(snapshot.recipe()))
+                        .append("; physical slots with live matching cargo=")
+                        .append(physicalRequired).append("/27")
+                        .append("; matching cargo variants=")
+                        .append(cargoVariants)
+                        .append("; physical stack slots by item=")
+                        .append(ItemIdentifier.readShulkerStackSlots(shell))
+                        .append("; enchanted golden apple stacks=")
+                        .append(ItemIdentifier.readShulkerStackDetails(shell, "enchanted_golden_apple"))
+                        .append("; end crystal stacks=")
+                        .append(ItemIdentifier.readShulkerStackDetails(shell, "end_crystal"));
+                Integer appleRequired = snapshot.recipe().get("enchanted_golden_apple");
+                if (appleRequired != null && appleRequired > 0) {
+                    var applePlan = com.zenith.plugin.stashmanager.kit.KitAppleExchangePlan
+                            .choose(ItemIdentifier.readShulkerPhysicalStacks(shell), List.of(),
+                                    appleRequired,
+                                    KitCapacity.requiredSlots(Map.of("enchanted_golden_apple",
+                                            appleRequired)));
+                    out.append("; apple component plan without surveyed sources=")
+                            .append(applePlan.choice()).append(" retained=")
+                            .append(applePlan.retained()).append(" replace=")
+                            .append(applePlan.toRemove()).append(" shortfall=")
+                            .append(applePlan.shortfall());
+                }
+            }
+            var cursor = cache.getMouseStack();
+            out.append("; cursor count=").append(cursor == null ? 0 : cursor.getAmount());
+            int total = 0;
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack != null && stack.getAmount() > 0
+                        && snapshot.currentItem() != null
+                        && snapshot.currentItem().equals(ItemIdentifier.getItemId(stack))) {
+                    out.append("; slot ").append(raw).append('=')
+                            .append(stack.getAmount());
+                    total += stack.getAmount();
+                }
+            }
+            out.append("; total loose=").append(total);
+            if ("kit_preexisting_inventory_changed".equals(snapshot.blocker())
+                    && kitFulfillment.lastBaselineMismatch() != null) {
+                out.append("; baseline mismatch=")
+                        .append(kitFulfillment.lastBaselineMismatch());
+            }
+            if (snapshot.borrowedSourceWorksite() != null) {
+                out.append("; journaled borrowed box=")
+                        .append(snapshot.borrowedSourceItemId()).append(' ')
+                        .append(snapshot.borrowedSourceContents());
+            }
+            int candidates = 0;
+            for (int raw = 9; raw <= 45; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack == null || stack.getAmount() <= 0) continue;
+                String id = ItemIdentifier.getItemId(stack);
+                if (!ItemIdentifier.baseItemId(id).contains("shulker_box")) continue;
+                Map<String, Integer> contents = ItemIdentifier.readShulkerContents(stack);
+                if (snapshot.currentItem() == null
+                        || !contents.containsKey(snapshot.currentItem())) continue;
+                if (++candidates <= 12) {
+                    out.append("; carried source slot ").append(raw).append('=')
+                            .append(id).append(' ').append(contents);
+                    Map<String, Integer> sourceVariants = new LinkedHashMap<>();
+                    for (ItemStack inner : ItemIdentifier.readShulkerPhysicalStacks(stack)) {
+                        if (!snapshot.currentItem().equals(ItemIdentifier.getItemId(inner))) continue;
+                        String fingerprint = KitVariantFingerprint.canonicalVariant(inner);
+                        sourceVariants.merge(fingerprint == null ? "unavailable" : fingerprint,
+                                inner.getAmount(), Integer::sum);
+                    }
+                    out.append(" physical variants=").append(sourceVariants);
+                }
+            }
+            if (candidates > 12) out.append("; +").append(candidates - 12)
+                    .append(" more carried candidates");
+            int shulkers = 0;
+            for (int raw = 9; raw <= 45; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack == null || stack.getAmount() != 1) continue;
+                String id = ItemIdentifier.getItemId(stack);
+                if (!ItemIdentifier.baseItemId(id).contains("shulker_box")) continue;
+                shulkers++;
+                if (shulkers <= 12) {
+                    out.append("; shulker raw ").append(raw).append('=')
+                            .append(id).append(' ')
+                            .append(ItemIdentifier.readShulkerContents(stack))
+                            .append(" component hash=")
+                            .append(KitVariantFingerprint.canonicalVariant(stack));
+                }
+            }
+            if (shulkers > 12) out.append("; +").append(shulkers - 12)
+                    .append(" more carried shulkers");
+            if (snapshot.kitWorksite() != null && cache.getOpenContainerId() > 0
+                    && cache.getOpenContainer() != null
+                    && cache.getOpenContainer().getSize() - 36 == 27) {
+                out.append("; ").append(inspectOpenKitWorksite());
+            }
+            if (config.kitInteractionTraceEnabled) {
+                var trace = kitInteractionTrace.status();
+                out.append("; last interaction observation=")
+                        .append(trace.verdict())
+                        .append(" (passive, not cargo proof)")
+                        .append("; awaiting full window=")
+                        .append(trace.awaitingFullWindow())
+                        .append("; awaiting player mirror=")
+                        .append(trace.awaitingPlayerMirror())
+                        .append("; interaction trace failed=")
+                        .append(trace.failed());
+            }
+            return out.toString();
+        } catch (Exception e) {
+            return "Kit cargo inspection failed: " + e.getMessage();
+        }
+    }
+
+    /** Read-only preflight for a combined carried source box; does not rebase or move cargo. */
+    public String diagnoseKitHeldBoxRebase(int attestedKeptUnits) {
+        try {
+            if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                    || organizer != null && organizer.isActive() || state != ScanState.IDLE
+                    || INVENTORY.hasActiveRequest())
+                return "Another stash operation is active; held-box state is unsettled.";
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null) return "No kit checkpoint exists.";
+            if (database == null || !database.isInitialized())
+                return "Database is unavailable.";
+            refreshLatestScanTrust();
+            if (!heldBoxScanRecoveryAdmissible(snapshot))
+                return "Held-box recovery requires a trusted scan, or exactly one "
+                        + "failed container with this source chest indexed.";
+            if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive())
+                return "Bot must be alive in-world with no controller attached.";
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            var cursor = cache.getMouseStack();
+            if (cache.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+                return "Close the GUI and clear the cursor before checking held stock.";
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "Player inventory is unavailable.";
+            int ownedRaw = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            int retainedRaw = snapshot.retainedShell() == null ? -1
+                    : KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+            Map<Integer, ItemStack> live = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+            var result = KitHeldBorrowedBoxPolicy.inspect(
+                    snapshot, live, ownedRaw, retainedRaw, attestedKeptUnits);
+            if (!result.accepted()) {
+                debugRecorder.record("kit_held_box_rebase_check_rejected",
+                        "reason=" + result.blocker());
+                return "Held-box preflight rejected: " + result.blocker()
+                        + ". No checkpoint or inventory change.";
+            }
+            var plan = result.plan();
+            debugRecorder.record("kit_held_box_rebase_candidate",
+                    "source_raw=" + plan.sourceRaw() + ", combined="
+                            + plan.combinedSourceUnits() + ", journaled="
+                            + plan.journaledSourceUnits() + ", task_observed="
+                            + plan.retrievedUnits() + ", kept_attested="
+                            + plan.keptUnits());
+            return "Held-box preflight matches: source raw " + plan.sourceRaw()
+                    + " contains " + plan.combinedSourceUnits() + " " + plan.itemId()
+                    + "; journaled post-retrieval source=" + plan.journaledSourceUnits()
+                    + "; observed task=" + plan.retrievedUnits()
+                    + "; attested older stock=" + plan.keptUnits()
+                    + ". This is an arithmetic and live-identity check only. "
+                    + "Observed stable phase="
+                    + KitHeldBorrowedBoxPolicy.observe(plan, live, ownedRaw) + ". "
+                    + "No extraction, ownership change, checkpoint rebase, or resume occurred. "
+                    + "Last passive interaction observation="
+                    + (config.kitInteractionTraceEnabled
+                            ? kitInteractionTrace.status() : "disabled");
+        } catch (Exception e) {
+            return "Held-box preflight failed: " + e.getClass().getSimpleName();
+        }
+    }
+
+    /** Journal the exact carried-box rebase; all item movement occurs after guarded recovery. */
+    public @Nullable String scheduleKitHeldBoxRebase(int attestedKeptUnits) {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || organizer != null && organizer.isActive() || state != ScanState.IDLE
+                || INVENTORY.hasActiveRequest()) return "another stash operation is active";
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || database == null || !database.isInitialized())
+                return "checkpoint or database is unavailable";
+            refreshLatestScanTrust();
+            if (!heldBoxScanRecoveryAdmissible(snapshot))
+                return "source chest is not indexed or latest scan has more than one failure";
+            if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive())
+                return "bot must be alive in-world with no controller attached";
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            var cursor = cache.getMouseStack();
+            if (cache.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+                return "close the GUI and clear the cursor";
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "player inventory is unavailable";
+            int ownedRaw = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            int retainedRaw = snapshot.retainedShell() == null ? -1
+                    : KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+            Map<Integer, ItemStack> live = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+            if (snapshot.heldBoxRebase() != null) {
+                if (!"BLOCKED".equals(snapshot.state())
+                        || !"borrowed_inventory_source_changed".equals(snapshot.blocker())
+                        || snapshot.resumeState() != null
+                        || snapshot.kitWorksite() != null
+                        || snapshot.borrowedSourceWorksite() != null
+                        || snapshot.variantRepair() != null
+                        || snapshot.protectedLoose() != null
+                        || snapshot.heldBoxRebase().keptUnits() != attestedKeptUnits)
+                    return "saved held-box recovery is not at its exact retry boundary";
+                var retry = new KitFulfillmentJournalStore.Snapshot(
+                        KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                        snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                        snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                        ownedRaw, snapshot.exportPosition(), null, null, null, Map.of(),
+                        "resume_held_box_rebase", System.currentTimeMillis(), "NEED_CARGO",
+                        System.currentTimeMillis()
+                                + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                        snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(), Map.of(),
+                        snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                        snapshot.currentBoxMissing())
+                        .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                        .withRetainedShell(snapshot.retainedShell())
+                        .withHeldBoxRebase(snapshot.heldBoxRebase());
+                if (!KitHeldBorrowedBoxPolicy.verifiedScheduled(retry, live, ownedRaw, retainedRaw))
+                    return "saved held-box identity or balance changed";
+                live.clear();
+                for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+                if (!KitHeldBorrowedBoxPolicy.verifiedScheduled(retry, live, ownedRaw, retainedRaw))
+                    return "saved held-box identity changed before checkpoint write";
+                kitJournal.save(retry);
+                kitResumeCadence.reset();
+                debugRecorder.record("kit_held_box_rebase_rescheduled",
+                        "task=" + retry.currentQuantity() + ", kept_in_source="
+                                + retry.heldBoxRebase().keptUnits());
+                return null;
+            }
+            var first = KitHeldBorrowedBoxPolicy.inspect(
+                    snapshot, live, ownedRaw, retainedRaw, attestedKeptUnits);
+            if (!first.accepted()) return first.blocker();
+            var plan = first.plan();
+            live.clear();
+            for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+            var second = KitHeldBorrowedBoxPolicy.inspect(
+                    snapshot, live, ownedRaw, retainedRaw, attestedKeptUnits);
+            if (!second.accepted() || !plan.equals(second.plan()))
+                return "held source or inventory changed before checkpoint write";
+            var source = snapshot.sourceBoxesToReturn().getFirst();
+            var combined = new KitFulfillmentJournalStore.BorrowedBox(
+                    source.sourcePosition(), source.itemId(),
+                    Map.of(plan.itemId(), plan.combinedSourceUnits()), source.returnPosition());
+            var witness = new KitFulfillmentJournalStore.HeldBoxRebase(
+                    plan.journaledSourceUnits(), plan.combinedSourceUnits(),
+                    plan.retrievedUnits(), plan.keptUnits(), plan.sourceItemId(),
+                    plan.itemId(), plan.variantHash());
+            var scheduled = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), plan.retrievedUnits(),
+                    ownedRaw, snapshot.exportPosition(), null, null, null, Map.of(),
+                    "resume_held_box_rebase", System.currentTimeMillis(), "NEED_CARGO",
+                    System.currentTimeMillis()
+                            + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                    List.of(combined), -1, snapshot.writtenOffSources(), Map.of(),
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell())
+                    .withHeldBoxRebase(witness);
+            if (!KitHeldBorrowedBoxPolicy.verifiedScheduled(
+                    scheduled, live, ownedRaw, retainedRaw))
+                return "scheduled held-box identity failed its final preflight";
+            kitJournal.save(scheduled);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_held_box_rebase_scheduled",
+                    "source_raw=" + plan.sourceRaw() + ", combined="
+                            + plan.combinedSourceUnits() + ", task="
+                            + plan.retrievedUnits() + ", older_stock_in_source="
+                            + plan.keptUnits());
+            return null;
+        } catch (Exception e) {
+            return "held-box rebase failed: " + e.getClass().getSimpleName();
+        }
+    }
+
+    private boolean heldBoxScanRecoveryAdmissible(
+            KitFulfillmentJournalStore.Snapshot snapshot) throws Exception {
+        if (snapshot.sourceBoxesToReturn() == null
+                || snapshot.sourceBoxesToReturn().size() != 1) return false;
+        int[] source = snapshot.sourceBoxesToReturn().getFirst().sourcePosition();
+        if (source == null || source.length != 3) return false;
+        boolean indexedSource = index.get(source[0], source[1], source[2]) != null;
+        var summary = database.getLatestScanSummary(config.pos1, config.pos2);
+        return summary.map(scan -> KitHeldScanRecoveryPolicy.accepts(
+                latestScanTrusted, indexedSource, scan.found(), scan.indexed(),
+                scan.failed(), scan.completionStatus())).orElse(false);
+    }
+
+    /**
+     * Reconcile the narrow case where the pre-placement journal named the owned kit shell,
+     * while the actual chest-borrowed shulker was recovered into inventory. All physical
+     * identities and the operator-observed source delta must agree before any write.
+     * Syntax: sourceSlot originX originY originZ sourceBefore sourceTaken slot:count ...
+     */
+    public @Nullable String auditMismatchedBorrowedSource(String evidence) {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())) {
+            return "another automation or recovery operation is active";
+        }
+        try {
+            String[] tokens = evidence == null ? new String[0] : evidence.trim().split("\\s+");
+            if (tokens.length > 0 && "unopened".equals(tokens[0])) {
+                return auditUnopenedBorrowedSource(tokens);
+            }
+            if (tokens.length == 2 && "recycled".equals(tokens[0])) {
+                return auditRetainedKitShell(Integer.parseInt(tokens[1]));
+            }
+            if (tokens.length < 7) {
+                return "use sourceSlot originX originY originZ sourceBefore sourceTaken slot:count ...";
+            }
+            int sourceSlot = Integer.parseInt(tokens[0]);
+            int[] origin = {Integer.parseInt(tokens[1]), Integer.parseInt(tokens[2]),
+                    Integer.parseInt(tokens[3])};
+            int sourceBefore = Integer.parseInt(tokens[4]);
+            int sourceTaken = Integer.parseInt(tokens[5]);
+            if (sourceSlot < 9 || sourceSlot > 44 || sourceBefore < 1 || sourceBefore > 1728
+                    || sourceTaken < 1 || sourceTaken >= sourceBefore) {
+                return "borrowed source slot or item-count evidence is out of range";
+            }
+            Map<Integer, Integer> pinned = new java.util.LinkedHashMap<>();
+            for (int i = 6; i < tokens.length; i++) {
+                String[] pair = tokens[i].split(":", -1);
+                if (pair.length != 2) return "cargo evidence must use slot:count pairs";
+                int slot = Integer.parseInt(pair[0]);
+                int count = Integer.parseInt(pair[1]);
+                if (slot < 9 || slot > 44 || count < 1 || count > 64
+                        || pinned.putIfAbsent(slot, count) != null) {
+                    return "cargo slot, count, or uniqueness is invalid";
+                }
+            }
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || !"borrowed_source_contents_unverified".equals(snapshot.blocker())
+                    || snapshot.resumeState() != null || snapshot.kitWorksite() != null
+                    || snapshot.borrowedSourceWorksite() == null
+                    || !snapshot.sourceBoxesToReturn().isEmpty()
+                    || snapshot.currentItem() == null || snapshot.currentQuantity() <= 0
+                    || sourceSlot == snapshot.ownedShellSlot()) {
+                return "checkpoint is not at the mismatched borrowed-source boundary";
+            }
+            if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+                return "bot must be in-world with no controller attached";
+            }
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = cache.getMouseStack();
+            if (cache.getOpenContainerId() > 0 || INVENTORY.hasActiveRequest()
+                    || (cursor != null && cursor.getAmount() > 0)) {
+                return "inventory transaction is still open";
+            }
+            if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)) {
+                return "owned kit shell does not match the checkpoint";
+            }
+            Container player = cache.getPlayerInventory();
+            ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+            if (!snapshot.borrowedSourceItemId().equals(ItemIdentifier.getItemId(shell))
+                    || !snapshot.borrowedSourceContents().equals(
+                            ItemIdentifier.readShulkerContents(shell))) {
+                return "journaled borrowed identity is not the intact owned kit shell";
+            }
+            ItemStack source = player.getItemStack(sourceSlot);
+            if (source == null || source.getAmount() != 1) {
+                return "borrowed source is absent from the specified inventory slot";
+            }
+            String sourceId = ItemIdentifier.getItemId(source);
+            Map<String, Integer> sourceContents = ItemIdentifier.readShulkerContents(source);
+            if (!ItemIdentifier.baseItemId(sourceId).contains("shulker_box")
+                    || sourceId.equals(snapshot.borrowedSourceItemId())
+                    || sourceContents.size() != 1
+                    || sourceContents.getOrDefault(snapshot.currentItem(), 0)
+                            != sourceBefore - sourceTaken) {
+                return "carried source identity or observed withdrawal does not match";
+            }
+            int[] worksite = snapshot.borrowedSourceWorksite();
+            if (!World.isChunkLoadedBlockPos(worksite[0], worksite[2])
+                    || World.getChunkSection(worksite[0], worksite[1], worksite[2]) == null
+                    || !BlockCompat.isAir(World.getBlock(worksite[0], worksite[1], worksite[2]))) {
+                return "journaled worksite is not loaded and empty";
+            }
+            ContainerEntry originEntry = index.get(origin[0], origin[1], origin[2]);
+            if (originEntry == null || index.isExportChest(originEntry)
+                    || !World.isChunkLoadedBlockPos(origin[0], origin[2])
+                    || !World.getBlock(origin[0], origin[1], origin[2]).name().contains("chest")) {
+                return "original source chest is not a live indexed input chest";
+            }
+            var returning = List.of(new KitFulfillmentJournalStore.BorrowedBox(
+                    origin, sourceId, sourceContents));
+            var audited = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                    Map.of(), "resume_audited_inventory_cargo", System.currentTimeMillis(),
+                    "WAIT_CARGO", System.currentTimeMillis()
+                            + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                    returning, -1, snapshot.writtenOffSources(), pinned,
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots());
+            if (!KitFulfillmentCoordinator.verifiedAuditedCargo(audited)
+                    || KitFulfillmentCoordinator.uniqueSourceReturnSlot(audited) != sourceSlot
+                    || KitResumePolicy.blocker(audited) != null) {
+                return "pinned cargo or borrowed source is missing or ambiguous";
+            }
+            kitJournal.save(audited);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_mismatched_borrowed_source_audited",
+                    "kit=" + snapshot.kitName() + ", source_slot=" + sourceSlot
+                            + ", source=" + sourceId + " " + sourceContents
+                            + ", before=" + sourceBefore + ", taken=" + sourceTaken
+                            + ", return=" + java.util.Arrays.toString(origin)
+                            + ", cargo=" + pinned);
+            return null;
+        } catch (NumberFormatException e) {
+            return "source, origin, and cargo counts must be integers";
+        } catch (Exception e) {
+            return "borrowed source audit failed: " + e.getMessage();
+        }
+    }
+
+    /** Audit an interrupted chest borrow before the borrowed box was placed or opened.
+     * Syntax: unopened raw x y z units itemId baselineRaw:count ... . The baseline
+     * counts must come from a server inventory observation before the borrow. */
+    private @Nullable String auditUnopenedBorrowedSource(String[] tokens) throws Exception {
+        if (tokens.length < 8) {
+            return "use unopened raw originX originY originZ sourceUnits sourceItemId baselineRaw:count ...";
+        }
+        int sourceRaw = Integer.parseInt(tokens[1]);
+        int[] origin = {Integer.parseInt(tokens[2]), Integer.parseInt(tokens[3]),
+                Integer.parseInt(tokens[4])};
+        int sourceUnits = Integer.parseInt(tokens[5]);
+        String expectedSourceId = tokens[6];
+        Map<Integer, Integer> baseline = new java.util.LinkedHashMap<>();
+        for (int i = 7; i < tokens.length; i++) {
+            String[] pair = tokens[i].split(":", -1);
+            if (pair.length != 2) return "baseline evidence must use raw:count pairs";
+            int raw = Integer.parseInt(pair[0]);
+            int count = Integer.parseInt(pair[1]);
+            if (raw < 9 || raw > 44 || count < 1 || count > 64
+                    || baseline.putIfAbsent(raw, count) != null) {
+                return "baseline apple slot or count is invalid or repeated";
+            }
+        }
+        var snapshot = kitJournal.load().orElse(null);
+        boolean retryAfterSourceAdmission = snapshot != null
+                && "BLOCKED".equals(snapshot.state())
+                && "RETURNING_SOURCE".equals(snapshot.resumeState())
+                && ("unexpected_inventory_slots:[" + sourceRaw
+                    + "]; disposition=[" + sourceRaw + "=SHULKER_IDENTITY_REVIEW]")
+                        .equals(snapshot.blocker())
+                && snapshot.sourceBoxesToReturn().size() == 1
+                && java.util.Arrays.equals(origin,
+                        snapshot.sourceBoxesToReturn().getFirst().sourcePosition())
+                && java.util.Arrays.equals(origin,
+                        snapshot.sourceBoxesToReturn().getFirst().returnPosition())
+                && expectedSourceId.equals(snapshot.sourceBoxesToReturn().getFirst().itemId())
+                && Map.of("enchanted_golden_apple", sourceUnits).equals(
+                        snapshot.sourceBoxesToReturn().getFirst().contents());
+        if (!(KitResumePolicy.canAuditUnopenedSourceReturn(snapshot)
+                    || retryAfterSourceAdmission)
+                || !"enchanted_golden_apple".equals(snapshot.currentItem())
+                || sourceRaw == snapshot.ownedShellSlot()
+                || sourceUnits < 1 || sourceUnits > 1728
+                || !snapshot.auditedCargoSlots().isEmpty()
+                || snapshot.auditedCargoSlot() >= 0
+                || snapshot.variantRepair() != null) {
+            return "checkpoint is not an interrupted, unopened apple borrow";
+        }
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+            return "bot must be in-world with no controller attached";
+        }
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = cache.getMouseStack();
+        if (cache.getOpenContainerId() > 0 || INVENTORY.hasActiveRequest()
+                || (cursor != null && cursor.getAmount() > 0)) {
+            return "inventory transaction is still open";
+        }
+        if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                        snapshot.displacedAppleSlots())) {
+            return "owned kit shell or journaled displaced apples changed";
+        }
+        if (config.pos1 == null || config.pos2 == null || database == null
+                || !database.isInitialized()) return "stash region or database is unavailable";
+        var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+        ContainerEntry originEntry = index.get(origin[0], origin[1], origin[2]);
+        if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())
+                || originEntry == null || originEntry.timestamp() < scan.startedAtEpochMilli()
+                || index.isExportChest(originEntry) || !inConfiguredRegion(originEntry)
+                || !originEntry.inventoryFootprintKnown()
+                || !World.isChunkLoadedBlockPos(origin[0], origin[2])
+                || !World.getBlock(origin[0], origin[1], origin[2]).name().contains("chest")) {
+            return "source chest is not a live, freshly indexed input in the trusted region";
+        }
+        Container player = cache.getPlayerInventory();
+        if (player == null || sourceRaw < 9 || sourceRaw > 44) return "source slot is invalid";
+        ItemStack held = player.getItemStack(sourceRaw);
+        if (held == null || held.getAmount() != 1
+                || !expectedSourceId.equals(ItemIdentifier.getItemId(held))
+                || !ItemIdentifier.baseItemId(expectedSourceId).contains("shulker_box")
+                || !Map.of(snapshot.currentItem(), sourceUnits).equals(
+                        ItemIdentifier.readShulkerContents(held))) {
+            return "held source box does not match the pre-borrow window evidence";
+        }
+        int baselineUnits = 0;
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack == null || stack.getAmount() <= 0
+                    || !snapshot.currentItem().equals(ItemIdentifier.getItemId(stack))) continue;
+            if (snapshot.displacedAppleSlots().containsKey(raw)) continue;
+            Integer expected = baseline.get(raw);
+            if (expected == null || expected != stack.getAmount()) {
+                return "loose apples differ from the pre-borrow baseline at raw " + raw;
+            }
+            baselineUnits += expected;
+        }
+        if (baselineUnits == 0 || baseline.size() != 5
+                || baseline.values().stream().mapToInt(Integer::intValue).sum() != baselineUnits
+                || baselineUnits != 128) {
+            return "pre-borrow loose apple witness is incomplete";
+        }
+        var borrowed = new KitFulfillmentJournalStore.BorrowedBox(
+                origin, expectedSourceId,
+                Map.of(snapshot.currentItem(), sourceUnits), origin);
+        var scheduled = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null, null,
+                Map.of(), "resume_unopened_source_to_origin", System.currentTimeMillis(),
+                "RETURNING_SOURCE", System.currentTimeMillis()
+                        + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                List.of(borrowed), -1, snapshot.writtenOffSources(), Map.of(),
+                snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                snapshot.currentBoxMissing())
+                .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                .withRetainedShell(snapshot.retainedShell());
+        if (KitFulfillmentCoordinator.uniqueSourceReturnSlot(scheduled) != sourceRaw
+                || KitResumePolicy.blocker(scheduled) != null) {
+            return "borrowed box identity is ambiguous or scheduled checkpoint is invalid";
+        }
+        kitJournal.save(scheduled);
+        kitResumeCadence.reset();
+        debugRecorder.record("kit_unopened_source_return_scheduled",
+                "raw=" + sourceRaw + ", source=" + expectedSourceId + " " + sourceUnits
+                        + ", origin=" + java.util.Arrays.toString(origin)
+                        + ", baseline_apples=" + baseline);
+        return null;
+    }
+
+    /** Reconcile one fully delivered box only after inspecting the exact live output GUI. */
+    public @Nullable String auditKitExportDelivery(List<int[]> targetedChest, int expectedFullBoxes) {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || (organizer != null && organizer.isActive())) {
+            return "another inventory or recovery job is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || snapshot.exportPosition() == null
+                    || targetedChest == null || targetedChest.stream().noneMatch(
+                            pos -> java.util.Arrays.equals(pos, snapshot.exportPosition()))) {
+                return "the targeted chest is not this kit's saved output chest";
+            }
+            if (!Proxy.getInstance().isConnected()) return "bot is disconnected";
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            Container open = cache.getOpenContainer();
+            int openId = cache.getOpenContainerId();
+            if (openId <= 0 || open == null || open.getContainerId() != openId) {
+                return "open the saved output chest and leave its GUI open while auditing";
+            }
+            int chestSlots = open.getSize() - 36;
+            if (chestSlots != 27 && chestSlots != 54) {
+                return "the open GUI is not a chest";
+            }
+            int fullBoxes = 0;
+            for (int slot = 0; slot < chestSlots; slot++) {
+                ItemStack stack = open.getItemStack(slot);
+                if (stack != null && stack.getAmount() == 1
+                        && ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack))
+                                .contains("shulker_box")
+                        && ItemIdentifier.readShulkerContents(stack).equals(snapshot.recipe())) {
+                    fullBoxes++;
+                }
+            }
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "player inventory is unavailable";
+            int matchingPlayerBoxes = 0;
+            int currentItemLooseCount = 0;
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack != null && snapshot.currentItem() != null
+                        && snapshot.currentItem().equals(ItemIdentifier.getItemId(stack))) {
+                    currentItemLooseCount += stack.getAmount();
+                }
+                if (stack != null && stack.getAmount() == 1
+                        && ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack))
+                                .contains("shulker_box")
+                        && ItemIdentifier.readShulkerContents(stack).equals(snapshot.recipe())) {
+                    matchingPlayerBoxes++;
+                }
+            }
+            ItemStack cursor = cache.getMouseStack();
+            String blocker = KitExportAudit.blocker(snapshot, expectedFullBoxes, fullBoxes,
+                    matchingPlayerBoxes, currentItemLooseCount,
+                    cursor == null ? 0 : cursor.getAmount());
+            if (blocker != null) return blocker + " (observed " + fullBoxes + " exact boxes)";
+            kitJournal.save(KitExportAudit.reconciledSnapshot(snapshot, System.currentTimeMillis()));
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_export_delivery_audited", "kit=" + snapshot.kitName()
+                    + ", completed_boxes=" + (snapshot.completedBoxes() + 1)
+                    + ", exact_boxes_in_chest=" + fullBoxes
+                    + ", chest=" + java.util.Arrays.toString(snapshot.exportPosition()));
+            return null;
+        } catch (Exception e) {
+            return "export audit failed: " + e.getMessage();
+        }
+    }
+
+    /** Human-attested old stock remains pinned while only the observed partial batch is packed. */
+    public @Nullable String scheduleKitPartialBorrowedCargoAudit(
+            int keptRaw, int keptCount, String slots) {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || organizer != null && organizer.isActive() || state != ScanState.IDLE
+                || INVENTORY.hasActiveRequest()) return "another stash operation is active";
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (!KitResumePolicy.canAuditUnverifiedBorrowedCargo(snapshot)
+                    || KitPartialBorrowedCargoGuard.observedUnits(
+                            snapshot.blocker(), snapshot.currentQuantity()) < 1)
+                return "checkpoint is not at a partial borrowed-cargo boundary";
+            if (database == null || !database.isInitialized()) return "database is unavailable";
+            refreshLatestScanTrust();
+            if (!latestScanTrusted) return "latest scan is not trusted";
+            if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive())
+                return "bot must be alive and online with no controller attached";
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            var cursor = cache.getMouseStack();
+            if (cache.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+                return "close the GUI and clear the cursor";
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "player inventory is unavailable";
+            int ownedRaw = KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            Set<Integer> sources = KitFulfillmentCoordinator.verifiedPendingSourceSlots(snapshot);
+            if (ownedRaw < 9 || sources.size() != 1)
+                return "owned shell or complete borrowed-box ledger is ambiguous";
+            Map<Integer, Integer> pinned = new java.util.LinkedHashMap<>();
+            if (slots == null || slots.isBlank()) return "supply cargo slot:count pairs";
+            for (String token : slots.trim().split("\\s+")) {
+                String[] pair = token.split(":", -1);
+                if (pair.length != 2) return "use cargo slot:count pairs";
+                int raw = Integer.parseInt(pair[0]);
+                int count = Integer.parseInt(pair[1]);
+                if (pinned.putIfAbsent(raw, count) != null) return "duplicate cargo slot";
+            }
+            Map<Integer, ItemStack> live = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+            var result = KitPartialBorrowedCargoGuard.inspect(snapshot, live, ownedRaw,
+                    sources.iterator().next(), keptRaw, keptCount, pinned);
+            if (!result.accepted()) return result.blocker();
+            int partial = KitPartialBorrowedCargoGuard.observedUnits(
+                    snapshot.blocker(), snapshot.currentQuantity());
+            var audited = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), partial, ownedRaw,
+                    snapshot.exportPosition(), null, null, snapshot.borrowedSourceItemId(),
+                    snapshot.borrowedSourceContents(), "resume_audited_inventory_cargo",
+                    System.currentTimeMillis(), "WAIT_CARGO",
+                    System.currentTimeMillis()
+                            + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                    snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(), pinned,
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell())
+                    .withProtectedLoose(result.witness());
+            if (!KitFulfillmentCoordinator.verifiedAuditedCargo(audited)
+                    || !KitFulfillmentCoordinator.verifiedPendingSourceInventory(audited))
+                return "live partial cargo or source changed before checkpoint save";
+            kitJournal.save(audited);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_partial_borrowed_cargo_audited",
+                    "kit=" + snapshot.kitName() + ", cargo=" + pinned
+                            + ", kept=" + keptRaw + ":" + keptCount);
+            return null;
+        } catch (NumberFormatException e) {
+            return "use numeric kept and cargo slot:count values";
+        } catch (Exception e) {
+            return "could not audit partial borrowed cargo: " + e.getMessage();
+        }
+    }
+
+    /** Human-pinned multi-stack recovery; no inventory action occurs before live verification. */
+    public @Nullable String scheduleKitCargoBatchAudit(String slots) {
+        if ("auto".equalsIgnoreCase(slots == null ? "" : slots.trim())) {
+            return scheduleInterruptedBorrowedAppleBatch();
+        }
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()) {
+            return "kit movement or worksite recovery is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (KitShiftedShellCargoAudit.eligible(snapshot)) {
+                return scheduleShiftedShellCargoAudit(snapshot, slots);
+            }
+            if (snapshot != null && "BLOCKED".equals(snapshot.state())
+                    && "kit_packer_start_failed".equals(snapshot.blocker())
+                    && "enchanted_golden_apple".equals(snapshot.currentItem())
+                    && snapshot.currentQuantity() == 128
+                    && snapshot.auditedCargoSlots().isEmpty()
+                    && snapshot.packedContents().getOrDefault("end_crystal", 0) == 256
+                    && snapshot.sourceBoxesToReturn().size() == 1)
+                return auditKitPhysicalBudgetAppleBatch(snapshot, slots);
+            if (KitEmptyShellOwnershipAudit.canAudit(snapshot)) {
+                return scheduleKitEmptyShellOwnershipAudit(snapshot, slots);
+            }
+            boolean unverifiedBorrowed =
+                    KitResumePolicy.canAuditUnverifiedBorrowedCargo(snapshot);
+            boolean recoveredBorrowed =
+                    KitResumePolicy.canAuditRecoveredBorrowedCargo(snapshot);
+            boolean changedBaselineAudit =
+                    KitResumePolicy.canAuditChangedBaselineCargo(snapshot);
+            boolean keptAppleAudit = KitResumePolicy.canAuditKeptAppleCargo(snapshot);
+            boolean partialBorrowedAppleAudit =
+                    KitResumePolicy.canAuditPartialBorrowedAppleCargo(snapshot);
+            boolean packerPreflightRetry = KitResumePolicy.canRetryPackerPreflight(snapshot);
+            keptAppleAudit |= partialBorrowedAppleAudit || packerPreflightRetry;
+            partialBorrowedAppleAudit |= packerPreflightRetry;
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || (!"recovered_box_requires_cargo_audit".equals(snapshot.blocker())
+                        && !unverifiedBorrowed && !keptAppleAudit && !changedBaselineAudit)
+                    || snapshot.currentItem() == null || snapshot.currentQuantity() < 2
+                    || snapshot.kitWorksite() != null
+                    || snapshot.borrowedSourceWorksite() != null
+                    || (!unverifiedBorrowed && !recoveredBorrowed
+                        && !partialBorrowedAppleAudit
+                        && !changedBaselineAudit
+                        && !snapshot.sourceBoxesToReturn().isEmpty())) {
+                return "checkpoint is not at a recovered-box cargo audit boundary";
+            }
+            if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+                return "bot must be online with no client controller attached";
+            }
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            var cursor = cache.getMouseStack();
+            if (cache.getOpenContainerId() > 0 || (cursor != null && cursor.getAmount() > 0)) {
+                return "close the container and clear the cursor before auditing cargo";
+            }
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "player inventory is unavailable";
+            int ownedShellSlot = KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                    ? snapshot.ownedShellSlot()
+                    : KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot);
+            if (ownedShellSlot < 9 || ownedShellSlot > 44) {
+                return "packed kit shulker no longer matches the checkpoint";
+            }
+            if (changedBaselineAudit
+                    && (!KitFulfillmentCoordinator.verifiedPendingSourceInventory(snapshot)
+                        || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                                snapshot.displacedAppleSlots()))) {
+                return "pending borrowed boxes or displaced apples are missing or ambiguous";
+            }
+            if ((unverifiedBorrowed || recoveredBorrowed || partialBorrowedAppleAudit)
+                    && KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot) < 0) {
+                return "borrowed source shulker is missing or ambiguous";
+            }
+            if (recoveredBorrowed
+                    && !KitFulfillmentCoordinator.verifiedPendingSourceInventory(snapshot)) {
+                return "pending borrowed source identity or shulker inventory is ambiguous";
+            }
+            Map<Integer, Integer> pinned = new java.util.LinkedHashMap<>();
+            for (String token : slots.trim().split("\\s+")) {
+                String[] parts = token.split(":", -1);
+                if (parts.length != 2) return "use slot:count pairs, for example 26:64 33:64";
+                int raw = Integer.parseInt(parts[0]);
+                int count = Integer.parseInt(parts[1]);
+                if (pinned.putIfAbsent(raw, count) != null) return "duplicate inventory slot: " + raw;
+            }
+            if (packerPreflightRetry && !pinned.equals(snapshot.auditedCargoSlots())) {
+                return "preflight retry must pin the same audited cargo slots and counts";
+            }
+            if (changedBaselineAudit) {
+                if (database == null || !database.isInitialized()) {
+                    return "inventory keep policy is unavailable";
+                }
+                Set<Integer> admitted = new HashSet<>(pinned.keySet());
+                admitted.add(ownedShellSlot);
+                admitted.addAll(snapshot.displacedAppleSlots().keySet());
+                for (int raw = 9; raw <= 44; raw++) {
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack != null && stack.getAmount() > 0
+                            && ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack))
+                                    .contains("shulker_box")) admitted.add(raw);
+                }
+                var admission = KitInventoryAdmissionPolicy.inspectLive(
+                        database.loadKeepItems(), admitted);
+                if (admission == null || !admission.accepted()) {
+                    return "unassigned inventory remains outside the audited cargo and keep policy"
+                            + (admission == null ? "" : ": " + admission.unexpectedSlots());
+                }
+            }
+            int auditedQuantity = snapshot.currentQuantity();
+            if (partialBorrowedAppleAudit) {
+                auditedQuantity = pinned.values().stream().mapToInt(Integer::intValue).sum();
+                if (auditedQuantity < 2 || auditedQuantity > snapshot.currentQuantity()) {
+                    return "partial apple cargo exceeds the saved batch";
+                }
+                ItemStack exemplar = null;
+                for (int raw : pinned.keySet()) {
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack == null || !"enchanted_golden_apple".equals(
+                            ItemIdentifier.getItemId(stack))) {
+                        return "pinned slot is not a live enchanted golden apple stack";
+                    }
+                    if (exemplar != null
+                            && !KitAppleExchangePlan.samePhysicalStack(exemplar, stack)) {
+                        return "partial apple cargo spans different named or regular variants";
+                    }
+                    exemplar = stack;
+                }
+                for (int raw = 9; raw <= 44; raw++) {
+                    if (pinned.containsKey(raw)) continue;
+                    ItemStack stack = player.getItemStack(raw);
+                    if (stack != null && exemplar != null
+                            && KitAppleExchangePlan.samePhysicalStack(exemplar, stack)) {
+                        return "same-variant apples remain outside the pinned cargo slots";
+                    }
+                }
+            }
+            var audited = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), auditedQuantity,
+                    ownedShellSlot, snapshot.exportPosition(), null, null,
+                    snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                    keptAppleAudit ? "resume_audited_kept_apple_cargo"
+                            : "resume_audited_inventory_cargo",
+                    System.currentTimeMillis(), "WAIT_CARGO",
+                    System.currentTimeMillis()
+                            + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                    snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(), pinned,
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell())
+                    .withVariantRepair(snapshot.variantRepair());
+            if (!KitFulfillmentCoordinator.verifiedAuditedCargo(audited)) {
+                return "pinned slots do not contain the exact item and counts; use /stash kit cargo";
+            }
+            if (changedBaselineAudit
+                    && !KitFulfillmentCoordinator.verifiedPendingSourceInventory(audited)) {
+                return "borrowed source identities changed before the audit was saved";
+            }
+            if (changedBaselineAudit
+                    && "kit_packer_start_failed".equals(snapshot.blocker())) {
+                ItemStack shell = player.getItemStack(ownedShellSlot);
+                if (shell == null) return "packed kit shell is missing";
+                List<ItemStack> exact = new ArrayList<>(
+                        ItemIdentifier.readShulkerPhysicalSlotStacks(shell).values());
+                for (int raw : pinned.keySet()) exact.add(player.getItemStack(raw));
+                int slotsNeeded = KitPhysicalSlotBudget.requiredExactSlots(exact);
+                if (slotsNeeded > KitCapacity.MAX_SLOTS)
+                    return "pinned cargo variants need " + slotsNeeded
+                            + " physical slots; the kit shell has 27";
+            }
+            if (keptAppleAudit && !KitFulfillmentCoordinator.auditedAppleFitsSlots(audited)) {
+                return "selected apples do not fit the recipe's physical apple slots";
+            }
+            kitJournal.save(audited);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_batch_cargo_audited", "kit=" + snapshot.kitName()
+                    + ", item=" + snapshot.currentItem() + ", slots=" + pinned);
+            return null;
+        } catch (NumberFormatException e) {
+            return "use numeric slot:count pairs, for example 26:64 33:64";
+        } catch (Exception e) {
+            return "could not audit batch cargo: " + e.getMessage();
+        }
+    }
+
+    /** Audit a completed retrieval whose shell, source, and reserved empty shell swapped slots. */
+    private @Nullable String scheduleShiftedShellCargoAudit(
+            KitFulfillmentJournalStore.Snapshot snapshot, String slots)
+            throws IOException, SQLException {
+        if (organizer != null && organizer.isActive() || state != ScanState.IDLE
+                || INVENTORY.hasActiveRequest()) return "another stash operation is active";
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            return "bot must be alive and online with no controller attached";
+        }
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = cache.getMouseStack();
+        if (cache.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0) {
+            return "close the container and clear the cursor before auditing cargo";
+        }
+        Container player = cache.getPlayerInventory();
+        if (player == null || database == null || !database.isInitialized()) {
+            return "player inventory or keep policy is unavailable";
+        }
+        Map<Integer, Integer> pinned = new java.util.LinkedHashMap<>();
+        for (String token : slots.trim().split("\\s+")) {
+            String[] parts = token.split(":", -1);
+            if (parts.length != 2) return "use slot:count pairs, for example 9:64 16:64";
+            int raw = Integer.parseInt(parts[0]);
+            int count = Integer.parseInt(parts[1]);
+            if (pinned.putIfAbsent(raw, count) != null) return "duplicate inventory slot: " + raw;
+        }
+        Map<Integer, ItemStack> live = new HashMap<>();
+        for (int raw = 9; raw <= 44; raw++) live.put(raw, player.getItemStack(raw));
+        var plan = KitShiftedShellCargoAudit.inspect(snapshot, live, pinned);
+        if (plan == null) {
+            return "kit shell, returned source, reserved shell, or loose cargo differs from the journal";
+        }
+        Set<Integer> admitted = new HashSet<>(pinned.keySet());
+        admitted.add(plan.ownedSlot());
+        admitted.add(plan.sourceSlot());
+        admitted.add(plan.retainedShell().rawSlot());
+        admitted.addAll(snapshot.displacedAppleSlots().keySet());
+        var admission = KitInventoryAdmissionPolicy.inspectLive(
+                database.loadKeepItems(), admitted);
+        if (admission == null || !admission.accepted()) {
+            return "unassigned inventory remains outside audited cargo and keep policy"
+                    + (admission == null ? "" : ": " + admission.unexpectedSlots());
+        }
+        long now = System.currentTimeMillis();
+        var audited = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                plan.ownedSlot(), snapshot.exportPosition(), null, null,
+                snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                "resume_audited_inventory_cargo", now, "WAIT_CARGO",
+                now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(),
+                Map.copyOf(pinned), snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                snapshot.currentBoxMissing())
+                .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                .withRetainedShell(plan.retainedShell());
+        if (!KitFulfillmentCoordinator.verifiedAuditedCargo(audited)
+                || !KitFulfillmentCoordinator.hasVerifiedOwnedShell(audited)
+                || KitFulfillmentCoordinator.uniqueSourceReturnSlot(audited)
+                    != plan.sourceSlot()
+                || KitFulfillmentCoordinator.uniqueRetainedShellSlot(audited)
+                    != plan.retainedShell().rawSlot()
+                || KitResumePolicy.blocker(audited) != null) {
+            return "rebased checkpoint failed a second live cargo or ownership check";
+        }
+        kitJournal.save(audited);
+        kitResumeCadence.reset();
+        debugRecorder.record("kit_shifted_shell_cargo_audited",
+                "kit=" + snapshot.kitName() + ", box=" + (snapshot.completedBoxes() + 1)
+                        + ", shell=" + plan.ownedSlot() + ", source=" + plan.sourceSlot()
+                        + ", retained=" + plan.retainedShell().rawSlot()
+                        + ", cargo=" + pinned);
+        return null;
+    }
+
+    /** Derive task cargo from the durable retrieval baseline and reconcile every carried source. */
+    private @Nullable String scheduleInterruptedBorrowedAppleBatch() {
+        if (kitFulfillment.isActive() || retriever.isActive() || kitRecovery.isActive()
+                || organizer != null && organizer.isActive()
+                || state != ScanState.IDLE || INVENTORY.hasActiveRequest())
+            return "another stash operation is active";
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || !"BLOCKED".equals(snapshot.state())
+                    || !"kit_cargo_retrieval_incomplete".equals(snapshot.blocker()))
+                return "checkpoint is not at an interrupted borrowed-cargo boundary";
+            if (database == null || !database.isInitialized()
+                    || config.pos1 == null || config.pos2 == null)
+                return "stash region or database is unavailable";
+            refreshLatestScanTrust();
+            if (!latestScanTrusted) return "latest scan is not trusted";
+            if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                    || !CACHE.getPlayerCache().getThePlayer().isAlive())
+                return "bot must be alive and online with no controller attached";
+            var cache = CACHE.getPlayerCache().getInventoryCache();
+            ItemStack cursor = cache.getMouseStack();
+            if (cache.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+                return "close the GUI and clear the cursor";
+            Container player = cache.getPlayerInventory();
+            if (player == null) return "player inventory is unavailable";
+            var evidence = com.zenith.plugin.stashmanager.kit.KitProvenanceJournal
+                    .defaultStore().blockedRetrieval(snapshot.kitName(),
+                            snapshot.completedBoxes() + 1, snapshot.currentItem(),
+                            snapshot.currentQuantity(), snapshot.blocker()).orElse(null);
+            Map<Integer, com.zenith.plugin.stashmanager.kit.KitBorrowedBatchRecovery.Slot>
+                    observed = new HashMap<>();
+            for (int raw = 9; raw <= 44; raw++) {
+                ItemStack stack = player.getItemStack(raw);
+                if (stack == null || stack.getAmount() <= 0) continue;
+                String id = ItemIdentifier.getItemId(stack);
+                observed.put(raw, new com.zenith.plugin.stashmanager.kit
+                        .KitBorrowedBatchRecovery.Slot(id, stack.getAmount(),
+                                ItemIdentifier.baseItemId(id).contains("shulker_box")
+                                        ? ItemIdentifier.readShulkerContents(stack) : Map.of()));
+            }
+            var plan = com.zenith.plugin.stashmanager.kit.KitBorrowedBatchRecovery
+                    .inspect(snapshot, evidence, observed);
+            if (!plan.accepted()) return plan.blocker();
+            ItemStack exemplar = null;
+            for (int raw : plan.cargoSlots().keySet()) {
+                ItemStack apple = player.getItemStack(raw);
+                if (exemplar != null
+                        && !KitAppleExchangePlan.samePhysicalStack(exemplar, apple))
+                    return "new task apples have different physical variants";
+                exemplar = apple;
+            }
+            if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                    snapshot.displacedAppleSlots()))
+                return "journaled displaced apples changed";
+            int[] origin = plan.sources().getFirst().sourcePosition();
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            ContainerEntry originEntry = index.get(origin[0], origin[1], origin[2]);
+            if (scan == null || !KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())
+                    || originEntry == null
+                    || originEntry.timestamp() < scan.startedAtEpochMilli()
+                    || index.isExportChest(originEntry)
+                    || index.isBlacklistedChest(originEntry)
+                    || !inConfiguredRegion(originEntry)
+                    || !originEntry.inventoryFootprintKnown()
+                    || !World.isChunkLoadedBlockPos(origin[0], origin[2])
+                    || !World.getBlock(origin[0], origin[1], origin[2])
+                            .name().contains("chest"))
+                return "source origin is not a live, trusted indexed stock chest";
+            int cargoCount = plan.cargoSlots().values().stream()
+                    .mapToInt(Integer::intValue).sum();
+            long now = System.currentTimeMillis();
+            var audited = new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), cargoCount,
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null,
+                    snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                    "resume_audited_kept_apple_cargo", now, "WAIT_CARGO",
+                    now + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                    plan.sources(), -1, snapshot.writtenOffSources(), plan.cargoSlots(),
+                    snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                    snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(),
+                    snapshot.retainedShell(), snapshot.variantRepair(),
+                    snapshot.protectedLoose(), snapshot.heldBoxRebase());
+            if (KitResumePolicy.blocker(audited, "WAIT_CARGO") != null
+                    || !KitFulfillmentCoordinator.hasVerifiedOwnedShell(audited)
+                    || !KitFulfillmentCoordinator.verifiedPendingSourceInventory(audited)
+                    || !KitFulfillmentCoordinator.verifiedAuditedCargo(audited)
+                    || !KitFulfillmentCoordinator.auditedAppleFitsSlots(audited))
+                return "live source, cargo, shell, or apple slot budget changed";
+            kitJournal.save(audited);
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_interrupted_borrowed_batch_audited",
+                    "kit=" + snapshot.kitName() + ", box="
+                            + (snapshot.completedBoxes() + 1) + ", cargo="
+                            + plan.cargoSlots() + ", sources=" + plan.sources().size());
+            return null;
+        } catch (Exception e) {
+            return "could not reconcile interrupted borrowed cargo: " + e.getMessage();
+        }
+    }
+
+    private @Nullable String auditKitPhysicalBudgetAppleBatch(
+            KitFulfillmentJournalStore.Snapshot snapshot, String slots) throws IOException {
+        if (snapshot.resumeState() != null || snapshot.variantRepair() != null
+                || snapshot.kitWorksite() != null || snapshot.borrowedSourceWorksite() != null
+                || !Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer())
+            return "physical budget audit boundary changed";
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = cache.getMouseStack();
+        if (cache.getOpenContainerId() > 0 || (cursor != null && cursor.getAmount() > 0)
+                || INVENTORY.hasActiveRequest()) return "inventory window or cursor is active";
+        if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot)
+                || !KitFulfillmentCoordinator.verifiedPendingSourceInventory(snapshot)
+                || !KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                        snapshot.displacedAppleSlots()))
+            return "owned shell, borrowed source, or displaced apples changed";
+        Container player = cache.getPlayerInventory();
+        if (player == null) return "player inventory unavailable";
+        ItemStack shell = player.getItemStack(snapshot.ownedShellSlot());
+        if (ItemIdentifier.readShulkerPhysicalSlotStacks(shell).size() != 26)
+            return "owned shell is not at 26 physical slots";
+        Map<Integer, Integer> pinned = new LinkedHashMap<>();
+        for (String token : slots.trim().split("\\s+")) {
+            String[] parts = token.split(":", -1);
+            if (parts.length != 2) return "use two slot:64 pairs";
+            int raw = Integer.parseInt(parts[0]);
+            int count = Integer.parseInt(parts[1]);
+            if (pinned.putIfAbsent(raw, count) != null) return "duplicate apple slot";
+        }
+        if (pinned.size() != 2 || pinned.values().stream().anyMatch(n -> n != 64))
+            return "exactly two 64-apple slots are required";
+        Map<Integer, KitCargoAudit.Stack> observed = new HashMap<>();
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack != null && stack.getAmount() > 0)
+                observed.put(raw, new KitCargoAudit.Stack(
+                        ItemIdentifier.getItemId(stack), stack.getAmount()));
+        }
+        if (!KitCargoAudit.verifiedBatch(observed, snapshot.currentItem(), 128,
+                snapshot.ownedShellSlot(), pinned, true)) return "pinned apple batch changed";
+        String firstHash = null;
+        for (int raw : pinned.keySet()) {
+            String hash = KitVariantFingerprint.canonicalVariant(player.getItemStack(raw));
+            if (hash == null || (firstHash != null && !firstHash.equals(hash)))
+                return "pinned apple components differ";
+            firstHash = hash;
+        }
+        var audited = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                snapshot.ownedShellSlot(), snapshot.exportPosition(), null, null,
+                snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                snapshot.blocker(), System.currentTimeMillis(), null, 0,
+                snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(), pinned,
+                snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                snapshot.currentBoxMissing(), snapshot.displacedAppleSlots(),
+                snapshot.retainedShell(), null)
+                .withProtectedLoose(snapshot.protectedLoose())
+                .withHeldBoxRebase(snapshot.heldBoxRebase());
+        kitJournal.save(audited);
+        debugRecorder.record("kit_physical_budget_apple_batch_audited",
+                "kit=" + snapshot.kitName() + ", slots=" + pinned
+                        + ", no_resume=true");
+        return null;
+    }
+
+    /** An operator-selected empty shell is pinned only after a complete live inventory audit. */
+    private @Nullable String scheduleKitEmptyShellOwnershipAudit(
+            KitFulfillmentJournalStore.Snapshot snapshot, String evidence) throws IOException {
+        if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()
+                || state != ScanState.IDLE || organizer != null && organizer.isActive()
+                || INVENTORY.hasActiveRequest()) {
+            return "bot must be online, idle, and free of client control";
+        }
+        var cache = CACHE.getPlayerCache().getInventoryCache();
+        var cursor = cache.getMouseStack();
+        Container player = cache.getPlayerInventory();
+        if (player == null || cache.getOpenContainerId() > 0
+                || cursor != null && cursor.getAmount() > 0) {
+            return "close the GUI and clear the cursor before auditing empty shell ownership";
+        }
+        String[] tokens = evidence == null ? new String[0] : evidence.trim().split("\\s+");
+        if (tokens.length < 3 || !tokens[0].startsWith("owned=")
+                || !tokens[1].startsWith("borrowed=")) {
+            return "use owned=<raw> borrowed=<raw> followed by task slot:count pairs";
+        }
+        int ownedRaw = Integer.parseInt(tokens[0].substring(6));
+        int borrowedRaw = Integer.parseInt(tokens[1].substring(9));
+        if (ownedRaw < 9 || ownedRaw > 44 || borrowedRaw < 9 || borrowedRaw > 44
+                || ownedRaw == borrowedRaw) return "invalid distinct empty-shell slots";
+        ItemStack owned = player.getItemStack(ownedRaw);
+        ItemStack borrowed = player.getItemStack(borrowedRaw);
+        String marker = KitEmptyShellOwnershipAudit.marker(
+                ownedRaw, borrowedRaw, owned, borrowed);
+        if (marker == null) return "empty-shell fingerprints are missing or indistinguishable";
+        Map<Integer, Integer> pinned = new LinkedHashMap<>();
+        for (int i = 2; i < tokens.length; i++) {
+            String[] pair = tokens[i].split(":", -1);
+            if (pair.length != 2) return "invalid task slot:count pair";
+            int raw = Integer.parseInt(pair[0]);
+            int count = Integer.parseInt(pair[1]);
+            if (raw < 9 || raw > 44 || raw == ownedRaw || raw == borrowedRaw
+                    || count <= 0 || pinned.putIfAbsent(raw, count) != null) {
+                return "invalid or duplicate task cargo slot";
+            }
+        }
+        if (pinned.values().stream().mapToInt(Integer::intValue).sum()
+                != snapshot.currentQuantity()) return "pinned task cargo total differs from checkpoint";
+        String physicalItem = null;
+        for (int raw = 9; raw <= 44; raw++) {
+            ItemStack stack = player.getItemStack(raw);
+            if (stack == null || stack.getAmount() <= 0
+                    || !snapshot.currentItem().equals(ItemIdentifier.getItemId(stack))) continue;
+            String variant = KitVariantFingerprint.canonicalVariant(stack);
+            if (physicalItem == null) physicalItem = variant;
+            else if (!physicalItem.equals(variant)
+                    && !KitEmptyShellOwnershipAudit.acceptsMixedCargoVariants(snapshot))
+                return "current item has mixed physical variants in bot inventory";
+        }
+        var audited = new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                ownedRaw, snapshot.exportPosition(), null, null,
+                snapshot.borrowedSourceItemId(), snapshot.borrowedSourceContents(),
+                marker, System.currentTimeMillis(), "WAIT_CARGO",
+                System.currentTimeMillis()
+                        + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L,
+                snapshot.sourceBoxesToReturn(), -1, snapshot.writtenOffSources(), pinned,
+                snapshot.incompleteBoxes(), snapshot.missingTotals(),
+                snapshot.currentBoxMissing())
+                .withDisplacedAppleSlots(snapshot.displacedAppleSlots());
+        if (!KitEmptyShellOwnershipAudit.verify(audited, player)) {
+            return "live named and unnamed empty boxes do not match the complete checkpoint ledger";
+        }
+        if (!KitFulfillmentCoordinator.verifiedAuditedCargo(audited)) {
+            return "pinned task slots do not contain the exact item and counts";
+        }
+        kitJournal.save(audited);
+        kitResumeCadence.reset();
+        debugRecorder.record("kit_empty_shell_ownership_audited",
+                "owned_raw=" + ownedRaw + ", borrowed_raw=" + borrowedRaw
+                        + ", cargo_slots=" + pinned.keySet());
+        return null;
+    }
+
+    public @Nullable String discardKitFulfillmentCheckpoint() {
+        if (kitFulfillment.isActive() || kitRecovery.isActive() || retriever.isActive()
+                || organizer == null || organizer.isActive() || organizer.hasDurableCheckpoint()
+                || INVENTORY.hasActiveRequest()) {
+            return "kit movement or recovery is active";
+        }
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null) return "no kit checkpoint exists";
+            if (snapshot.borrowedSourceWorksite() != null || snapshot.kitWorksite() != null) {
+                return "a journaled shulker worksite is unresolved; recover or inspect it first";
+            }
+            if (snapshot.ownedShellSlot() >= 9 && snapshot.ownedShellSlot() <= 44) {
+                if (!"kit_retirement_inventory_staging".equals(snapshot.blocker())) {
+                    return "stage the owned shell through /stash kit retire stage first";
+                }
+                if (!Proxy.getInstance().isConnected() || Proxy.getInstance().hasActivePlayer()) {
+                    return "bot must be online and free of client control for retirement audit";
+                }
+                var inventoryCache = CACHE.getPlayerCache().getInventoryCache();
+                ItemStack cursor = inventoryCache.getMouseStack();
+                if (inventoryCache.getOpenContainerId() > 0
+                        || (cursor != null && cursor.getAmount() > 0)) {
+                    return "close the container and clear the cursor before retirement";
+                }
+                if (KitFulfillmentCoordinator.uniqueOwnedShellSlot(snapshot) >= 0) {
+                    return "the owned kit shell remains in inventory";
+                }
+                var admission = KitInventoryAdmissionPolicy.inspectLive(database.loadKeepItems(),
+                        Set.of());
+                if (admission == null || !admission.accepted()) {
+                    return "inventory still contains non-kept cargo; finish staging before retirement";
+                }
+            }
+            kitJournal.clear();
+            debugRecorder.record("kit_checkpoint_retired", "kit=" + snapshot.kitName()
+                    + ", completed=" + snapshot.completedBoxes()
+                    + ", requested=" + snapshot.requestedBoxes());
+            return null;
+        } catch (Exception e) {
+            return "cannot clear kit checkpoint: " + e.getMessage();
+        }
+    }
+
+    private void armRestoredKitCheckpoint() {
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || "BLOCKED".equals(snapshot.state())) return;
+            if ("COMPLETE".equals(snapshot.state())) return;
+            long due = System.currentTimeMillis()
+                    + Math.max(1L, config.scanPreemptionCooldownSeconds) * 1000L;
+            kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                    KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                    snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                    snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                    snapshot.ownedShellSlot(), snapshot.exportPosition(), snapshot.kitWorksite(),
+                    snapshot.borrowedSourceWorksite(), snapshot.borrowedSourceItemId(),
+                    snapshot.borrowedSourceContents(), "process_restarted", System.currentTimeMillis(),
+                    snapshot.state(), due, snapshot.sourceBoxesToReturn(),
+                    snapshot.auditedCargoSlot(), snapshot.writtenOffSources(),
+                    snapshot.auditedCargoSlots(), snapshot.incompleteBoxes(),
+                    snapshot.missingTotals(), snapshot.currentBoxMissing())
+                    .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                    .withRetainedShell(snapshot.retainedShell()));
+            debugRecorder.record("kit_resume_scheduled",
+                    "reason=process_restarted, phase=" + snapshot.state()
+                            + ", cooldown_seconds=" + Math.max(1, config.scanPreemptionCooldownSeconds));
+        } catch (Exception e) {
+            warn("Kit checkpoint cannot be scheduled after restart: {}", e.getMessage());
+        }
+    }
+
+    private boolean cancelKitScheduledResume() {
+        try {
+            var snapshot = kitJournal.load().orElse(null);
+            if (snapshot == null || snapshot.resumeState() == null
+                    || snapshot.resumeNotBeforeEpochMilli() == 0) return false;
+            saveKitResumeReview(snapshot, "manual_stop", false);
+            return true;
+        } catch (Exception e) {
+            warn("Could not cancel kit resume schedule: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private void saveKitResumeReview(KitFulfillmentJournalStore.Snapshot snapshot,
+                                     String reason, boolean notify) throws IOException {
+        kitJournal.save(new KitFulfillmentJournalStore.Snapshot(
+                KitFulfillmentJournalStore.SCHEMA_VERSION, snapshot.kitName(), "BLOCKED",
+                snapshot.recipe(), snapshot.packedContents(), snapshot.requestedBoxes(),
+                snapshot.completedBoxes(), snapshot.currentItem(), snapshot.currentQuantity(),
+                snapshot.ownedShellSlot(), snapshot.exportPosition(), snapshot.kitWorksite(),
+                snapshot.borrowedSourceWorksite(), snapshot.borrowedSourceItemId(),
+                snapshot.borrowedSourceContents(), reason, System.currentTimeMillis(),
+                snapshot.resumeState(), 0, snapshot.sourceBoxesToReturn(),
+                snapshot.auditedCargoSlot(), snapshot.writtenOffSources(),
+                snapshot.auditedCargoSlots(), snapshot.incompleteBoxes(),
+                snapshot.missingTotals(), snapshot.currentBoxMissing())
+                .withDisplacedAppleSlots(snapshot.displacedAppleSlots())
+                .withRetainedShell(snapshot.retainedShell())
+                .withHeldBoxRebase(snapshot.heldBoxRebase()));
+        kitResumeCadence.reset();
+        debugRecorder.record("kit_resume_manual_review", "kit=" + snapshot.kitName()
+                + ", reason=" + reason + ", completed_boxes=" + snapshot.completedBoxes());
+        if (notify) handleAutomationEvent("kit_fulfillment_blocked", Map.of(
+                "kit", snapshot.kitName(), "reason", "resume_manual_review:" + reason,
+                "completed_boxes", snapshot.completedBoxes()));
+    }
+
     public DebugRecorder getDebugRecorder() {
         return debugRecorder;
+    }
+
+    public DebugRecorder getGeometryRecorder() {
+        return geometryRecorder;
+    }
+
+    public PoseTraceRecorder getPoseTraceRecorder() {
+        return poseTraceRecorder;
+    }
+
+    private void recordPoseTrace(String stage, String context) {
+        if (!poseTraceRecorder.isEnabled()) return;
+        try {
+            var player = CACHE.getPlayerCache();
+            var feet = PlayerContext.INSTANCE.playerFeet();
+            var velocity = BOT.getVelocity();
+            var inputs = BARITONE.getInputOverrideHandler();
+            String movementDetail = String.format(Locale.ROOT,
+                    "nav_feet=%d,%d,%d, on_ground=%s, velocity=%.3f,%.3f,%.3f, "
+                            + "path_active=%s, forced_inputs=F%s/B%s/L%s/R%s/J%s/Sneak%s/Sprint%s, "
+                            + "feet_block=%s, below=%s, above=%s",
+                    feet.x(), feet.y(), feet.z(), BOT.isOnGround(),
+                    velocity.getX(), velocity.getY(), velocity.getZ(), BARITONE.isActive(),
+                    inputs.isInputForcedDown(PathInput.MOVE_FORWARD),
+                    inputs.isInputForcedDown(PathInput.MOVE_BACK),
+                    inputs.isInputForcedDown(PathInput.MOVE_LEFT),
+                    inputs.isInputForcedDown(PathInput.MOVE_RIGHT),
+                    inputs.isInputForcedDown(PathInput.JUMP),
+                    inputs.isInputForcedDown(PathInput.SNEAK),
+                    inputs.isInputForcedDown(PathInput.SPRINT),
+                    WorldGeometrySnapshot.describeBlock(feet.x(), feet.y(), feet.z()),
+                    WorldGeometrySnapshot.describeBlock(feet.x(), feet.y() - 1, feet.z()),
+                    WorldGeometrySnapshot.describeBlock(feet.x(), feet.y() + 1, feet.z()));
+            poseTraceRecorder.record(stage, context,
+                    player.getX(), player.getY(), player.getZ(),
+                    player.getYaw(), player.getPitch(), BOT.getYaw(), BOT.getPitch(), movementDetail);
+        } catch (RuntimeException e) {
+            // Diagnostics must never change the outcome of a cargo-carrying job.
+            debugRecorder.record("pose_trace_sample_unavailable", e.getClass().getSimpleName());
+        }
+    }
+
+    private void sampleAutomationPose() {
+        if (!poseTraceRecorder.isEnabled()) return;
+        // Keep every pathing tick so a brief ladder exit cannot fall between samples.
+        // Idle/interaction states still use the lower-rate baseline sample.
+        if (++poseTraceTicks % POSE_TRACE_SAMPLE_TICKS != 0 && !BARITONE.isActive()) return;
+        if (organizer != null && organizer.isActive()) {
+            recordPoseTrace("organize_pose", "state=" + organizer.getState());
+        } else if (state != ScanState.IDLE && state != ScanState.DONE) {
+            recordPoseTrace("scan_pose", "state=" + state + ", target=" + currentContainerPos()
+                    + ", click_target=" + scanOpenClickTarget
+                    + ", open_wait_ticks=" + openTimeoutCounter);
+        }
     }
 
     @Override
@@ -311,11 +4278,19 @@ public class StashManagerModule extends Module {
             .setId("stash-manager")
             .setPriority(1)
             .state(ProtocolState.GAME, PacketHandlerStateCodec.clientBuilder()
+                .inbound(ClientboundOpenScreenPacket.class, (packet, session) -> {
+                    if (config.kitInteractionTraceEnabled)
+                        traceKitInteraction(() -> kitInteractionTrace.onOpen(packet.getContainerId()));
+                    return packet;
+                })
                 .inbound(ClientboundContainerSetContentPacket.class, (packet, session) -> {
+                    if (config.kitInteractionTraceEnabled)
+                        traceKitInteraction(() -> kitInteractionTrace.onSetContent(packet.getContainerId(),
+                                packet.getStateId(), packet.getItems(), packet.getCarriedItem()));
                     if (state == ScanState.OPENING || state == ScanState.READING) {
                         containerDataReceived = true;
                         debug("Received container data packet (windowId={})", packet.getContainerId());
-                    } else if ((state == ScanState.CLOSING
+                    } else if ((state == ScanState.CLOSING || state == ScanState.APPROACHING
                             || (state == ScanState.YIELDED && lateOpenQuarantineTicks > 0))
                             && packet.getContainerId() > 0) {
                         // A response can arrive after its open attempt timed out. It no longer
@@ -332,7 +4307,44 @@ public class StashManagerModule extends Module {
                     if (retriever.isActive()) {
                         retriever.onContainerData(session, packet);
                     }
+                    if (kitFulfillment.isActive()) {
+                        kitFulfillment.onContainerData(packet.getContainerId());
+                    }
+                    if (kitRecovery.isActive()) {
+                        kitRecovery.onContainerData(packet.getContainerId());
+                    }
+                    kitExporter.onContainerData(packet.getContainerId());
+                    kitWorkingFill.onContainerData(packet.getContainerId());
+                    if (kitWorkingPreparation != null)
+                        kitWorkingPreparation.onContainerData(packet.getContainerId());
+                    if (kitWorkingReservation != null)
+                        kitWorkingReservation.onContainerData(packet.getContainerId());
+                    if (kitWorkingRecovery != null)
+                        kitWorkingRecovery.onContainerData(packet.getContainerId());
                     return packet;
+                })
+                .inbound(ClientboundContainerSetSlotPacket.class, (packet, session) -> {
+                    if (config.kitInteractionTraceEnabled)
+                        traceKitInteraction(() -> kitInteractionTrace.onSetSlot(packet.getContainerId(),
+                                packet.getStateId(), packet.getSlot(), packet.getItem()));
+                    return packet;
+                })
+                .inbound(ClientboundContainerClosePacket.class, (packet, session) -> {
+                    if (config.kitInteractionTraceEnabled)
+                        traceKitInteraction(() -> kitInteractionTrace.onClose(packet.getContainerId(), true));
+                    return packet;
+                })
+                .postOutbound(ServerboundContainerClickPacket.class,
+                        (PostOutgoingPacketHandler<ServerboundContainerClickPacket, ClientSession>)
+                                (packet, session) -> {
+                    if (config.kitInteractionTraceEnabled)
+                        traceKitInteraction(() -> kitInteractionTrace.onClick(packet));
+                })
+                .postOutbound(ServerboundContainerClosePacket.class,
+                        (PostOutgoingPacketHandler<ServerboundContainerClosePacket, ClientSession>)
+                                (packet, session) -> {
+                    if (config.kitInteractionTraceEnabled)
+                        traceKitInteraction(() -> kitInteractionTrace.onClose(packet.getContainerId(), false));
                 })
                 // Priority 1 runs before Zenith's priority-0 entity-cache handler removes the
                 // collected item. This gives the organizer definitive pickup evidence even if
@@ -345,6 +4357,19 @@ public class StashManagerModule extends Module {
                 })
                 .build())
             .build();
+    }
+
+    private void traceKitInteraction(Runnable observation) {
+        try {
+            observation.run();
+            if (kitInteractionTrace.failed() && !kitInteractionTraceFailureReported) {
+                kitInteractionTraceFailureReported = true;
+                debugRecorder.record("kit_interaction_trace_failed", "private_trace_write_failed");
+            }
+        } catch (RuntimeException error) {
+            // A diagnostic observer must never alter a packet or the kit state machine.
+            debugRecorder.record("kit_interaction_trace_failed", error.getClass().getSimpleName());
+        }
     }
 
     @Override
@@ -360,6 +4385,7 @@ public class StashManagerModule extends Module {
         if (organizer != null) {
             StashOrganizer.DurableRestoreResult restored = organizer.restoreDurableCheckpoint();
             if (restored == StashOrganizer.DurableRestoreResult.RESTORED) {
+                refreshLatestScanTrust();
                 organizerPreemptionGate = newOrganizerPreemptionGate();
                 organizerPreemptionGate.yield();
                 organizerPreemptionCount = 1;
@@ -372,6 +4398,7 @@ public class StashManagerModule extends Module {
                         organizer.getDurableRecoveryError());
             }
         }
+        armRestoredKitCheckpoint();
         if (activeResumableJob() != JobContinuanceManager.Job.NONE
                 && !Proxy.getInstance().isConnected()) {
             beginConnectionOutage("module_enabled_while_disconnected", false, "module_enable");
@@ -381,6 +4408,10 @@ public class StashManagerModule extends Module {
 
     @Override
     public void onDisable() {
+        if (kitFulfillment.isActive()) {
+            kitFulfillment.interruptForRecovery("module_disabled",
+                    Math.max(1, config.scanPreemptionCooldownSeconds));
+        }
         resetKeepReequip();
         jobContinuanceManager.clear();
         connectionRecoveryTracker.reset();
@@ -490,6 +4521,8 @@ public class StashManagerModule extends Module {
     }
 
     public @Nullable String getRetrieveBlocker() {
+        if (hasWorkingFillCheckpoint()) return "kit working-stock fill checkpoint requires review";
+        if (kitJournal.exists()) return "kit fulfillment checkpoint requires recovery or manual review";
         if (state != ScanState.IDLE && state != ScanState.DONE) {
             return "scan is active (state=" + state + ")";
         }
@@ -506,6 +4539,8 @@ public class StashManagerModule extends Module {
     }
 
     public @Nullable String getOrganizerBlocker() {
+        if (hasWorkingFillCheckpoint()) return "kit working-stock fill checkpoint requires review";
+        if (kitJournal.exists()) return "kit fulfillment checkpoint requires recovery or manual review";
         if (organizer == null) {
             return config.organizerEnabled ? "organizer not available" : "organizer is disabled in config";
         }
@@ -533,7 +4568,10 @@ public class StashManagerModule extends Module {
         }
         String automationBlocker = getAutomationUnavailableReason();
         if (automationBlocker != null) return automationBlocker;
-        if (isBotOutsideScanEnvelope()) {
+        if (isBotOutsideScanEnvelope() && !organizer.isWithinPinnedIntakeEnvelope(
+                CACHE.getPlayerCache().getX(), CACHE.getPlayerCache().getY(),
+                CACHE.getPlayerCache().getZ(), SCAN_HORIZONTAL_RECOVERY_MARGIN,
+                SCAN_VERTICAL_RECOVERY_MARGIN)) {
             return "bot is outside the configured stash area; return it near the scanned region before organizing";
         }
 
@@ -557,6 +4595,8 @@ public class StashManagerModule extends Module {
                     + capacity.unclassifiedShulkers() + " unclassified shulker(s); run a fresh /stash scan";
             case NEEDS_FRESH_CONTAINER_SCAN -> "double-chest physical footprints require a fresh /stash scan";
             case REGION_NOT_DEFINED -> "region not defined (set pos1 and pos2 first)";
+            case NO_STORAGE_REGION -> "no all-purpose or storage region is available";
+            case MULTIPLE_STORAGE_REGIONS -> "multiple storage regions exist; choose one explicitly";
             case NO_SCANNED_CONTAINERS -> "no scanned containers in the configured region";
             case NO_LANES_DETECTED -> shortageCanStage
                     ? null
@@ -566,7 +4606,7 @@ public class StashManagerModule extends Module {
 
     private boolean hasImportStagingInventory() {
         if (config.pos1 == null || config.pos2 == null) return false;
-        return index.getInRegion(config.pos1, config.pos2).stream().anyMatch(index::isImportChest);
+        return organizer != null && organizer.hasScopedImportStaging();
     }
 
     public boolean startOrganizer() {
@@ -583,6 +4623,98 @@ public class StashManagerModule extends Module {
         boolean started = organizer.start();
         if (started) requestFoodContingency("organize_started");
         return started;
+    }
+
+    /** Select a saved region before planning; keep it selected for durable resume. */
+    public boolean startOrganizerForRegion(DatabaseManager.SavedRegion region) {
+        if (region == null || region.pos1() == null || region.pos2() == null
+                || region.pos1().length < 3 || region.pos2().length < 3
+                || !region.role().isStorageCapable()) return false;
+        if (region.role() == DatabaseManager.RegionRole.UNASSIGNED && database != null
+                && database.isInitialized()) {
+            try {
+                if (database.listRegions().stream().anyMatch(saved ->
+                        saved.role() == DatabaseManager.RegionRole.STORAGE)) return false;
+            } catch (Exception e) {
+                warn("Cannot validate storage-region policy before organizing: {}", e.getMessage());
+                return false;
+            }
+        }
+        if (organizer == null || organizer.isActive() || organizer.hasDurableCheckpoint()
+                || (state != ScanState.IDLE && state != ScanState.DONE)) return false;
+        if (!organizer.configureCrossRegionIntakes(List.of())) return false;
+        int[] previousPos1 = config.pos1;
+        int[] previousPos2 = config.pos2;
+        config.pos1 = Arrays.copyOf(region.pos1(), 3);
+        config.pos2 = Arrays.copyOf(region.pos2(), 3);
+        if (startOrganizer()) {
+            debugRecorder.record("organize_region_selected", "region=" + region.name());
+            return true;
+        }
+        config.pos1 = previousPos1;
+        config.pos2 = previousPos2;
+        refreshLatestScanTrust();
+        return false;
+    }
+
+    /** Route every explicitly registered intake inventory to one pinned storage region. */
+    public @Nullable String startOrganizerAcrossRegions(DatabaseManager.SavedRegion storage) {
+        if (database == null || !database.isInitialized()) return "database not connected";
+        if (organizer == null || organizer.isActive() || organizer.hasDurableCheckpoint()
+                || (state != ScanState.IDLE && state != ScanState.DONE)) {
+            return "an automation or organizer checkpoint is already active";
+        }
+        final MultiRegionImportRoutePolicy.Selection route;
+        try {
+            List<DatabaseManager.SavedRegion> regions = database.listRegions();
+            if (storage == null || regions.stream().noneMatch(saved ->
+                    saved.name().equals(storage.name())
+                            && saved.role() == DatabaseManager.RegionRole.STORAGE
+                            && Arrays.equals(saved.pos1(), storage.pos1())
+                            && Arrays.equals(saved.pos2(), storage.pos2()))) {
+                return "selected storage region changed; reload it before organizing";
+            }
+            route = MultiRegionImportRoutePolicy.select(storage, regions, index);
+            if (!route.ready()) return route.blocker();
+            for (StashOrganizer.IntakeRegion intake : route.intakes()) {
+                var scan = database.getLatestScanSummary(intake.pos1(), intake.pos2()).orElse(null);
+                if (scan == null || !scan.completed()
+                        || !ScanCompletionPolicy.trustedSnapshot(
+                                scan.found(), scan.indexed(), scan.failed())) {
+                    return "intake " + intake.name() + " needs a complete, fully indexed scan";
+                }
+                for (int[] position : intake.importBlocks()) {
+                    ContainerEntry entry = index.get(position[0], position[1], position[2]);
+                    if (entry == null || entry.timestamp() < scan.startedAtEpochMilli()) {
+                        return "intake " + intake.name() + " has a stale import at "
+                                + position[0] + "," + position[1] + "," + position[2];
+                    }
+                }
+            }
+        } catch (Exception e) {
+            return "could not verify intake routes: " + e.getMessage();
+        }
+        int[] previousPos1 = config.pos1;
+        int[] previousPos2 = config.pos2;
+        config.pos1 = Arrays.copyOf(storage.pos1(), 3);
+        config.pos2 = Arrays.copyOf(storage.pos2(), 3);
+        if (!organizer.configureCrossRegionIntakes(route.intakes())) {
+            config.pos1 = previousPos1;
+            config.pos2 = previousPos2;
+            return "organizer route could not be pinned";
+        }
+        String blocker = getOrganizerBlocker();
+        if (blocker == null && startOrganizer()) {
+            debugRecorder.record("organize_multi_region_selected",
+                    "storage=" + storage.name() + ", intakes=" + route.intakes().size()
+                            + ", import_blocks=" + route.importBlocks());
+            return null;
+        }
+        organizer.configureCrossRegionIntakes(List.of());
+        config.pos1 = previousPos1;
+        config.pos2 = previousPos2;
+        refreshLatestScanTrust();
+        return blocker == null ? "organizer could not start; see console for the exact reason" : blocker;
     }
 
     /** Cancel organizer work and retire any cooldown gate owned by that job. */
@@ -606,9 +4738,12 @@ public class StashManagerModule extends Module {
 
     /** Arm (or leave armed) a restored organizer checkpoint for normal gated resume. */
     public boolean requestOrganizerCheckpointResume() {
+        return requestOrganizerCheckpointResume(0);
+    }
+
+    /** Operator-attested count is checked again in the server's destination window. */
+    public boolean requestOrganizerCheckpointResume(int expectedPackedBoxCount) {
         if (organizer == null) return false;
-        refreshLatestScanTrust();
-        if (getOrganizerCheckpointResumeBlocker() != null) return false;
         if (!organizer.isDurableRecoveryLoaded()) {
             StashOrganizer.DurableRestoreResult restored = organizer.restoreDurableCheckpoint();
             if (restored != StashOrganizer.DurableRestoreResult.RESTORED) return false;
@@ -616,20 +4751,42 @@ public class StashManagerModule extends Module {
             organizerPreemptionGate.yield();
             lastOrganizerRecoveryBlocker = null;
         }
+        refreshLatestScanTrust();
         if (!organizer.isYielded()) return false;
-        if (getOrganizerCheckpointResumeBlocker() != null) return false;
-        if (!organizer.prepareManualCheckpointResume()) return false;
+        String resumeBlocker = getOrganizerCheckpointResumeBlocker();
+        boolean attestedFoodGate = foodContingencyJob == JobContinuanceManager.Job.ORGANIZE
+                && FoodContingencyRetryPolicy.allowsAttestedPackedBoxResume(
+                        expectedPackedBoxCount, resumeBlocker, foodContingencyBlocked,
+                        foodContingencyTerminalReason, foodContingencyBlockedRetryCount);
+        if (resumeBlocker != null
+                && (!attestedFoodGate || organizer.getDurableResumeBlocker() != null)) return false;
+        if (!organizer.prepareManualCheckpointResume(expectedPackedBoxCount)) return false;
         organizer.emitPackedShulkerInventoryAudit();
         if (!organizerPreemptionGate.isYielded()) {
             organizerPreemptionGate = newOrganizerPreemptionGate();
             organizerPreemptionGate.yield();
         }
+        // The verified box is no longer an unresolved world marker. Re-evaluate food from
+        // live inventory; the old blocked result must not indefinitely prevent this resume.
+        if (attestedFoodGate) resetFoodContingency();
         requestFoodContingency("organize_checkpoint_resume");
         return true;
     }
 
     public @Nullable String getOrganizerCheckpointResumeBlocker() {
-        if (!latestScanTrusted) return "latest_scan_incomplete_or_unhealthy";
+        if (hasWorkingFillCheckpoint()) return "kit_working_fill_checkpoint_requires_review";
+        if (organizer != null && organizer.isInventoryRecoveryOnly()) {
+            try {
+                var snapshot = kitJournal.load().orElse(null);
+                if (!kitAllowsInventoryReconciliation(snapshot)) {
+                    return "kit_owned_shell_or_checkpoint_changed";
+                }
+            } catch (Exception e) {
+                return "kit_checkpoint_unavailable_for_inventory_reconciliation";
+            }
+        } else if (!latestScanTrusted) {
+            return "latest_scan_incomplete_or_unhealthy";
+        }
         if (foodContingencyJob == JobContinuanceManager.Job.ORGANIZE
                 && foodContingencyBlocked) {
             if (foodContingencyBlockedRetryCount >= FoodContingencyRetryPolicy.MAX_RETRIES) {
@@ -641,6 +4798,15 @@ public class StashManagerModule extends Module {
                     + "); it will retry when the bot is back near the stash";
         }
         return organizer == null ? "organizer_unavailable" : organizer.getDurableResumeBlocker();
+    }
+
+    private boolean kitAllowsInventoryReconciliation(
+            KitFulfillmentJournalStore.Snapshot snapshot) {
+        if (organizer == null || !organizer.isInventoryRecoveryOnly()
+                || !KitInventoryReconciliationBoundary.matchesActive(
+                        snapshot, organizer.inventoryRecoveryPinnedSlots())) return false;
+        return snapshot == null || !KitResumePolicy.canAuditLostBorrowedNoCargo(snapshot)
+                || kitFulfillment.hasVerifiedOwnedShell(snapshot);
     }
 
     public boolean discardOrganizerCheckpoint() {
@@ -658,6 +4824,1122 @@ public class StashManagerModule extends Module {
 
     public boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems) {
         return startKitRetrieval(requestName, kitItems, false);
+    }
+
+    /** Shared-demand projection for arbitrary saved kits; never authorizes lane retirement. */
+    public String previewKitConsolidation(Map<String, Integer> targets) {
+        if (targets == null || targets.isEmpty()) return "supply at least one kit=count target";
+        if (config.pos1 == null || config.pos2 == null) return "stash region is not configured";
+        try {
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null) return "no scan is available for planning";
+            Map<String, Map<String, Integer>> recipes = new java.util.LinkedHashMap<>();
+            for (String name : targets.keySet()) {
+                var definition = database.loadKitDefinition(name);
+                if (definition == null || definition.items().isEmpty()) {
+                    return "saved kit is missing or empty: " + name;
+                }
+                if (definition.items().keySet().stream().anyMatch(id -> id.startsWith("profile:"))) {
+                    return "physical planning needs exact item IDs in kit: " + name;
+                }
+                recipes.put(name, definition.items());
+            }
+            Set<Long> excludedPositions = getReservedContainerKeys();
+            Map<Long, ContainerEntry> physical = new java.util.LinkedHashMap<>();
+            Set<Long> excludedInventories = new HashSet<>();
+            for (ContainerEntry entry : database.getAllContainers()) {
+                if (!inConfiguredRegion(entry) || !entry.inventoryFootprintKnown()
+                        || entry.timestamp() < scan.startedAtEpochMilli()) continue;
+                if (excludedPositions.contains(entry.posKey()) || index.isBlacklistedChest(entry)
+                        || index.isExportChest(entry)) excludedInventories.add(entry.inventoryKey());
+                physical.putIfAbsent(entry.inventoryKey(), entry);
+            }
+            Map<String, Long> stock = new java.util.LinkedHashMap<>();
+            int indexedEmptyBoxes = 0;
+            for (var entry : physical.entrySet()) {
+                if (excludedInventories.contains(entry.getKey())) continue;
+                ContainerEntry container = entry.getValue();
+                container.items().forEach((id, amount) ->
+                        stock.merge(id, amount.longValue(), Long::sum));
+                for (var detail : container.shulkerDetails()) {
+                    if (detail.isPhysicalInstance() && detail.items().isEmpty()) indexedEmptyBoxes++;
+                }
+            }
+            var plan = KitConsolidationPlan.assess(recipes, targets, stock,
+                    database.loadColumnAssignments().keySet(),
+                    config.kitConsolidationPinnedClasses == null ? Set.of()
+                            : Set.copyOf(config.kitConsolidationPinnedClasses));
+            StringBuilder report = new StringBuilder();
+            report.append(targets.size()).append(" saved kit type(s), ")
+                    .append(plan.outputBoxes()).append(" planned output boxes.\n")
+                    .append("Scan ").append(scan.completionStatus()).append(": ")
+                    .append(scan.indexed()).append("/").append(scan.found())
+                    .append(" indexed, ").append(scan.failed()).append(" failed; started ")
+                    .append(java.time.Instant.ofEpochMilli(scan.startedAtEpochMilli()))
+                    .append(". Indexed stock is not live stock.\n")
+                    .append("Indexed empty boxes: ").append(indexedEmptyBoxes)
+                    .append("; kit builder currently requires at least ")
+                    .append(plan.outputBoxes()).append(" before starting.\n")
+                    .append("Indexed depleted assigned classes: ")
+                    .append(plan.projectedEmptyLaneCount()).append(".\n")
+                    .append("Residual handoff candidates: ")
+                    .append(plan.residualHandoffCandidateCount())
+                    .append(" assigned classes; conservatively ")
+                    .append(plan.residualHandoffShulkerSlots())
+                    .append(" shulker slots for their leftovers before shared-chest capacity checks.\n");
+            if (!scan.completed() || scan.failed() != 0 || scan.indexed() != scan.found()) {
+                report.append("Scan is incomplete; depletion and handoff figures are provisional.\n");
+            }
+            if (!plan.exactShortages().isEmpty()) {
+                report.append("Indexed exact-item shortages: ");
+                plan.exactShortages().entrySet().stream().limit(8).forEach(e ->
+                        report.append(e.getKey()).append('=').append(e.getValue()).append(' '));
+                if (plan.exactShortages().size() > 8) report.append("and more");
+                report.append('\n');
+            }
+            plan.classes().entrySet().stream().filter(e -> e.getValue().projectedEmpty())
+                    .limit(10).forEach(e -> report.append("Would empty: ")
+                            .append(e.getKey()).append('\n'));
+            plan.classes().entrySet().stream().filter(e -> e.getValue().residualHandoffCandidate())
+                    .sorted(java.util.Comparator.comparingLong(e -> e.getValue().residualShulkerSlots()))
+                    .limit(8).forEach(e -> report.append(e.getKey()).append(": leftover ")
+                            .append(e.getValue().residualUnits())
+                            .append(" units / ").append(e.getValue().residualShulkerSlots())
+                            .append(" box slot(s)")
+                            .append('\n'));
+            report.append("Projection only; no boxes, lanes, or checkpoints changed. A fresh post-build scan and live audit are required before retirement.");
+            return report.toString();
+        } catch (Exception e) {
+            debugRecorder.record("kit_consolidation_preview_error", "targets=" + targets.size(), e);
+            return "kit consolidation preview unavailable: " + e.getMessage();
+        }
+    }
+
+    /** Sizes a kit-specific working-stock chest group without reserving or moving inventory. */
+    public String previewKitWorkingLane(String kitName, int copies) {
+        if (copies < 1 || copies > 64) return "request between 1 and 64 copies";
+        if (config.pos1 == null || config.pos2 == null) return "stash region is not configured";
+        try {
+            var kit = database.loadKitDefinition(kitName);
+            if (kit == null || kit.items().isEmpty()) return "kit recipe does not exist or is empty";
+            if (kit.items().keySet().stream().anyMatch(id -> id.startsWith("profile:"))) {
+                return "profile-based recipes need exact item IDs for working-stock sizing";
+            }
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null) return "no scan is available for stock planning";
+            Set<Long> excludedPositions = getReservedContainerKeys();
+            Map<Long, ContainerEntry> physical = new java.util.LinkedHashMap<>();
+            Set<Long> excludedInventories = new HashSet<>();
+            for (ContainerEntry entry : database.getAllContainers()) {
+                if (!inConfiguredRegion(entry) || !entry.inventoryFootprintKnown()
+                        || entry.timestamp() < scan.startedAtEpochMilli()) continue;
+                if (excludedPositions.contains(entry.posKey()) || index.isBlacklistedChest(entry)
+                        || index.isExportChest(entry)) excludedInventories.add(entry.inventoryKey());
+                physical.putIfAbsent(entry.inventoryKey(), entry);
+            }
+            Map<String, Long> stock = new java.util.LinkedHashMap<>();
+            for (var entry : physical.entrySet()) {
+                if (excludedInventories.contains(entry.getKey())) continue;
+                entry.getValue().items().forEach((id, amount) ->
+                        stock.merge(id, amount.longValue(), Long::sum));
+            }
+            var plan = KitWorkingLanePlan.assess(kit.items(), copies, stock);
+            long reservableChests = (plan.shulkerSlots()
+                    + (KitWorkingLaneAllocation.DOUBLE_CHEST_SLOTS - 3) - 1)
+                    / (KitWorkingLaneAllocation.DOUBLE_CHEST_SLOTS - 3);
+            StringBuilder report = new StringBuilder();
+            report.append(kitName).append(" × ").append(copies).append(": ")
+                    .append(plan.kitSlots()).append("/27 kit slots; ")
+                    .append(plan.shulkerSlots()).append(" working-stock shulker slots in ")
+                    .append(plan.doubleChests()).append(" double chest(s) minimum, ")
+                    .append(reservableChests)
+                    .append(" with three spare slots per chest.\n")
+                    .append("Scan: ").append(scan.completionStatus()).append(" ")
+                    .append(scan.indexed()).append("/").append(scan.found())
+                    .append(" indexed, ").append(scan.failed()).append(" failed; started ")
+                    .append(java.time.Instant.ofEpochMilli(scan.startedAtEpochMilli()))
+                    .append(". Indexed quantities are planning evidence, not live stock.\n");
+            if (!plan.recipeFits()) report.append("Recipe exceeds one shulker.\n");
+            if (!plan.stackSizesResolved()) report.append("Some stack sizes are unresolved; capacity is conservative.\n");
+            for (var item : plan.items().entrySet()) {
+                var demand = item.getValue();
+                report.append(item.getKey()).append(": ").append(demand.units())
+                        .append(" units, ").append(demand.shulkerSlots()).append(" box(es)");
+                if (demand.shortage() > 0) report.append(", indexed shortage ").append(demand.shortage());
+                report.append("\n");
+            }
+            report.append("No chest is reserved and no items are moved.");
+            return report.toString();
+        } catch (Exception e) {
+            debugRecorder.record("kit_working_lane_preview_error", "kit=" + kitName, e);
+            return "working-stock plan unavailable: " + e.getMessage();
+        }
+    }
+
+    /** Start an in-memory, read-only source probe for already reserved working slots. */
+    public @Nullable String prepareKitWorkingFill(String kitName) {
+        if (kitName == null || kitName.isBlank()) return "kit name is required";
+        if (kitWorkingPreparation != null) return "working-stock source probe is already running";
+        if (hasWorkingFillCheckpoint()) return "existing working-stock fill checkpoint requires review";
+        try {
+            var priorFill = kitWorkingFillJournal.load().orElse(null);
+            var priorTransfer = kitWorkingTransferJournal.load().orElse(null);
+            if ((priorFill != null
+                    && priorFill.status() != KitWorkingFillJournal.Status.COMPLETE)
+                    || (priorTransfer != null
+                        && priorTransfer.phase() != KitWorkingTransferJournal.Phase.COMPLETE)
+                    || (priorFill == null && priorTransfer != null)
+                    || (priorFill != null && priorTransfer == null))
+                return "existing working-stock fill journal requires review";
+        } catch (IOException e) {
+            return "working-stock fill journal is unreadable";
+        }
+        if (!workingFillOwnsAutomation())
+            return "kit, scan, organizer, retriever, or other stash automation is active";
+        if (hasAnyBaritoneProcessActive() || BARITONE.isActive() || INVENTORY.hasActiveRequest())
+            return "shared pathfinding or inventory automation is active";
+        String unavailable = getAutomationUnavailableReason();
+        if (unavailable != null) return unavailable;
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventory.getMouseStack();
+        if (inventory.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+            return "close the GUI and clear the cursor";
+        if (CACHE.getPlayerCache().getThePlayer() == null
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                || CACHE.getPlayerCache().getThePlayer().getFood() < 14)
+            return "bot needs a stable live world and hunger at least 14";
+        if (config.pos1 == null || config.pos2 == null || database == null
+                || !database.isInitialized() || !index.isDatabaseWriteHealthy())
+            return "configured stash region and healthy database required";
+        if (isBotOutsideScanEnvelope()) return "bot is outside the scanned stash area";
+        try {
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !scan.completed() || scan.failed() != 0
+                    || scan.found() != scan.indexed()
+                    || !database.latestScanHasFullItemIdentity(config.pos1, config.pos2))
+                return "complete current-identity scan required";
+            var pending = database.loadKitWorkingSlots().stream()
+                    .filter(row -> row.kitName().equals(kitName) && "pending".equals(row.status()))
+                    .toList();
+            if (pending.isEmpty()) return "no pending working slots are reserved for this kit";
+            if (pending.size() > 512) return "working fill exceeds 512 boxes";
+            Set<Long> excluded = new HashSet<>();
+            Set<Long> reservedPositions = getReservedContainerKeys();
+            var sources = database.getAllContainers();
+            for (var entry : sources) {
+                if (!inConfiguredRegion(entry) || reservedPositions.contains(entry.posKey())
+                        || index.isImportChest(entry) || index.isExportChest(entry)
+                        || index.isBlacklistedChest(entry) || index.isKitWorkingChest(entry))
+                    excluded.add(entry.inventoryKey());
+            }
+            var assignment = KitWorkingSourceAssignmentPlan.assign(pending, sources,
+                    excluded, scan.startedAtEpochMilli());
+            if (!assignment.ready()) return "intact source boxes unavailable: "
+                    + assignment.missingBoxes();
+            for (var source : assignment.assignments()) {
+                var destination = source.destination();
+                var preflight = new KitWorkingTransferJournal.Ticket(
+                        KitWorkingTransferJournal.SCHEMA_VERSION,
+                        destination.kitName(), destination.itemId(), destination.plannedUnits(),
+                        source.source(), source.sourceSlot(),
+                        new int[]{destination.x(), destination.y(), destination.z()},
+                        destination.slot(), "0".repeat(64),
+                        KitWorkingTransferJournal.Phase.PREPARED,
+                        System.currentTimeMillis(), null);
+                String blocker = KitWorkingFillAdmission.blocker(database, index,
+                        config.pos1, config.pos2, preflight, true);
+                if (blocker != null) return blocker;
+            }
+            kitWorkingPreparation = new KitWorkingFillPreparation(assignment.assignments(),
+                    new KitWorkingMinecraftPort(this::workingFillOwnsAutomation));
+            lastKitWorkingPreparationResult = "probing 0/" + assignment.assignments().size();
+            return null;
+        } catch (Exception e) {
+            return "working-stock source probe unavailable: " + e.getMessage();
+        }
+    }
+
+    /** Reserve one role-free, indexed empty double chest after a live window audit. */
+    public @Nullable String prepareKitWorkingReservation(String kitName, int copies,
+                                                          int[] position) {
+        if (kitName == null || kitName.isBlank() || copies < 1 || copies > 64)
+            return "saved kit name and 1..64 copies required";
+        if (position == null || position.length != 3) return "double-chest position required";
+        if (kitWorkingReservation != null || kitWorkingPreparation != null
+                || hasWorkingFillCheckpoint())
+            return "working-stock audit or checkpoint already exists";
+        if (!workingFillOwnsAutomation() || hasAnyBaritoneProcessActive()
+                || BARITONE.isActive() || INVENTORY.hasActiveRequest())
+            return "kit, scan, organizer, pathfinding, or inventory automation is active";
+        String unavailable = getAutomationUnavailableReason();
+        if (unavailable != null) return unavailable;
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventory.getMouseStack();
+        if (inventory.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+            return "close the GUI and clear the cursor";
+        if (CACHE.getPlayerCache().getThePlayer() == null
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                || CACHE.getPlayerCache().getThePlayer().getFood() < 14)
+            return "bot needs a stable live world and hunger at least 14";
+        if (database == null || !database.isInitialized() || !index.isDatabaseWriteHealthy()
+                || config.pos1 == null || config.pos2 == null)
+            return "configured stash region and healthy database required";
+        if (isBotOutsideScanEnvelope()) return "bot is outside the scanned stash area";
+        try {
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !scan.completed() || scan.failed() != 0
+                    || scan.found() != scan.indexed()
+                    || !database.latestScanHasFullItemIdentity(config.pos1, config.pos2))
+                return "complete current-identity scan required";
+            var entry = index.get(position[0], position[1], position[2]);
+            if (entry == null || !entry.isDouble() || !entry.inventoryFootprintKnown()
+                    || entry.x() != entry.inventoryX() || entry.y() != entry.inventoryY()
+                    || entry.z() != entry.inventoryZ()
+                    || entry.timestamp() < scan.startedAtEpochMilli()
+                    || entry.totalItems() != 0 || entry.shulkerCount() != 0)
+                return "select the freshly indexed canonical empty double-chest half";
+            int otherX = entry.x() + ("X".equals(entry.doubleChestAxis()) ? 1 : 0);
+            int otherZ = entry.z() + ("Z".equals(entry.doubleChestAxis()) ? 1 : 0);
+            if (otherX == entry.x() && otherZ == entry.z())
+                return "double-chest axis is unknown";
+            var partner = index.get(otherX, entry.y(), otherZ);
+            // The scanner records a double chest as one canonical inventory row. A
+            // second indexed block is optional, but if present it must agree with
+            // the canonical row. The live 54-slot window audit below verifies the
+            // physical footprint before any reservation is committed.
+            if (partner != null && (!partner.inventoryFootprintKnown()
+                    || partner.inventoryKey() != entry.inventoryKey()
+                    || partner.timestamp() < scan.startedAtEpochMilli()
+                    || partner.totalItems() != 0 || partner.shulkerCount() != 0))
+                return "partner chest half conflicts with the fresh empty inventory";
+            Set<Long> reservedPositions = getReservedContainerKeys();
+            if (index.hasAnyRole(entry.x(), entry.y(), entry.z())
+                    || index.hasAnyRole(otherX, entry.y(), otherZ)
+                    || reservedPositions.contains(entry.posKey())
+                    || reservedPositions.contains(posKey(otherX, entry.y(), otherZ)))
+                return "double chest already has a protected role";
+            var kit = database.loadKitDefinition(kitName);
+            if (kit == null || kit.items().isEmpty()) return "saved kit recipe is unavailable";
+            Map<Long, ContainerEntry> physical = new java.util.LinkedHashMap<>();
+            Set<Long> excluded = new HashSet<>();
+            var indexedContainers = database.getAllContainers();
+            for (var source : indexedContainers) {
+                if (!inConfiguredRegion(source) || !source.inventoryFootprintKnown()
+                        || source.timestamp() < scan.startedAtEpochMilli()) continue;
+                physical.putIfAbsent(source.inventoryKey(), source);
+                if (reservedPositions.contains(source.posKey())
+                        || index.hasAnyRole(source.x(), source.y(), source.z()))
+                    excluded.add(source.inventoryKey());
+            }
+            Map<String, Long> stock = new java.util.LinkedHashMap<>();
+            physical.forEach((key, source) -> {
+                if (!excluded.contains(key)) source.items().forEach((id, amount) ->
+                        stock.merge(id, amount.longValue(), Long::sum));
+            });
+            // Existing manifests may draw from the same indexed bulk stock. Count
+            // active boxes too because this scan may predate their physical fill.
+            Map<String, Long> existingClaims = new java.util.LinkedHashMap<>();
+            for (var reserved : database.loadKitWorkingSlots()) {
+                if ("pending".equals(reserved.status())
+                        || "active".equals(reserved.status())) {
+                    existingClaims.merge(reserved.itemId(),
+                            (long) reserved.plannedUnits(), Long::sum);
+                    stock.compute(reserved.itemId(), (id, available) ->
+                            Math.max(0L, (available == null ? 0L : available)
+                                    - reserved.plannedUnits()));
+                }
+            }
+            var chest = new KitWorkingLaneAllocation.Chest(entry.x(), entry.y(), entry.z(),
+                    true, true, true);
+            var plan = KitWorkingManifestPlan.assess(Map.of(kitName, kit.items()),
+                    Map.of(kitName, copies), stock, List.of(chest), 0);
+            if (!plan.ready()) return "working manifest lacks stock or chest slots: "
+                    + plan.indexedShortages() + ", missing slots="
+                    + plan.allocation().missingSlots();
+            var candidateSlots = plan.slots().stream().map(slot ->
+                    new DatabaseManager.KitWorkingSlotRow(slot.chest().x(),
+                            slot.chest().y(), slot.chest().z(), slot.chestSlot(),
+                            slot.kit(), slot.itemId(), slot.units(), "pending", null)).toList();
+            var intact = KitWorkingSourceAssignmentPlan.assign(candidateSlots,
+                    indexedContainers, excluded, scan.startedAtEpochMilli());
+            if (!intact.ready()) return "intact source boxes unavailable; repacking required: "
+                    + intact.missingBoxes();
+            kitWorkingReservationPlan = plan;
+            kitWorkingReservationScan = scan;
+            kitWorkingReservationClaims = Map.copyOf(existingClaims);
+            kitWorkingReservationRelease = false;
+            kitWorkingReservationPosition = position.clone();
+            kitWorkingReservation = new KitWorkingReservationPreparation(position,
+                    new KitWorkingMinecraftPort(this::workingFillOwnsAutomation));
+            lastKitWorkingPreparationResult = "auditing empty chest";
+            return null;
+        } catch (Exception e) {
+            return "working-stock reservation unavailable: " + e.getMessage();
+        }
+    }
+
+    public @Nullable String prepareKitWorkingRelease(int[] position) {
+        if (position == null || position.length != 3) return "double-chest position required";
+        if (kitWorkingReservation != null || kitWorkingPreparation != null
+                || hasWorkingFillCheckpoint())
+            return "working-stock audit or checkpoint already exists";
+        if (!workingFillOwnsAutomation() || hasAnyBaritoneProcessActive()
+                || BARITONE.isActive() || INVENTORY.hasActiveRequest())
+            return "kit, scan, organizer, pathfinding, or inventory automation is active";
+        String unavailable = getAutomationUnavailableReason();
+        if (unavailable != null) return unavailable;
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventory.getMouseStack();
+        if (inventory.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+            return "close the GUI and clear the cursor";
+        if (CACHE.getPlayerCache().getThePlayer() == null
+                || !CACHE.getPlayerCache().getThePlayer().isAlive())
+            return "bot needs a stable live world";
+        if (database == null || !database.isInitialized() || !index.isDatabaseWriteHealthy())
+            return "healthy database required";
+        var entry = index.get(position[0], position[1], position[2]);
+        if (entry == null || !entry.isDouble() || !entry.inventoryFootprintKnown()
+                || entry.x() != entry.inventoryX() || entry.y() != entry.inventoryY()
+                || entry.z() != entry.inventoryZ()
+                || !index.isKitWorkingChest(entry))
+            return "select the canonical half of a reserved working double chest";
+        int partnerX = entry.x() + ("X".equals(entry.doubleChestAxis()) ? 1 : 0);
+        int partnerZ = entry.z() + ("Z".equals(entry.doubleChestAxis()) ? 1 : 0);
+        if (partnerX == entry.x() && partnerZ == entry.z()
+                || !index.isKitWorkingChest(partnerX, entry.y(), partnerZ))
+            return "working double-chest footprint is incomplete";
+        try {
+            var slots = database.loadKitWorkingSlots().stream()
+                    .filter(slot -> slot.x() == entry.x() && slot.y() == entry.y()
+                            && slot.z() == entry.z()).toList();
+            if (slots.isEmpty() || slots.stream().anyMatch(slot ->
+                    !"pending".equals(slot.status()) || slot.boxFingerprint() != null))
+                return "only an entirely pending, unfilled working chest can be released";
+        } catch (Exception e) {
+            return "working slots unavailable: " + e.getMessage();
+        }
+        kitWorkingReservationRelease = true;
+        kitWorkingReservationPosition = position.clone();
+        kitWorkingReservation = new KitWorkingReservationPreparation(position,
+                new KitWorkingMinecraftPort(this::workingFillOwnsAutomation));
+        lastKitWorkingPreparationResult = "auditing empty chest before release";
+        return null;
+    }
+
+    public @Nullable String prepareKitWorkingRecovery() {
+        if (kitWorkingRecovery != null || kitWorkingReservation != null
+                || kitWorkingPreparation != null)
+            return "working-stock audit already running";
+        if (!workingFillOwnsAutomation() || hasAnyBaritoneProcessActive()
+                || BARITONE.isActive() || INVENTORY.hasActiveRequest())
+            return "kit, scan, organizer, pathfinding, or inventory automation is active";
+        String unavailable = getAutomationUnavailableReason();
+        if (unavailable != null) return unavailable;
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventory.getMouseStack();
+        if (inventory.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+            return "close the GUI and clear the cursor";
+        if (CACHE.getPlayerCache().getThePlayer() == null
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                || CACHE.getPlayerCache().getThePlayer().getFood() < 14)
+            return "bot needs a stable live world and hunger at least 14";
+        if (database == null || !database.isInitialized() || !index.isDatabaseWriteHealthy()
+                || config.pos1 == null || config.pos2 == null)
+            return "configured stash region and healthy database required";
+        if (isBotOutsideScanEnvelope()) return "bot is outside the scanned stash area";
+        try {
+            var job = kitWorkingFillJournal.load().orElse(null);
+            var ticket = kitWorkingTransferJournal.load().orElse(null);
+            if (job == null || job.status() != KitWorkingFillJournal.Status.REVIEW_REQUIRED)
+                return "no reviewed working fill exists";
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !scan.completed() || scan.failed() != 0
+                    || scan.found() != scan.indexed()
+                    || !database.latestScanHasFullItemIdentity(config.pos1, config.pos2))
+                return "complete current-identity scan required";
+            if (kitWorkingFill.resumeBeforeNextTicket()) {
+                lastKitWorkingPreparationResult = "pre-ticket fill resumed";
+                return null;
+            }
+            if (ticket == null || job.nextIndex() >= job.transfers().size()
+                    || !KitWorkingTransferJournal.sameTransfer(ticket,
+                            job.transfers().get(job.nextIndex())))
+                return "no matching reviewed working transfer exists";
+            if (ticket.phase() == KitWorkingTransferJournal.Phase.REVIEW_REQUIRED
+                    && ticket.reviewFromPhase() == null)
+                return "legacy review phase is unknown; manual cargo audit required";
+            int[] destination = ticket.destination();
+            var entry = index.get(destination[0], destination[1], destination[2]);
+            if (entry == null || !entry.inventoryFootprintKnown()
+                    || !entry.isDouble() || !index.isKitWorkingChest(entry)
+                    || database.loadKitWorkingSlots().stream().noneMatch(slot ->
+                            slot.x() == destination[0] && slot.y() == destination[1]
+                            && slot.z() == destination[2]
+                            && slot.slot() == ticket.destinationSlot()
+                            && slot.kitName().equals(ticket.kitName())
+                            && slot.itemId().equals(ticket.itemId())
+                            && slot.plannedUnits() == ticket.units()
+                            && ("pending".equals(slot.status())
+                                || "active".equals(slot.status()))))
+                return "working destination reservation changed";
+            kitWorkingRecovery = new KitWorkingRecoveryPreparation(ticket,
+                    new KitWorkingMinecraftPort(this::workingFillOwnsAutomation));
+            lastKitWorkingPreparationResult = "auditing reviewed transfer";
+            return null;
+        } catch (Exception e) {
+            return "working transfer recovery unavailable: " + e.getMessage();
+        }
+    }
+
+    public String kitWorkingFillStatus() {
+        if (kitWorkingRecovery != null)
+            return "Auditing the reviewed source, cargo, and destination; no item clicks sent.";
+        if (kitWorkingReservation != null)
+            return kitWorkingReservationRelease
+                    ? "Auditing live empty double chest before releasing pending slots."
+                    : "Auditing live empty double chest; no reservation written yet.";
+        if (kitWorkingPreparation != null)
+            return "Probing live sources " + kitWorkingPreparation.inspected() + "/"
+                    + kitWorkingPreparation.total() + "; no transfer clicks sent.";
+        try {
+            var job = kitWorkingFillJournal.load().orElse(null);
+            if (job == null) return "No working-stock fill job. Last probe: "
+                    + lastKitWorkingPreparationResult;
+            return "Working fill " + job.status() + " " + job.nextIndex() + "/"
+                    + job.transfers().size() + (job.blocker() == null ? ""
+                    : "; blocker=" + job.blocker());
+        } catch (IOException e) { return "Working fill checkpoint unreadable: " + e.getMessage(); }
+    }
+
+    /** Called only after every live source was observed and its GUI closed. */
+    public @Nullable String startKitWorkingFill(List<KitWorkingTransferJournal.Ticket> tickets) {
+        if (hasWorkingFillCheckpoint()) return "existing working-stock fill checkpoint requires review";
+        if (!workingFillOwnsAutomation())
+            return "kit, scan, organizer, retriever, or other stash automation is active";
+        if (tickets == null || tickets.isEmpty()) return "no source boxes were assigned";
+        if (hasAnyBaritoneProcessActive() || BARITONE.isActive() || INVENTORY.hasActiveRequest())
+            return "shared pathfinding or inventory automation is active";
+        String unavailable = getAutomationUnavailableReason();
+        if (unavailable != null) return unavailable;
+        var inventory = CACHE.getPlayerCache().getInventoryCache();
+        ItemStack cursor = inventory.getMouseStack();
+        if (inventory.getOpenContainerId() > 0 || cursor != null && cursor.getAmount() > 0)
+            return "close the GUI and clear the cursor";
+        if (CACHE.getPlayerCache().getThePlayer() == null
+                || !CACHE.getPlayerCache().getThePlayer().isAlive()
+                || CACHE.getPlayerCache().getThePlayer().getFood() < 14)
+            return "bot needs a stable live world and hunger at least 14";
+        if (config.pos1 == null || config.pos2 == null)
+            return "stash region is not configured";
+        if (isBotOutsideScanEnvelope()) return "bot is outside the scanned stash area";
+        try {
+            for (var ticket : tickets) {
+                String blocker = KitWorkingFillAdmission.blocker(database, index,
+                        config.pos1, config.pos2, ticket, true);
+                if (blocker != null) return blocker;
+            }
+            kitWorkingFill.start(tickets);
+            return null;
+        } catch (Exception e) {
+            return "working-stock fill could not start: " + e.getMessage();
+        }
+    }
+
+    private boolean hasWorkingFillCheckpoint() {
+        if (kitWorkingPreparation != null || kitWorkingReservation != null) return true;
+        try {
+            return kitWorkingFillJournal.load().map(job ->
+                    job.status() != KitWorkingFillJournal.Status.COMPLETE).orElse(false);
+        } catch (IOException e) {
+            return true;
+        }
+    }
+
+    private boolean workingFillOwnsAutomation() {
+        return !kitJournal.exists() && !kitFulfillment.isActive()
+                && !kitRecovery.isActive() && !retriever.isActive()
+                && (organizer == null || !organizer.isActive())
+                && (state == ScanState.IDLE || state == ScanState.DONE)
+                && pendingScanRegions.isEmpty() && !reequipActive
+                && !foodContingencyActive && !foodContingencyRequested
+                && !com.zenith.plugin.stashmanager.travel.TravelManager.get().hasActiveWork();
+    }
+
+    /** Start one serial, checkpointed physical kit delivery job from a trusted scan. */
+    public @Nullable String startKitFulfillment(String kitName, int boxes) {
+        return startKitFulfillmentInternal(kitName, boxes, null);
+    }
+
+    /** Reuse the proven kit retrieval/packing/borrowed-return pipeline for one stock box. */
+    public @Nullable String startKitWorkingRepack(String kitName, String itemId, int units,
+                                                 int[] stagingPosition) {
+        if (kitName == null || kitName.isBlank() || itemId == null || itemId.isBlank()
+                || stagingPosition == null || stagingPosition.length != 3 || units < 1)
+            return "saved kit, exact item, positive units, and staging chest required";
+        if (itemId.startsWith("profile:"))
+            return "profile-based stock needs exact physical item identity";
+        String base = ItemProfiles.baseItemId(itemId);
+        if (base == null || base.isBlank())
+            return "valid exact physical item identity required";
+        if (Set.of("filled_map", "potion", "splash_potion", "lingering_potion")
+                .contains(base))
+            return "this item needs variant-aware scanning before repacking";
+        if (database == null || !database.isInitialized() || config.pos1 == null
+                || config.pos2 == null) return "configured stash region and database required";
+        try {
+            var saved = database.loadKitDefinition(kitName);
+            if (saved == null || saved.items().getOrDefault(itemId, 0) <= 0)
+                return "item is not in the saved kit recipe";
+            if (KitCapacity.requiredSlots(Map.of(itemId, units)) > KitCapacity.MAX_SLOTS)
+                return "requested stock does not fit one shulker";
+            if (units > 64L * saved.items().get(itemId))
+                return "requested stock exceeds the maximum 64-copy working plan";
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            if (scan == null || !scan.completed() || scan.failed() != 0
+                    || scan.found() != scan.indexed()
+                    || !database.latestScanHasFullItemIdentity(config.pos1, config.pos2))
+                return "complete current-identity scan required";
+            var entry = index.get(stagingPosition[0], stagingPosition[1], stagingPosition[2]);
+            if (entry == null || !inConfiguredRegion(entry) || !entry.isDouble()
+                    || !entry.inventoryFootprintKnown()
+                    || entry.x() != entry.inventoryX() || entry.y() != entry.inventoryY()
+                    || entry.z() != entry.inventoryZ()
+                    || entry.timestamp() < scan.startedAtEpochMilli()
+                    || entry.totalItems() != 0
+                    || entry.shulkerCount() != 0)
+                return "select the indexed canonical half of an empty double chest";
+            int otherX = entry.x() + ("X".equals(entry.doubleChestAxis()) ? 1 : 0);
+            int otherZ = entry.z() + ("Z".equals(entry.doubleChestAxis()) ? 1 : 0);
+            if (otherX == entry.x() && otherZ == entry.z())
+                return "staging double-chest axis is unknown";
+            var partner = index.get(otherX, entry.y(), otherZ);
+            if (partner != null && (!partner.inventoryFootprintKnown()
+                    || partner.inventoryKey() != entry.inventoryKey()
+                    || partner.timestamp() < scan.startedAtEpochMilli()
+                    || partner.totalItems() != 0 || partner.shulkerCount() != 0))
+                return "staging double-chest partner conflicts with the indexed inventory";
+            Set<Long> reserved = getReservedContainerKeys();
+            if (index.hasAnyRole(entry.x(), entry.y(), entry.z())
+                    || index.hasAnyRole(otherX, entry.y(), otherZ)
+                    || reserved.contains(entry.posKey())
+                    || reserved.contains(posKey(otherX, entry.y(), otherZ))
+                    || database.loadColumnAssignments().values().stream().anyMatch(pos ->
+                        (pos[0] == entry.x() && pos[2] == entry.z())
+                        || (pos[0] == otherX && pos[2] == otherZ)))
+                return "staging double chest has a protected role or assigned lane";
+            var ephemeral = new DatabaseManager.KitDefinition(
+                    "@stash-working-repack:" + kitName + ":" + base,
+                    DatabaseManager.KitStatus.READY,
+                    Map.of(itemId, units), stagingPosition, false);
+            return startKitFulfillmentInternal(ephemeral.name(), 1, ephemeral);
+        } catch (Exception e) {
+            return "working-stock repack preflight failed: " + e.getMessage();
+        }
+    }
+
+    private @Nullable String startKitFulfillmentInternal(String kitName, int boxes,
+            DatabaseManager.@Nullable KitDefinition override) {
+        String blocker = getRetrieveBlocker();
+        if (blocker != null) return blocker;
+        if (foodContingencyActive || foodContingencyRequested || reequipActive) {
+            return "food recovery or re-equipping is active";
+        }
+        if (hasAnyBaritoneProcessActive() || BARITONE.isActive() || INVENTORY.hasActiveRequest()) {
+            return "shared Baritone/inventory automation is active";
+        }
+        if (boxes < 1 || boxes > 64) return "request between 1 and 64 boxes";
+        refreshLatestScanTrust();
+        if (config.pos1 == null || config.pos2 == null) return "stash region is not configured";
+        final java.util.Optional<DatabaseManager.ScanSummary> scan;
+        try {
+            scan = database.getLatestScanSummary(config.pos1, config.pos2);
+        } catch (Exception e) {
+            return "could not load latest scan: " + e.getMessage();
+        }
+        if (scan.isEmpty()) return "run a fresh stash scan first";
+        var summary = scan.get();
+        if (!KitScanAdmission.allows(summary.completionStatus(), summary.found(),
+                summary.indexed(), summary.failed())) {
+            return "latest scan is incomplete or has more than one failed chest";
+        }
+        boolean oneTargetPartial = !summary.completed();
+        if (isBotOutsideScanEnvelope()) return "bot is outside the scanned stash area";
+        int foodNeeded = Math.min(64, 16 * boxes);
+        if (CACHE.getPlayerCache().getThePlayer().getFood() < 14
+                || kitSafeFoodCount() < foodNeeded) {
+            return "kit build needs hunger at least 14 and " + foodNeeded
+                    + " safe, AutoEat-accepted food items in inventory";
+        }
+        try {
+            DatabaseManager.KitDefinition kit = override == null
+                    ? database.loadKitDefinition(kitName) : override;
+            if (kit == null || kit.status() != DatabaseManager.KitStatus.READY
+                    || kit.items().isEmpty() || kit.exportPosition() == null) {
+                return "kit is missing, incomplete, or has no export chest";
+            }
+            if (kit.items().keySet().stream().anyMatch(id -> id.startsWith("profile:"))) {
+                return "physical kit packing needs exact scanned item IDs; profile-based recipes "
+                        + "are not yet supported";
+            }
+            // Cargo is retrieved and packed in bounded batches, not all at once.
+            // The second main slot lets an empty borrowed shell be retained
+            // without immediately consuming the sole cargo slot.
+            int requiredMainSlots = 2;
+            int freeMainSlots = KitFulfillmentCoordinator.freeMainSlots();
+            int freeHotbarSlots = KitFulfillmentCoordinator.freeHotbarSlots();
+            if (freeMainSlots < requiredMainSlots || freeHotbarSlots < 1) {
+                return "kit needs " + requiredMainSlots + " free main slots and one free hotbar slot "
+                        + "(currently " + freeMainSlots + " main, " + freeHotbarSlots
+                        + " hotbar); keep items will not be moved";
+            }
+            int[] output = kit.exportPosition();
+            if (override == null && !index.isExportChest(output[0], output[1], output[2])) {
+                return "kit output is no longer a registered export chest";
+            }
+            ContainerEntry exportEntry = index.get(output[0], output[1], output[2]);
+            if (exportEntry == null || !exportEntry.inventoryFootprintKnown()
+                    || exportEntry.timestamp() < summary.startedAtEpochMilli()) {
+                return "export chest needs a fresh physical scan";
+            }
+            if (KitOutputChestPolicy.hasIndexedHopperBelow(exportEntry, index.getAll())) {
+                return "kit output has an indexed hopper below it; use a standalone chest";
+            }
+            int chestSlots = exportEntry.isDouble() ? 54 : 27;
+            int occupied = exportEntry.shulkerCount()
+                    + exportEntry.directStackSlots().values().stream().mapToInt(Integer::intValue).sum();
+            int freeExportSlots = Math.max(0, chestSlots - occupied);
+
+            Set<Long> excluded = new HashSet<>(getReservedContainerKeys());
+            List<ContainerEntry> candidates = database.getAllContainers().stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(ContainerEntry::inventoryFootprintKnown)
+                    .filter(entry -> entry.timestamp() >= summary.startedAtEpochMilli())
+                    .toList();
+            Set<Long> reservedInventories = new HashSet<>();
+            reservedInventories.add(exportEntry.inventoryKey());
+            for (ContainerEntry entry : candidates) {
+                if (excluded.contains(entry.posKey()) || index.isBlacklistedChest(entry)
+                        || index.isExportChest(entry)) {
+                    reservedInventories.add(entry.inventoryKey());
+                }
+            }
+            for (ContainerEntry entry : candidates) {
+                if (reservedInventories.contains(entry.inventoryKey())) excluded.add(entry.posKey());
+            }
+            Map<Long, ContainerEntry> physical = new java.util.LinkedHashMap<>();
+            for (ContainerEntry entry : candidates) {
+                if (inConfiguredRegion(entry) && entry.inventoryFootprintKnown()
+                        && !excluded.contains(entry.posKey())
+                        && !index.isBlacklistedChest(entry) && !index.isExportChest(entry)) {
+                    physical.putIfAbsent(entry.inventoryKey(), entry);
+                }
+            }
+            Map<String, Long> stock = new java.util.LinkedHashMap<>();
+            int emptyBoxes = 0;
+            for (ContainerEntry entry : physical.values()) {
+                entry.items().forEach((id, amount) -> stock.merge(id, amount.longValue(), Long::sum));
+                for (ContainerEntry.ShulkerDetail detail : entry.shulkerDetails()) {
+                    if (detail.isPhysicalInstance() && detail.items().isEmpty()) emptyBoxes++;
+                }
+            }
+            if (kit.craftMissing()) {
+                KitCraftingPlan.Assessment craft = KitCraftingPlan.assess(
+                        kit.items(), boxes, stock, true);
+                if (!craft.feasible()) {
+                    return "kit crafting ingredients unavailable: " + craft.shortages();
+                }
+                if (!craft.toCraft().isEmpty()) {
+                    boolean hasAssignedTable = index.getCraftingTables().stream().anyMatch(pos ->
+                            pos[0] >= Math.min(config.pos1[0], config.pos2[0])
+                                    && pos[0] <= Math.max(config.pos1[0], config.pos2[0])
+                                    && pos[1] >= Math.min(config.pos1[1], config.pos2[1])
+                                    && pos[1] <= Math.max(config.pos1[1], config.pos2[1])
+                                    && pos[2] >= Math.min(config.pos1[2], config.pos2[2])
+                                    && pos[2] <= Math.max(config.pos1[2], config.pos2[2]));
+                    if (!hasAssignedTable) return "kit crafting needs an assigned table in the region";
+                    return "kit crafting is requested for " + craft.toCraft()
+                            + " but the physical kit crafting executor is not available yet; "
+                            + "no materials were moved";
+                }
+            }
+            KitFulfillmentPlan.Assessment capacity = KitFulfillmentPlan.assess(
+                    kit.items(), boxes, stock, emptyBoxes, freeExportSlots);
+            if (!capacity.feasible()) {
+                return "kit stock/capacity preflight failed: missingItems=" + capacity.shortages()
+                        + ", emptyShulkersNeeded=" + capacity.missingEmptyBoxes()
+                        + ", exportSlotsNeeded=" + capacity.missingExportSlots();
+            }
+            Map<String, Integer> keepRules = database.loadKeepItems();
+            var inventoryAdmission = KitInventoryAdmissionPolicy.inspectLive(keepRules, Set.of());
+            if (inventoryAdmission == null) return "kit inventory keep-policy check unavailable";
+            if (!inventoryAdmission.accepted()) {
+                String disposition = kitUnexpectedInventoryDisposition(inventoryAdmission);
+                debugRecorder.record("kit_inventory_admission_rejected",
+                        "phase=start, " + disposition);
+                return "kit inventory contains items outside the keep list in raw slots "
+                        + inventoryAdmission.unexpectedSlots() + "; " + disposition;
+            }
+            kitFulfillment.setInventoryKeepRules(keepRules);
+            if (!kitFulfillment.start(kitName, kit.items(), boxes, output,
+                    candidates, config.pos1, config.pos2, excluded,
+                    index.getImportChests())) {
+                return "kit fulfillment could not start; check inventory headroom and checkpoint";
+            }
+            if (oneTargetPartial) {
+                debugRecorder.record("kit_fulfillment_partial_scan_sources",
+                        "found=" + summary.found() + ", indexed=" + summary.indexed()
+                                + ", failed=" + summary.failed()
+                                + ", fresh_candidate_entries=" + candidates.size());
+            }
+            return null;
+        } catch (Exception e) {
+            debugRecorder.record("kit_fulfillment_start_error", "kit=" + kitName, e);
+            return "kit fulfillment preflight failed: " + e.getMessage();
+        }
+    }
+
+    private void tickScheduledKitResume() {
+        final KitFulfillmentJournalStore.Snapshot snapshot;
+        try {
+            snapshot = kitJournal.load().orElse(null);
+        } catch (IOException e) {
+            kitResumeCadence.reset();
+            return;
+        }
+        if (snapshot == null || snapshot.resumeState() == null
+                || snapshot.resumeNotBeforeEpochMilli() == 0) {
+            kitResumeCadence.reset();
+            return;
+        }
+        if (kitRecovery.state() != KitWorksiteRecovery.State.DONE) {
+            kitResumeCadence.reset();
+            return;
+        }
+        String phaseBlocker = KitResumePolicy.blocker(snapshot);
+        if (phaseBlocker != null) {
+            if (!"world_box_recovery_pending".equals(phaseBlocker)) {
+                try { saveKitResumeReview(snapshot, phaseBlocker, true); }
+                catch (IOException e) { warn("Could not record kit resume review (reason={}): {}",
+                        phaseBlocker, e.getMessage()); }
+            }
+            return;
+        }
+        long now = System.currentTimeMillis();
+        String quietBlocker = kitResumeQuietBlocker();
+        if (quietBlocker != null && now >= snapshot.resumeNotBeforeEpochMilli()
+                && now - lastKitResumeWaitDiagnosticEpochMilli >= 30_000) {
+            lastKitResumeWaitDiagnosticEpochMilli = now;
+            debugRecorder.record("kit_resume_waiting", "reason=" + quietBlocker
+                    + ", hunger=" + CACHE.getPlayerCache().getThePlayer().getFood()
+                    + ", safe_food=" + kitSafeFoodCount());
+        }
+        if (!kitResumeCadence.tick(now, snapshot.resumeNotBeforeEpochMilli(),
+                quietBlocker == null)) return;
+        String blocker = resumeScheduledKit(snapshot);
+        if ("inventory_headroom_missing".equals(blocker)
+                || "resume_preflight_error".equals(blocker)) {
+            if (now - lastKitResumeWaitDiagnosticEpochMilli >= 30_000) {
+                lastKitResumeWaitDiagnosticEpochMilli = now;
+                debugRecorder.record("kit_resume_waiting", "reason=" + blocker
+                        + ", kit=" + snapshot.kitName()
+                        + ", phase=" + snapshot.resumeState()
+                        + ", free_main=" + KitFulfillmentCoordinator.freeMainSlots()
+                        + ", free_hotbar=" + KitFulfillmentCoordinator.freeHotbarSlots());
+            }
+            kitResumeCadence.reset();
+            return;
+        }
+        if (blocker != null) {
+            try { saveKitResumeReview(snapshot, blocker, true); }
+            catch (IOException e) { warn("Could not record kit resume review (reason={}): {}",
+                    blocker, e.getMessage()); }
+        } else {
+            kitResumeCadence.reset();
+            debugRecorder.record("kit_resume_started", "kit=" + snapshot.kitName()
+                    + ", phase=" + snapshot.resumeState()
+                    + ", completed_boxes=" + snapshot.completedBoxes());
+        }
+    }
+
+    private @Nullable String kitResumeQuietBlocker() {
+        if (!Proxy.getInstance().isConnected()) return "proxy_disconnected";
+        if (Proxy.getInstance().hasActivePlayer()) return "client_control_active";
+        if (!CACHE.getPlayerCache().getThePlayer().isAlive()) return "bot_not_alive";
+        if (state != ScanState.IDLE && state != ScanState.DONE) return "scan_active";
+        if (organizer != null && organizer.isActive()) return "organizer_active";
+        if (retriever.isActive()) return "retriever_active";
+        if (reequipActive) return "reequip_active";
+        if (foodContingencyActive || foodContingencyRequested) return "food_contingency_active";
+        if (BARITONE.isActive() || hasAnyBaritoneProcessActive()) return "pathfinder_active";
+        if (INVENTORY.hasActiveRequest()) return "inventory_action_active";
+        if (isBotOutsideScanEnvelope()) return "outside_scan_envelope";
+        if (CACHE.getPlayerCache().getThePlayer().getFood() < 14) return "hunger_low";
+        if (kitSafeFoodCount() < 16) return "safe_food_low";
+        return null;
+    }
+
+    private @Nullable String resumeScheduledKit(KitFulfillmentJournalStore.Snapshot snapshot) {
+        if (config.pos1 == null || config.pos2 == null) return "stash_region_missing";
+        try {
+            var scan = database.getLatestScanSummary(config.pos1, config.pos2).orElse(null);
+            boolean heldBoxResume = "resume_held_box_rebase".equals(snapshot.blocker());
+            if (scan == null || !(KitScanAdmission.allows(scan.completionStatus(),
+                    scan.found(), scan.indexed(), scan.failed())
+                    || heldBoxResume && heldBoxScanRecoveryAdmissible(snapshot)))
+                return "fresh_scan_required";
+            var definition = database.loadKitDefinition(snapshot.kitName());
+            if (definition == null || definition.status() != DatabaseManager.KitStatus.READY
+                    || !snapshot.recipe().equals(definition.items())
+                    || !java.util.Arrays.equals(snapshot.exportPosition(), definition.exportPosition())) {
+                return "kit_recipe_or_output_changed";
+            }
+            int[] output = snapshot.exportPosition();
+            if (!index.isExportChest(output[0], output[1], output[2])) {
+                return "export_chest_unregistered";
+            }
+            ContainerEntry outputEntry = index.get(output[0], output[1], output[2]);
+            if (outputEntry == null || !outputEntry.inventoryFootprintKnown()
+                    || outputEntry.timestamp() < scan.startedAtEpochMilli()) {
+                return "export_chest_scan_stale";
+            }
+            if (KitOutputChestPolicy.hasIndexedHopperBelow(outputEntry, index.getAll())) {
+                return "export_chest_hopper_below";
+            }
+            // This exact pre-retrieval headroom stop has already retained its
+            // empty source shell; one main cargo slot and one free hotbar slot
+            // suffice. Other fresh boundaries retain the two-slot margin.
+            boolean returningSource = "resume_source_return".equals(snapshot.blocker())
+                    || "resume_source_return_exact_import".equals(snapshot.blocker())
+                    || "resume_unopened_source_to_origin".equals(snapshot.blocker())
+                    || KitSameContentReturnAudit.parse(snapshot.blocker()) != null;
+            boolean verifyingReturn = "resume_audit_completed_source_return"
+                    .equals(snapshot.blocker());
+            boolean verifyingFailedReturn = "resume_audit_failed_source_return"
+                    .equals(snapshot.blocker());
+            boolean auditedCargoResume = "resume_audited_inventory_cargo".equals(snapshot.blocker())
+                    || "resume_audited_kept_apple_cargo".equals(snapshot.blocker())
+                    || KitEmptyShellOwnershipAudit.isScheduled(snapshot.blocker());
+            boolean auditedEmptyShell = KitEmptyShellOwnershipAudit.isScheduled(snapshot.blocker());
+            boolean variantRepairResume = "resume_variant_exchange".equals(snapshot.blocker());
+            boolean variantReadyResume = "resume_variant_source_cargo".equals(snapshot.blocker());
+            boolean variantStagingResume = "resume_variant_staging".equals(snapshot.blocker());
+            int requiredMain = auditedCargoResume
+                    || returningSource || verifyingReturn || verifyingFailedReturn
+                    || variantStagingResume ? 0
+                    : variantRepairResume ? 2
+                    : variantReadyResume ? 1
+                    : "resume_main_headroom".equals(snapshot.blocker())
+                        ? 1 : 2;
+            boolean borrowedInventorySourceAlreadyInHotbar =
+                    ("resume_borrowed_inventory_source".equals(snapshot.blocker())
+                            || heldBoxResume)
+                    && KitFulfillmentCoordinator.uniqueBorrowedInventorySourceSlot(snapshot) >= 36;
+            boolean auditedCargoWithHeldShell =
+                    auditedCargoResume
+                    && snapshot.ownedShellSlot() >= 36 && snapshot.ownedShellSlot() <= 44;
+            if (KitFulfillmentCoordinator.freeMainSlots() < requiredMain
+                    || (!returningSource && !verifyingReturn && !verifyingFailedReturn
+                        && !variantStagingResume
+                        // The already-held variant has its verified kit shell in the
+                        // hotbar. Packer reuses that slot and only needs the main
+                        // inventory headroom checked above for the exchanged stack.
+                        && !(variantReadyResume && snapshot.ownedShellSlot() >= 36
+                            && snapshot.ownedShellSlot() <= 44)
+                        && KitFulfillmentCoordinator.freeHotbarSlots() < 1
+                        && !borrowedInventorySourceAlreadyInHotbar
+                        && !auditedCargoWithHeldShell)) {
+                return "inventory_headroom_missing";
+            }
+            Set<Long> excluded = new HashSet<>(getReservedContainerKeys());
+            List<ContainerEntry> allContainers = database.getAllContainers();
+            Map<Long, List<KitFulfillmentJournalStore.BorrowedBox>> lossesByInventory =
+                    new HashMap<>();
+            for (var loss : snapshot.writtenOffSources()) {
+                int[] source = loss.sourcePosition();
+                allContainers.stream()
+                        .filter(entry -> entry.x() == source[0] && entry.y() == source[1]
+                                && entry.z() == source[2])
+                        .map(ContainerEntry::inventoryKey).distinct()
+                        .forEach(key -> lossesByInventory.computeIfAbsent(
+                                key, ignored -> new ArrayList<>()).add(loss));
+            }
+            List<ContainerEntry> candidates = allContainers.stream()
+                    .filter(this::inConfiguredRegion)
+                    .filter(ContainerEntry::inventoryFootprintKnown)
+                    .filter(entry -> entry.timestamp() >= scan.startedAtEpochMilli())
+                    .map(entry -> {
+                        var losses = lossesByInventory.get(entry.inventoryKey());
+                        if (losses == null || losses.isEmpty()) return entry;
+                        // If the physical shulker is no longer unique in this scan,
+                        // exclude this inventory rather than route to stale stock.
+                        if (losses.size() != 1) return null;
+                        return KitLostSourceIndexPolicy.withoutLostBox(entry, losses.getFirst(),
+                                snapshot.currentItem(), snapshot.currentQuantity());
+                    })
+                    .filter(Objects::nonNull)
+                    .toList();
+            Set<Long> reservedInventories = new HashSet<>();
+            reservedInventories.add(outputEntry.inventoryKey());
+            for (ContainerEntry entry : candidates) {
+                if (excluded.contains(entry.posKey()) || index.isBlacklistedChest(entry)
+                        || index.isExportChest(entry)) {
+                    reservedInventories.add(entry.inventoryKey());
+                }
+            }
+            for (ContainerEntry entry : candidates) {
+                if (reservedInventories.contains(entry.inventoryKey())) excluded.add(entry.posKey());
+            }
+            Set<Integer> ownedSlots = new HashSet<>();
+            if (snapshot.ownedShellSlot() >= 9 && snapshot.ownedShellSlot() <= 44) {
+                if (!KitFulfillmentCoordinator.hasVerifiedOwnedShell(snapshot))
+                    return "owned_inventory_unverified";
+                ownedSlots.add(snapshot.ownedShellSlot());
+            }
+            if (snapshot.retainedShell() != null) {
+                int retainedSlot = KitFulfillmentCoordinator.uniqueRetainedShellSlot(snapshot);
+                if (retainedSlot < 0) return "retained_shell_unverified";
+                ownedSlots.add(retainedSlot);
+            }
+            if (!KitFulfillmentCoordinator.verifiedDisplacedAppleSlots(
+                    snapshot.displacedAppleSlots())) return "displaced_apple_slots_changed";
+            ownedSlots.addAll(snapshot.displacedAppleSlots().keySet());
+            // The audited two-stack apple batch belongs to this in-progress kit.
+            // Without these exact slots, it consumes the keep quota and makes
+            // unrelated baseline apples look like unexpected inventory.
+            if ((variantRepairResume || variantReadyResume)
+                    && KitFulfillmentCoordinator.appleBudgetVariantRepair(snapshot)) {
+                ownedSlots.addAll(snapshot.auditedCargoSlots().keySet());
+            }
+            if (auditedCargoResume) {
+                if (snapshot.protectedLoose() != null) {
+                    if (!KitFulfillmentCoordinator.verifiedAuditedCargo(snapshot))
+                        return "protected_loose_or_partial_cargo_changed";
+                    ownedSlots.add(snapshot.protectedLoose().rawSlot());
+                }
+                if (auditedEmptyShell && !KitEmptyShellOwnershipAudit.verify(snapshot,
+                        CACHE.getPlayerCache().getInventoryCache().getPlayerInventory())) {
+                    return "audited_empty_shell_ownership_changed";
+                }
+                ownedSlots.addAll(snapshot.auditedCargoSlots().keySet());
+                if (snapshot.auditedCargoSlot() >= 9 && snapshot.auditedCargoSlot() <= 44)
+                    ownedSlots.add(snapshot.auditedCargoSlot());
+                if (auditedEmptyShell) {
+                    var player = CACHE.getPlayerCache().getInventoryCache().getPlayerInventory();
+                    for (int raw = 9; raw <= 44; raw++) {
+                        ItemStack stack = player.getItemStack(raw);
+                        if (stack != null && stack.getAmount() > 0
+                                && ItemIdentifier.baseItemId(ItemIdentifier.getItemId(stack))
+                                        .contains("shulker_box")) ownedSlots.add(raw);
+                    }
+                } else if (!snapshot.sourceBoxesToReturn().isEmpty()) {
+                    if (snapshot.sourceBoxesToReturn().size() == 1) {
+                        int returnSlot = KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot);
+                        if (returnSlot < 0) return "borrowed_source_return_unverified";
+                        ownedSlots.add(returnSlot);
+                    } else {
+                        Set<Integer> returnSlots =
+                                KitFulfillmentCoordinator.verifiedPendingSourceSlots(snapshot);
+                        if (returnSlots.size() != snapshot.sourceBoxesToReturn().size())
+                            return "borrowed_source_return_unverified";
+                        ownedSlots.addAll(returnSlots);
+                    }
+                }
+            }
+            if (variantRepairResume) {
+                if (!KitFulfillmentCoordinator.verifiedVariantRepairBoundary(snapshot)
+                        || !KitFulfillmentCoordinator.verifiedVariantPendingSources(snapshot)) {
+                    return "variant_repair_boundary_changed";
+                }
+                Set<Integer> pendingSlots =
+                        KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot);
+                if (pendingSlots.size() != snapshot.sourceBoxesToReturn().size()) {
+                    return "borrowed_source_return_unverified";
+                }
+                ownedSlots.addAll(pendingSlots);
+                ownedSlots.add(snapshot.variantRepair().cargoRawSlot());
+            }
+            if (variantReadyResume) {
+                if (!KitFulfillmentCoordinator.verifiedVariantReadyBoundary(snapshot))
+                    return "variant_source_cargo_changed";
+                ownedSlots.addAll(
+                        KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot));
+                ownedSlots.add(snapshot.variantRepair().cargoRawSlot());
+                ownedSlots.add(snapshot.variantRepair().auditedIncomingRawSlot());
+            }
+            if (variantStagingResume) {
+                if (!KitFulfillmentCoordinator.verifiedVariantStagingBoundary(snapshot))
+                    return "variant_staging_cargo_changed";
+                ownedSlots.addAll(
+                        KitFulfillmentCoordinator.variantPendingSourceSlots(snapshot));
+                ownedSlots.add(snapshot.variantRepair().cargoRawSlot());
+                ownedSlots.add(snapshot.variantRepair().displacedRawSlot());
+            }
+            if ("resume_borrowed_inventory_source".equals(snapshot.blocker())
+                    || heldBoxResume) {
+                int sourceSlot = KitFulfillmentCoordinator.uniqueBorrowedInventorySourceSlot(snapshot);
+                if (sourceSlot < 0) return "borrowed_inventory_source_unverified";
+                ownedSlots.add(sourceSlot);
+            }
+            if (returningSource || verifyingFailedReturn) {
+                if (snapshot.sourceBoxesToReturn().size() == 1) {
+                    int returnSlot = KitFulfillmentCoordinator.uniqueSourceReturnSlot(snapshot);
+                    if (returnSlot < 0) return "borrowed_source_return_unverified";
+                    ownedSlots.add(returnSlot);
+                } else {
+                    if (!returningSource) return "borrowed_source_return_unverified";
+                    Set<Integer> returnSlots =
+                            KitFulfillmentCoordinator.verifiedPendingSourceSlots(snapshot);
+                    if (returnSlots.size() != snapshot.sourceBoxesToReturn().size())
+                        return "borrowed_source_return_unverified";
+                    ownedSlots.addAll(returnSlots);
+                }
+            }
+            Map<String, Integer> keepRules = database.loadKeepItems();
+            var inventoryAdmission = KitInventoryAdmissionPolicy.inspectLive(keepRules, ownedSlots);
+            if (inventoryAdmission == null) return "inventory_keep_policy_unavailable";
+            if (!inventoryAdmission.accepted()) {
+                String disposition = kitUnexpectedInventoryDisposition(inventoryAdmission);
+                debugRecorder.record("kit_inventory_admission_rejected",
+                        "phase=resume, " + disposition);
+                return "unexpected_inventory_slots:" + inventoryAdmission.unexpectedSlots()
+                        + "; " + disposition;
+            }
+            kitFulfillment.setInventoryKeepRules(keepRules);
+            return kitFulfillment.resumeFromCheckpoint(snapshot, candidates,
+                    config.pos1, config.pos2, excluded, index.getImportChests())
+                    ? null : "owned_inventory_unverified";
+        } catch (Exception e) {
+            debugRecorder.record("kit_resume_error", "kit=" + snapshot.kitName(), e);
+            return "resume_preflight_error";
+        }
+    }
+
+    private String kitUnexpectedInventoryDisposition(KitInventoryAdmissionPolicy.Result admission)
+            throws SQLException {
+        return KitInventoryDispositionPolicy.plan(admission.unexpectedItems(),
+                        database.loadColumnAssignments(), database.loadImportChests()).stream()
+                .map(decision -> decision.rawSlot() + "=" + decision.route())
+                .collect(java.util.stream.Collectors.joining(",", "disposition=[", "]"));
+    }
+
+    private boolean inConfiguredRegion(ContainerEntry entry) {
+        return entry.x() >= Math.min(config.pos1[0], config.pos2[0])
+                && entry.x() <= Math.max(config.pos1[0], config.pos2[0])
+                && entry.y() >= Math.min(config.pos1[1], config.pos2[1])
+                && entry.y() <= Math.max(config.pos1[1], config.pos2[1])
+                && entry.z() >= Math.min(config.pos1[2], config.pos2[2])
+                && entry.z() <= Math.max(config.pos1[2], config.pos2[2]);
+    }
+
+    private int kitSafeFoodCount() {
+        int total = 0;
+        for (var entry : playerInventoryCounts().entrySet()) {
+            var food = FoodRegistry.REGISTRY.get(entry.getKey());
+            if (food != null && food.isSafeFood() && autoEatAccepts(entry.getKey())) {
+                total += entry.getValue();
+            }
+        }
+        return total;
     }
 
     private boolean startKitRetrieval(String requestName, Map<String, Integer> kitItems,
@@ -921,17 +6203,26 @@ public class StashManagerModule extends Module {
     }
 
     private Set<Long> getReservedContainerKeys() {
+        Set<Long> reserved = getScanExcludedContainerKeys();
+        // Output chests are visible to scans for capacity checks, but never supply cargo.
+        for (int[] pos : index.getExportChests()) {
+            reserved.add(posKey(pos[0], pos[1], pos[2]));
+        }
+        // The generic retriever must not spend another kit's reserved working stock.
+        for (int[] pos : index.getKitWorkingChests()) {
+            reserved.add(posKey(pos[0], pos[1], pos[2]));
+        }
+        return reserved;
+    }
+
+    private Set<Long> getScanExcludedContainerKeys() {
         Set<Long> reserved = new HashSet<>();
         for (int[] pos : config.supplyChests) {
             if (pos != null && pos.length >= 3) reserved.add(posKey(pos[0], pos[1], pos[2]));
         }
 
-        // Protected and output inventories are never retrieval sources. Export chests are
-        // terminal delivery ports; blacklisted chests remain entirely user-owned.
+        // Protected inventories remain user-owned and are never scan targets.
         for (int[] pos : index.getBlacklistedChests()) {
-            reserved.add(posKey(pos[0], pos[1], pos[2]));
-        }
-        for (int[] pos : index.getExportChests()) {
             reserved.add(posKey(pos[0], pos[1], pos[2]));
         }
 
@@ -967,7 +6258,36 @@ public class StashManagerModule extends Module {
 
     // Start a scan. Returns true if started.
     public boolean startScan() {
-        String blocker = getScanStartBlocker();
+        if (config.pos1 == null || config.pos2 == null) {
+            warn("Cannot start scan: region not defined");
+            return false;
+        }
+        boolean started = startScanRegion(new DatabaseManager.SavedRegion(
+                "pos1/pos2", config.pos1, config.pos2), false);
+        if (started) pendingScanRegions.clear();
+        return started;
+    }
+
+    /** Scan saved regions in order, with a separate snapshot and history row for each. */
+    public boolean startScanRegions(List<DatabaseManager.SavedRegion> regions) {
+        if (regions == null || regions.isEmpty()) return false;
+        List<DatabaseManager.SavedRegion> snapshots = new ArrayList<>(regions.size());
+        for (var region : regions) {
+            if (region == null || region.pos1() == null || region.pos2() == null
+                    || region.pos1().length < 3 || region.pos2().length < 3) return false;
+            snapshots.add(new DatabaseManager.SavedRegion(
+                    region.name(), Arrays.copyOf(region.pos1(), 3),
+                    Arrays.copyOf(region.pos2(), 3), region.role()));
+        }
+        if (!startScanRegion(snapshots.get(0), true)) return false;
+        pendingScanRegions.clear();
+        pendingScanRegions.addAll(snapshots.subList(1, snapshots.size()));
+        scanRegionHandoffWaitTicks = 0;
+        return true;
+    }
+
+    private boolean startScanRegion(DatabaseManager.SavedRegion region, boolean named) {
+        String blocker = getScanStartBlocker(region.pos1(), region.pos2(), named);
         if (blocker != null) {
             warn("Cannot start scan: {}", blocker);
             recordAndFireScanFailure("scan_start_blocked", Map.of("reason", blocker));
@@ -975,6 +6295,9 @@ public class StashManagerModule extends Module {
         }
 
         resetScanState();
+        activeScanPos1 = Arrays.copyOf(region.pos1(), 3);
+        activeScanPos2 = Arrays.copyOf(region.pos2(), 3);
+        activeScanRegionName = region.name();
         latestScanTrusted = false;
 
         // Clear any existing Baritone state before starting
@@ -986,6 +6309,12 @@ public class StashManagerModule extends Module {
         startY = playerCache.getY();
         startZ = playerCache.getZ();
         hasStartPosition = true;
+        scanTransitX = startX;
+        scanTransitY = startY;
+        scanTransitZ = startZ;
+        scanTransitActive = named && ScanNavigationPolicy.isOutsideRegionEnvelope(
+                startX, startY, startZ, activeScanPos1, activeScanPos2,
+                SCAN_HORIZONTAL_RECOVERY_MARGIN, SCAN_VERTICAL_RECOVERY_MARGIN);
         info("Recorded starting position: {}, {}, {}",
             String.format("%.1f", startX), String.format("%.1f", startY), String.format("%.1f", startZ));
 
@@ -995,20 +6324,30 @@ public class StashManagerModule extends Module {
         // Record scan in DB
         if (database != null && database.isInitialized()) {
             try {
-                currentScanId = database.recordScanStart(config.pos1, config.pos2);
+                currentScanId = database.recordScanStart(activeScanPos1, activeScanPos2);
             } catch (Exception e) {
                 warn("Failed to record scan start in database: {}", e.getMessage());
                 debugRecorder.record("scan_start_db_error", "Failed to record scan start", e);
                 fireWebhookEvent("scan_start_db_error", Map.of("message", e.getMessage()));
             }
         }
+        if (named && currentScanId < 0) {
+            restoreBaritoneBreaking();
+            activeScanPos1 = null;
+            activeScanPos2 = null;
+            activeScanRegionName = null;
+            scanTransitActive = false;
+            hasStartPosition = false;
+            return false;
+        }
 
         state = ScanState.ZONE_SCANNING;
-        info("Starting container scan in region ({}) to ({})",
-            formatPos(config.pos1), formatPos(config.pos2));
+        info("Starting container scan for {} in region ({}) to ({})",
+            activeScanRegionName, formatPos(activeScanPos1), formatPos(activeScanPos2));
         debugRecorder.record("scan_started",
-            "pos1=" + formatPos(config.pos1)
-                + ", pos2=" + formatPos(config.pos2)
+            "region=" + activeScanRegionName
+                + ", pos1=" + formatPos(activeScanPos1)
+                + ", pos2=" + formatPos(activeScanPos2)
                 + ", start_position=" + String.format("%.1f, %.1f, %.1f", startX, startY, startZ));
         requestFoodContingency("scan_started");
         return true;
@@ -1025,6 +6364,17 @@ public class StashManagerModule extends Module {
 
     private void abortScan(String reason, boolean returnAfterAbort) {
         if (state == ScanState.IDLE) return;
+        if (state == ScanState.DONE) {
+            if (!pendingScanRegions.isEmpty()) {
+                info("Multi-region scan stopped before the next region ({} remaining)",
+                        pendingScanRegions.size());
+                pendingScanRegions.clear();
+                scanRegionHandoffWaitTicks = 0;
+            }
+            return;
+        }
+        pendingScanRegions.clear();
+        scanRegionHandoffWaitTicks = 0;
 
         if (foodContingencyJob == JobContinuanceManager.Job.SCAN) {
             resetFoodContingency();
@@ -1083,6 +6433,10 @@ public class StashManagerModule extends Module {
             clearOwnedAutomation();
             lateOpenQuarantineTicks = 0;
             connectionRecoveryTracker.reset();
+            activeScanPos1 = null;
+            activeScanPos2 = null;
+            activeScanRegionName = null;
+            scanTransitActive = false;
         }
     }
 
@@ -1121,9 +6475,26 @@ public class StashManagerModule extends Module {
     public double getStartX() { return startX; }
     public double getStartY() { return startY; }
     public double getStartZ() { return startZ; }
+    public @Nullable String getActiveScanRegionName() { return activeScanRegionName; }
+    public int getRemainingScanRegions() { return pendingScanRegions.size(); }
 
     public @Nullable String getScanStartBlocker() {
-        if (config.pos1 == null || config.pos2 == null) {
+        return getScanStartBlocker(config.pos1, config.pos2, false);
+    }
+
+    public @Nullable String getScanStartBlocker(List<DatabaseManager.SavedRegion> regions) {
+        if (regions == null || regions.isEmpty()) return "no saved regions selected";
+        var region = regions.get(0);
+        return getScanStartBlocker(region.pos1(), region.pos2(), true);
+    }
+
+    private @Nullable String getScanStartBlocker(int[] pos1, int[] pos2, boolean named) {
+        if (hasWorkingFillCheckpoint()) return "kit working-stock fill checkpoint requires review";
+        if (kitJournal.exists()) return "kit fulfillment checkpoint requires recovery or manual review";
+        if (named && (database == null || !database.isInitialized())) {
+            return "database not connected; named scans require persisted scan history";
+        }
+        if (pos1 == null || pos2 == null || pos1.length < 3 || pos2.length < 3) {
             return "region not defined (set pos1 and pos2 first)";
         }
         if (state != ScanState.IDLE && state != ScanState.DONE) {
@@ -1140,12 +6511,19 @@ public class StashManagerModule extends Module {
         }
         String automationBlocker = getAutomationUnavailableReason();
         if (automationBlocker != null) return automationBlocker;
-        return isBotOutsideScanEnvelope()
-                ? "bot is outside the configured stash area; move it near the region before scanning"
+        var player = CACHE.getPlayerCache();
+        return ScanNavigationPolicy.isOutsideRegionEnvelope(
+                player.getX(), player.getY(), player.getZ(), pos1, pos2,
+                named ? NAMED_SCAN_START_HORIZONTAL_MARGIN : SCAN_HORIZONTAL_RECOVERY_MARGIN,
+                named ? NAMED_SCAN_START_VERTICAL_MARGIN : SCAN_VERTICAL_RECOVERY_MARGIN)
+                ? named
+                    ? "bot is too far from the selected region; move it within 128 blocks before scanning"
+                    : "bot is outside the configured stash area; move it near the region before scanning"
                 : null;
     }
 
     public @Nullable String getReturnToStartBlocker() {
+        if (hasWorkingFillCheckpoint()) return "kit working-stock fill checkpoint requires review";
         if (!hasStartPosition) {
             return "no starting position recorded";
         }
@@ -1174,6 +6552,36 @@ public class StashManagerModule extends Module {
     // Tick Handlers
     private void onControllingPlayerLogin(PlayerLoginEvent.Post event) {
         if (!event.session().isActivePlayer()) return;
+
+        if (kitFulfillment.isActive()) {
+            kitFulfillment.interruptForRecovery("proxy_control",
+                    Math.max(1, config.scanPreemptionCooldownSeconds));
+        }
+        if (kitJournal.exists() && !(organizer != null && organizer.isActive()
+                && organizer.isInventoryRecoveryOnly())) {
+            try {
+                var checkpoint = kitJournal.load().orElse(null);
+                if (checkpoint != null && checkpoint.resumeNotBeforeEpochMilli() > 0) {
+                    var update = jobContinuanceManager.beginControl(JobContinuanceManager.Job.KIT,
+                            System.nanoTime(), Math.max(1, config.proxyControlGraceSeconds));
+                    if (update.transition() == JobContinuanceManager.Transition.CONTROL_STARTED) {
+                        controllingPlayerName = event.session().getName();
+                        notifications.sendProxyControlWarning(controllingPlayerName, "kit",
+                                Math.max(1, config.proxyControlGraceSeconds),
+                                Math.max(1, config.scanPreemptionCooldownSeconds),
+                                checkpoint.kitWorksite() != null
+                                        || checkpoint.borrowedSourceWorksite() != null);
+                    }
+                }
+            } catch (IOException e) {
+                debugRecorder.record("kit_proxy_control_checkpoint_unreadable", e.getMessage());
+            }
+            event.session().sendAsyncAlert(
+                    "<yellow>Kit fulfillment paused.</yellow> <gray>Its checkpoint is saved. "
+                            + "Safe phases will resume after the configured cooldown when you release control; "
+                            + "uncertain item moves require review. Check <white>/stash kit job</white>.</gray>");
+            return;
+        }
 
         JobContinuanceManager.Job job = activeResumableJob();
         if (job == JobContinuanceManager.Job.NONE) {
@@ -1252,6 +6660,20 @@ public class StashManagerModule extends Module {
         } else if (expiredJob == JobContinuanceManager.Job.SCAN
                 && state != ScanState.IDLE && state != ScanState.DONE) {
             abortScan("proxy_control_grace_expired");
+        } else if (expiredJob == JobContinuanceManager.Job.KIT) {
+            cancelKitScheduledResume();
+            debugRecorder.record("kit_resume_grace_expired",
+                    "controller=" + controller + ", checkpoint_preserved=true");
+            notifications.sendProxyControlKitReview(controller,
+                    Math.max(1, config.proxyControlGraceSeconds));
+            var activePlayer = Proxy.getInstance().getActivePlayer();
+            if (activePlayer != null) {
+                activePlayer.sendAsyncAlert("<yellow>Kit auto-resume canceled.</yellow> "
+                        + "<gray>The checkpoint is saved. Review <white>/stash kit job</white> "
+                        + "before scheduling another resume.</gray>");
+            }
+            controllingPlayerName = null;
+            return;
         }
 
         debugRecorder.record("proxy_control_grace_expired",
@@ -1300,6 +6722,34 @@ public class StashManagerModule extends Module {
     }
 
     private void onTickStopped(ClientBotTick.Stopped event) {
+        if (kitWorkingRecovery != null) {
+            kitWorkingRecovery.interrupt("bot_ticks_stopped");
+            kitWorkingRecovery = null;
+            lastKitWorkingPreparationResult = "bot_ticks_stopped";
+        }
+        if (kitWorkingReservation != null) {
+            kitWorkingReservation.interrupt("bot_ticks_stopped");
+            kitWorkingReservation = null;
+            kitWorkingReservationPlan = null;
+            kitWorkingReservationScan = null;
+            kitWorkingReservationClaims = Map.of();
+            kitWorkingReservationPosition = null;
+            lastKitWorkingPreparationResult = "bot_ticks_stopped";
+        }
+        if (kitWorkingPreparation != null) {
+            kitWorkingPreparation.interrupt("bot_ticks_stopped");
+            kitWorkingPreparation = null;
+            lastKitWorkingPreparationResult = "bot_ticks_stopped";
+        }
+        try {
+            kitWorkingFill.forceReview("bot_ticks_stopped");
+        } catch (IOException e) {
+            debugRecorder.record("kit_working_fill_checkpoint_error", e.getMessage());
+        }
+        if (kitFulfillment.isActive()) {
+            kitFulfillment.interruptForRecovery("bot_ticks_stopped",
+                    Math.max(1, config.scanPreemptionCooldownSeconds));
+        }
         if (reequipActive) {
             debugRecorder.record("reequip_interrupted", "reason=bot_control_stopped");
             resetKeepReequip();
@@ -1350,6 +6800,10 @@ public class StashManagerModule extends Module {
                     "reason=replacement_session_connected, manual_disconnect="
                             + event.manualDisconnect());
             return;
+        }
+        if (kitFulfillment.isActive()) {
+            kitFulfillment.interruptForRecovery("client_disconnect",
+                    Math.max(1, config.scanPreemptionCooldownSeconds));
         }
         beginConnectionOutage(event.reason(), event.manualDisconnect(), "client_disconnect");
         if (retriever.isActive()) {
@@ -1726,11 +7180,24 @@ public class StashManagerModule extends Module {
                 if (state != ScanState.YIELDED) beginScannerYield();
                 yield state == ScanState.YIELDED;
             }
-            case NONE -> false;
+            case NONE, KIT -> false;
         };
     }
 
     private boolean startFoodContingencyRetrieval(FoodContingencyPolicy.Plan plan) {
+        boolean directFoodAroundPackedHandoff = foodContingencyJob == JobContinuanceManager.Job.ORGANIZE
+                && organizer != null && organizer.hasUnresolvedPackedHandoff()
+                && organizer.canRefillFoodWithoutTouchingPackedHandoff();
+        if (foodContingencyJob == JobContinuanceManager.Job.ORGANIZE
+                && organizer != null
+                && (organizer.hasTemporaryShulkerOutstanding()
+                    || organizer.hasUnresolvedPackedHandoff())
+                && !directFoodAroundPackedHandoff) {
+            // A normal retrieval can borrow the organizer's in-flight box. Only the
+            // exact, inventory-verified handoff may use direct loose stock instead.
+            blockFoodContingency("organizer_temporary_shulker_unresolved");
+            return true;
+        }
         if (isBotOutsideScanEnvelope()) {
             blockFoodContingency("bot_outside_stash_region");
             return true;
@@ -1759,19 +7226,21 @@ public class StashManagerModule extends Module {
                         + ", trigger=" + foodContingencyTrigger
                         + ", requested=" + plan.requested()
                         + ", current_food_units=" + plan.currentFoodUnits()
-                        + ", target_food_units=" + plan.targetFoodUnits());
+                        + ", target_food_units=" + plan.targetFoodUnits()
+                        + ", direct_contents_only=" + directFoodAroundPackedHandoff);
         boolean started = retriever.startKit(
                 FOOD_CONTINGENCY_REQUEST,
                 plan.requested(),
                 entries,
-                config.pos1,
-                config.pos2,
+                foodContingencyJob == JobContinuanceManager.Job.SCAN ? scanPos1() : config.pos1,
+                foodContingencyJob == JobContinuanceManager.Job.SCAN ? scanPos2() : config.pos2,
                 getReservedContainerKeys(),
                 true,
                 foodContingencyJob == JobContinuanceManager.Job.ORGANIZE && organizer != null
                         ? organizer.getReconciliationStation() : null,
                 foodContingencyJob == JobContinuanceManager.Job.ORGANIZE && organizer != null
-                        ? organizer.getReconciliationWorksite() : null);
+                        ? organizer.getReconciliationWorksite() : null,
+                -1, null, directFoodAroundPackedHandoff);
         if (!started && foodContingencyActive) {
             foodContingencyActive = false;
             StashRetriever.StartFailureReason failure = retriever.getLastStartFailureReason();
@@ -1958,7 +7427,7 @@ public class StashManagerModule extends Module {
         return switch (foodContingencyJob) {
             case ORGANIZE -> organizer != null && organizer.isActive();
             case SCAN -> state != ScanState.IDLE && state != ScanState.DONE;
-            case NONE -> false;
+            case NONE, KIT -> false;
         };
     }
 
@@ -2032,8 +7501,151 @@ public class StashManagerModule extends Module {
         // Tick TravelManager independently (it manages its own state)
         com.zenith.plugin.stashmanager.travel.TravelManager.get().tick();
         tunnelNetworkSyncWorker.tick();
+        sampleAutomationPose();
+
+        if (kitWorkingRecovery != null) {
+            if (!workingFillOwnsAutomation() || getAutomationUnavailableReason() != null) {
+                kitWorkingRecovery.interrupt("exclusive_automation_owner_lost");
+                kitWorkingRecovery = null;
+                lastKitWorkingPreparationResult = "exclusive_automation_owner_lost";
+                return;
+            }
+            try {
+                var audited = kitWorkingRecovery.tick();
+                if (audited.ready()) {
+                    kitWorkingFill.resumeAudited(kitWorkingRecovery);
+                    kitWorkingRecovery = null;
+                    lastKitWorkingPreparationResult = "reviewed transfer recovered at "
+                            + audited.next();
+                } else if (audited.blocker() != null) {
+                    lastKitWorkingPreparationResult = audited.blocker();
+                    kitWorkingRecovery = null;
+                }
+            } catch (Exception e) {
+                if (kitWorkingRecovery != null)
+                    kitWorkingRecovery.interrupt("recovery_audit_failed");
+                kitWorkingRecovery = null;
+                lastKitWorkingPreparationResult = "recovery_audit_failed: " + e.getMessage();
+                debugRecorder.record("kit_working_recovery_error", e.getMessage());
+            }
+            return;
+        }
+
+        if (kitWorkingReservation != null) {
+            if (!workingFillOwnsAutomation() || getAutomationUnavailableReason() != null) {
+                kitWorkingReservation.interrupt("exclusive_automation_owner_lost");
+                kitWorkingReservation = null;
+                kitWorkingReservationPlan = null;
+                kitWorkingReservationScan = null;
+                kitWorkingReservationClaims = Map.of();
+                kitWorkingReservationPosition = null;
+                lastKitWorkingPreparationResult = "exclusive_automation_owner_lost";
+                return;
+            }
+            try {
+                var audited = kitWorkingReservation.tick();
+                if (audited.verified()) {
+                    boolean release = kitWorkingReservationRelease;
+                    int[] position = kitWorkingReservationPosition;
+                    var plan = kitWorkingReservationPlan;
+                    var scan = kitWorkingReservationScan;
+                    var claims = kitWorkingReservationClaims;
+                    kitWorkingReservation = null;
+                    kitWorkingReservationPlan = null;
+                    kitWorkingReservationScan = null;
+                    kitWorkingReservationClaims = Map.of();
+                    kitWorkingReservationPosition = null;
+                    kitWorkingReservationRelease = false;
+                    if (release) {
+                        int count = database.releasePendingKitWorkingChest(position,
+                                audited.verifiedAtEpochMilli());
+                        lastKitWorkingPreparationResult = "released " + count
+                                + " unused working slots";
+                    } else {
+                        database.reserveKitWorkingManifest(plan, config.pos1, config.pos2,
+                                scan, audited.verifiedAtEpochMilli(), claims);
+                        lastKitWorkingPreparationResult = "reserved " + plan.slots().size()
+                                + " pending working slots";
+                    }
+                    try {
+                        index.refreshKitWorkingChests();
+                    } catch (Exception refreshError) {
+                        lastKitWorkingPreparationResult += "; role cache refresh failed: "
+                                + refreshError.getMessage();
+                        debugRecorder.record("kit_working_role_refresh_error",
+                                refreshError.getMessage());
+                    }
+                } else if (audited.blocker() != null) {
+                    lastKitWorkingPreparationResult = audited.blocker();
+                    kitWorkingReservation = null;
+                    kitWorkingReservationPlan = null;
+                    kitWorkingReservationScan = null;
+                    kitWorkingReservationClaims = Map.of();
+                    kitWorkingReservationPosition = null;
+                    kitWorkingReservationRelease = false;
+                }
+            } catch (Exception e) {
+                if (kitWorkingReservation != null)
+                    kitWorkingReservation.interrupt("empty_chest_audit_failed");
+                kitWorkingReservation = null;
+                kitWorkingReservationPlan = null;
+                kitWorkingReservationScan = null;
+                kitWorkingReservationClaims = Map.of();
+                kitWorkingReservationPosition = null;
+                kitWorkingReservationRelease = false;
+                lastKitWorkingPreparationResult = "reservation_failed: " + e.getMessage();
+                debugRecorder.record("kit_working_reservation_error", e.getMessage());
+            }
+            return;
+        }
+
+        if (kitWorkingPreparation != null) {
+            if (!workingFillOwnsAutomation() || getAutomationUnavailableReason() != null) {
+                kitWorkingPreparation.interrupt("exclusive_automation_owner_lost");
+                kitWorkingPreparation = null;
+                lastKitWorkingPreparationResult = "exclusive_automation_owner_lost";
+                return;
+            }
+            try {
+                var preparation = kitWorkingPreparation.tick();
+                if (preparation.ready()) {
+                    kitWorkingPreparation = null;
+                    String blocker = startKitWorkingFill(preparation.tickets());
+                    lastKitWorkingPreparationResult = blocker == null
+                            ? "live source probe complete; fill started" : blocker;
+                } else if (preparation.blocker() != null) {
+                    lastKitWorkingPreparationResult = preparation.blocker();
+                    kitWorkingPreparation = null;
+                }
+            } catch (Exception e) {
+                kitWorkingPreparation.interrupt("source_probe_failed");
+                kitWorkingPreparation = null;
+                lastKitWorkingPreparationResult = "source_probe_failed";
+                debugRecorder.record("kit_working_source_probe_error", e.getMessage());
+            }
+            return;
+        }
+
+        try {
+            var workingJob = kitWorkingFillJournal.load().orElse(null);
+            if (workingJob != null && workingJob.status() == KitWorkingFillJournal.Status.RUNNING) {
+                if (!workingFillOwnsAutomation()) {
+                    kitWorkingFill.forceReview("exclusive_automation_owner_lost");
+                } else {
+                    kitWorkingFill.tick();
+                }
+                return;
+            }
+        } catch (IOException e) {
+            debugRecorder.record("kit_working_fill_checkpoint_error", e.getMessage());
+            return;
+        }
 
         if (!CACHE.getPlayerCache().getThePlayer().isAlive()) {
+            if (kitFulfillment.isActive()) {
+                kitFulfillment.interruptForRecovery("bot_death",
+                        Math.max(1, config.scanPreemptionCooldownSeconds));
+            }
             if (reequipActive) {
                 if (retriever.isActive()) retriever.stop();
                 resetKeepReequip();
@@ -2055,6 +7667,39 @@ public class StashManagerModule extends Module {
         }
         probeFoodSafety();
 
+        if (com.zenith.plugin.stashmanager.kit.KitCrystalOverflowReturn.pending()
+                && com.zenith.plugin.stashmanager.kit.KitCrystalOverflowReturn.tick(
+                        kitExporter, kitJournal)) return;
+
+        if (kitFulfillment.isActive()) {
+            if (CACHE.getPlayerCache().getThePlayer().getFood() <= 8
+                    && kitSafeFoodCount() == 0) {
+                kitFulfillment.interruptForRecovery("food_exhausted",
+                        Math.max(1, config.scanPreemptionCooldownSeconds));
+                return;
+            }
+            if (retriever.isActive()) retriever.tick();
+            kitFulfillment.tick();
+            return;
+        }
+        if (kitJournal.exists() && !(organizer != null && organizer.isActive()
+                && organizer.isInventoryRecoveryOnly())) {
+            if (kitRecovery.state() == KitWorksiteRecovery.State.DONE) {
+                try {
+                    var checkpoint = kitJournal.load().orElse(null);
+                    if (checkpoint != null && (checkpoint.kitWorksite() != null
+                            || checkpoint.borrowedSourceWorksite() != null)) {
+                        kitRecovery.retry();
+                    }
+                } catch (IOException e) {
+                    debugRecorder.record("kit_recovery_checkpoint_unreadable", e.getMessage());
+                }
+            }
+            if (!retriever.isActive()) kitRecovery.tick();
+            tickScheduledKitResume();
+            return;
+        }
+
         if (tickFoodContingency()) return;
 
         // Delegate tick to organizer when active
@@ -2062,6 +7707,18 @@ public class StashManagerModule extends Module {
             if (organizer.isYielded()) {
                 tickOrganizerYielded();
                 return;
+            }
+            if (organizer.isInventoryRecoveryOnly()) {
+                try {
+                    var savedKit = kitJournal.load().orElse(null);
+                    if (!kitAllowsInventoryReconciliation(savedKit)) {
+                        beginOrganizerYield("kit_owned_shell_or_checkpoint_changed");
+                        return;
+                    }
+                } catch (Exception e) {
+                    beginOrganizerYield("kit_checkpoint_unreadable");
+                    return;
+                }
             }
             if (organizer.wasAutomationPreempted()) {
                 if (!beginOrganizerYield("shared_automation")) {
@@ -2097,6 +7754,10 @@ public class StashManagerModule extends Module {
             return;
         }
 
+        if (state == ScanState.DONE && !pendingScanRegions.isEmpty()) {
+            tickPendingScanRegion();
+            return;
+        }
         if (state == ScanState.IDLE || state == ScanState.DONE) return;
 
         if (state == ScanState.YIELDED) {
@@ -2114,6 +7775,7 @@ public class StashManagerModule extends Module {
         switch (state) {
             case ZONE_SCANNING -> tickZoneScanning();
             case WALKING -> tickWalking();
+            case APPROACHING -> tickApproaching();
             case OPENING -> tickOpening();
             case READING -> tickReading();
             case CLOSING -> tickClosing();
@@ -2132,7 +7794,7 @@ public class StashManagerModule extends Module {
         int remainingCapacity = Math.max(0, config.maxContainers - discoveredContainerKeys.size());
         List<ContainerLocation> found = remainingCapacity > 0
             ? regionScanner.scanRegion(
-                config.pos1, config.pos2, remainingCapacity, getReservedContainerKeys())
+                scanPos1(), scanPos2(), remainingCapacity, getScanExcludedContainerKeys())
             : List.of();
 
         int newlyQueued = 0;
@@ -2157,7 +7819,7 @@ public class StashManagerModule extends Module {
                 + ", queue_entries=" + Math.max(0, pendingContainers.size() - currentContainerIndex - 1));
 
         // Check for chunks beyond render distance
-        var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
+        var unscanned = regionScanner.getUnscannedChunks(scanPos1(), scanPos2());
         if (!unscanned.isEmpty() && containersFound < config.maxContainers) {
             info("{} chunks still unloaded — will walk to load them", unscanned.size());
         }
@@ -2200,6 +7862,7 @@ public class StashManagerModule extends Module {
         // Always check distance — may have arrived regardless of Baritone state
         if (isAtContainerAccessPosition(target)) {
             stopOwnedBaritoneProcess();
+            scanWalkProgress.reset();
             walkRetryCount = 0;
             state = ScanState.OPENING;
             containerOpenGate.reset();
@@ -2207,6 +7870,7 @@ public class StashManagerModule extends Module {
             openTimeoutCounter = 0;
             openInteractionAttempts = 0;
             lastOpenInteractionTick = -1;
+            scanOpenClickTarget = null;
             containerDataReceived = false;
             return;
         }
@@ -2214,13 +7878,20 @@ public class StashManagerModule extends Module {
         // Zenith's diagonal movement cannot click a closed door on its path.
         if (beginScanDoorOpening()) return;
 
-        // Timeout failsafe
-        if (walkingTickCount >= WALK_TIMEOUT_TICKS) {
-            warn("Walking timeout for container at {} (dist={})",
-                currentContainerPos(), String.format("%.1f", dist));
+        // A distant container can take longer than 30 seconds even while pathing normally.
+        var player = CACHE.getPlayerCache();
+        if (scanWalkProgress.stalled(player.getX(), player.getY(), player.getZ())) {
+            recordPoseTrace("scan_walk_timeout", "target=" + currentContainerPos()
+                    + ", idle_ticks=" + scanWalkProgress.idleTicks());
+            warn("Walking timeout for container at {} (dist={}, elapsed_ticks={}, idle_ticks={})",
+                currentContainerPos(), String.format("%.1f", dist),
+                scanWalkProgress.elapsedTicks(), scanWalkProgress.idleTicks());
+            if (tryAlternateScanApproach(target, "container_walk_timeout")) return;
             retryCurrentContainerAtTail("container_walk_timeout", Map.of(
                 "container", currentContainerPos(),
-                "distance", String.format("%.1f", dist)));
+                "distance", String.format("%.1f", dist),
+                "elapsed_ticks", scanWalkProgress.elapsedTicks(),
+                "idle_ticks", scanWalkProgress.idleTicks()));
             stopOwnedBaritoneProcess();
             advanceToNextContainer();
             return;
@@ -2228,15 +7899,21 @@ public class StashManagerModule extends Module {
 
         // Use CustomGoalProcess.isActive() — not Baritone.isActive() which depends on
         // runtime gates (chunks loaded, teleport delay) that may not have passed yet
-        if (!BARITONE.getCustomGoalProcess().isActive()) {
+        if (ScanPathRetryCadence.shouldHandleInactive(
+                BARITONE.getCustomGoalProcess().isActive(),
+                walkingTickCount, lastContainerPathRequestTick,
+                PATH_RETRY_SETTLE_TICKS)) {
             if (walkRetryCount < MAX_WALK_RETRIES) {
                 walkRetryCount++;
-                info("Re-pathing to container at {}, {}, {} (dist={}, attempt={})",
-                    target.x(), target.y(), target.z(), String.format("%.1f", dist), walkRetryCount);
+                info("Re-pathing to container at {}, {}, {} (dist={}, attempt={}, path_age_ticks={})",
+                    target.x(), target.y(), target.z(), String.format("%.1f", dist),
+                    walkRetryCount, walkingTickCount - lastContainerPathRequestTick);
                 pathToContainer(target);
             } else {
-                warn("Failed to reach container at {}, {}, {} after {} attempts (dist={})",
-                    target.x(), target.y(), target.z(), MAX_WALK_RETRIES, String.format("%.1f", dist));
+                warn("Failed to reach container at {}, {}, {} after {} attempts (dist={}, path_age_ticks={})",
+                    target.x(), target.y(), target.z(), MAX_WALK_RETRIES,
+                    String.format("%.1f", dist), walkingTickCount - lastContainerPathRequestTick);
+                if (tryAlternateScanApproach(target, "container_unreachable")) return;
                 retryCurrentContainerAtTail("container_unreachable", Map.of(
                     "container", target.x() + ", " + target.y() + ", " + target.z(),
                     "distance", String.format("%.1f", dist),
@@ -2353,6 +8030,16 @@ public class StashManagerModule extends Module {
 
     private void tickOpening() {
         if (containerDataReceived) {
+            ContainerLocation opened = currentContainer();
+            if (opened != null) {
+                rejectedScanStances.remove(opened.posKey());
+                scanAlternateAttempts.remove(opened.posKey());
+            }
+            if (scanOpenClickTarget != null) {
+                debugRecorder.record("scan_partner_half_opened",
+                        "container=" + currentContainerPos()
+                                + ", clicked_half=" + scanOpenClickTarget);
+            }
             if (openInteractionAttempts > 1) {
                 debugRecorder.record("scan_open_recovered",
                     "container=" + currentContainerPos()
@@ -2369,14 +8056,45 @@ public class StashManagerModule extends Module {
         if (!prepareStandingContainerInteraction()) return;
         openTimeoutCounter++;
 
+        ContainerLocation target = currentContainer();
+        if (target != null && isChestTarget(target) && !selectVisibleChestHalf(target)) {
+            // The cached raycast is only an approach hint. Zenith may still click a
+            // reachable chest half, so verify that with a bounded GUI-confirmed probe.
+            if (lastOpenInteractionTick >= 0
+                    && openTimeoutCounter - lastOpenInteractionTick
+                    < CONTAINER_INTERACTION_ATTEMPT_TIMEOUT_TICKS) return;
+            if (openInteractionAttempts < ScanChestOpenFallback.MAX_UNVERIFIED_PROBES_PER_STANCE
+                    && selectUnverifiedReachableChestHalf(target, openInteractionAttempts)) {
+                debugRecorder.record("scan_chest_visibility_probe",
+                        "container=" + currentContainerPos()
+                                + ", click_target=" + (scanOpenClickTarget == null
+                                        ? new BlockPos(target.x(), target.y(), target.z())
+                                        : scanOpenClickTarget)
+                                + ", attempt=" + (openInteractionAttempts + 1));
+                interactWithContainer(target);
+                return;
+            }
+            reapproachScannerChest(target, "no_visible_half_after_probe");
+            return;
+        }
+        if (target != null) maybeTryPartnerChestHalf(target);
+
         int effectiveOpenTimeoutTicks = Math.max(
             config.openTimeoutTicks, MIN_CONTAINER_OPEN_TIMEOUT_TICKS);
         if (openTimeoutCounter >= effectiveOpenTimeoutTicks) {
+            if (target != null && isChestTarget(target)) {
+                reapproachScannerChest(target, "open_timeout");
+                return;
+            }
+            recordPoseTrace("scan_open_timeout", "target=" + currentContainerPos()
+                    + ", click_target=" + scanOpenClickTarget
+                    + ", interaction_attempts=" + openInteractionAttempts);
             warn("Timeout waiting for container open at {}", currentContainerPos());
             retryCurrentContainerAtTail("container_open_timeout", Map.of(
                 "container", currentContainerPos(),
                 "timeout_ticks", effectiveOpenTimeoutTicks,
                 "interaction_attempts", openInteractionAttempts,
+                "partner_half_attempted", scanOpenClickTarget != null,
                 "distance", String.format("%.2f", distanceToCurrentContainer())));
             state = ScanState.CLOSING;
             tickCounter = 0;
@@ -2390,9 +8108,215 @@ public class StashManagerModule extends Module {
                 openTimeoutCounter,
                 effectiveOpenTimeoutTicks,
                 CONTAINER_OPEN_RETRY_INTERVAL_TICKS)) {
-            ContainerLocation target = currentContainer();
             if (target != null) interactWithContainer(target);
         }
+    }
+
+    private void maybeTryPartnerChestHalf(ContainerLocation target) {
+        if (!ScanChestOpenFallback.shouldTryPartner(
+                openTimeoutCounter, openInteractionAttempts, scanOpenClickTarget != null)) return;
+        if (target.type() != BlockEntityType.CHEST
+                && target.type() != BlockEntityType.TRAPPED_CHEST) return;
+        try {
+            BlockPos primary = new BlockPos(target.x(), target.y(), target.z());
+            var partner = ScanChestOpenFallback.partner(
+                    DoubleChestIdentity.resolve(target.x(), target.y(), target.z(), true),
+                    primary);
+            if (partner.isEmpty()) return;
+            BlockPos candidate = partner.get();
+            var player = CACHE.getPlayerCache();
+            if (!ContainerApproach.isWithinVanillaReach(
+                    player.getX(), player.getY(), player.getZ(),
+                    candidate.x(), candidate.y(), candidate.z())
+                    || !ContainerAccessPlanner.visible(
+                            player.getX(), player.getY(), player.getZ(),
+                            candidate.x(), candidate.y(), candidate.z())) return;
+            stopOwnedBaritoneProcess();
+            scanOpenClickTarget = candidate;
+            lastOpenInteractionTick = -1;
+            recordPoseTrace("scan_partner_half_selected", "target=" + currentContainerPos()
+                    + ", click_target=" + candidate);
+            info("Trying verified partner half for double chest at {}", currentContainerPos());
+            debugRecorder.record("scan_partner_half_attempt",
+                    "container=" + currentContainerPos()
+                            + ", alternate_half=" + candidate
+                            + ", prior_clicks=" + openInteractionAttempts);
+        } catch (RuntimeException e) {
+            debug("Could not resolve partner half for {}: {}", currentContainerPos(), e.getMessage());
+        }
+    }
+
+    private void tickApproaching() {
+        ContainerLocation target = currentContainer();
+        BlockPos goal = scanAlternateGoal;
+        if (target == null || goal == null) {
+            resumeCurrentContainer();
+            return;
+        }
+        if (beginScanPositionRecoveryIfNeeded(
+                ScanResumeMode.RETRY_CURRENT, "chest_approach_outside_region")) return;
+
+        var player = CACHE.getPlayerCache();
+        boolean arrived = (int) Math.floor(player.getX()) == goal.x()
+                && (int) Math.floor(player.getY()) == goal.y()
+                && (int) Math.floor(player.getZ()) == goal.z();
+        if (arrived) {
+            stopOwnedBaritoneProcess();
+            scanAlternateGoal = null;
+            scanAlternateProgress.reset();
+            // The final Baritone step can change the raycast. Opening owns the
+            // bounded interaction probe before rejecting this stance.
+            selectVisibleChestHalf(target);
+            state = ScanState.OPENING;
+            containerOpenGate.reset();
+            openTimeoutCounter = 0;
+            openInteractionAttempts = 0;
+            lastOpenInteractionTick = -1;
+            debugRecorder.record("scan_chest_approach_arrived",
+                    "container=" + currentContainerPos() + ", stance=" + goal);
+            return;
+        }
+        if (scanAlternateProgress.stalled(goal.x(), goal.y(), goal.z(),
+                player.getX(), player.getY(), player.getZ())) {
+            debugRecorder.record("scan_chest_approach_stalled",
+                    "container=" + currentContainerPos() + ", stance=" + goal
+                            + ", elapsed_ticks=" + scanAlternateProgress.elapsedTicks()
+                            + ", idle_ticks=" + scanAlternateProgress.idleTicks());
+            reapproachScannerChest(target, "alternate_path_stalled");
+        }
+    }
+
+    private boolean isChestTarget(ContainerLocation target) {
+        return target.type() == BlockEntityType.CHEST
+                || target.type() == BlockEntityType.TRAPPED_CHEST;
+    }
+
+    private boolean tryAlternateScanApproach(ContainerLocation target, String reason) {
+        if (!isChestTarget(target)) return false;
+        info("Trying alternate standing position for chest at {} after {}",
+                currentContainerPos(), reason);
+        debugRecorder.record("scan_walk_alternate_approach",
+                "container=" + currentContainerPos() + ", reason=" + reason);
+        reapproachScannerChest(target, reason);
+        return true;
+    }
+
+    private boolean selectVisibleChestHalf(ContainerLocation target) {
+        var player = CACHE.getPlayerCache();
+        BlockPos primary = new BlockPos(target.x(), target.y(), target.z());
+        BlockPos selected = scanOpenClickTarget == null ? primary : scanOpenClickTarget;
+        if (ContainerApproach.isWithinVanillaReach(player.getX(), player.getY(), player.getZ(),
+                selected.x(), selected.y(), selected.z())
+                && ContainerAccessPlanner.visible(player.getX(), player.getY(), player.getZ(),
+                        selected.x(), selected.y(), selected.z())) return true;
+
+        if (scanOpenClickTarget != null
+                && ContainerApproach.isWithinVanillaReach(player.getX(), player.getY(), player.getZ(),
+                        primary.x(), primary.y(), primary.z())
+                && ContainerAccessPlanner.visible(player.getX(), player.getY(), player.getZ(),
+                        primary.x(), primary.y(), primary.z())) {
+            scanOpenClickTarget = null;
+            lastOpenInteractionTick = -1;
+            return true;
+        }
+        try {
+            var partner = ScanChestOpenFallback.partner(
+                    DoubleChestIdentity.resolve(target.x(), target.y(), target.z(), true), primary);
+            if (partner.isPresent()) {
+                BlockPos other = partner.get();
+                if (ContainerApproach.isWithinVanillaReach(player.getX(), player.getY(), player.getZ(),
+                        other.x(), other.y(), other.z())
+                        && ContainerAccessPlanner.visible(player.getX(), player.getY(), player.getZ(),
+                                other.x(), other.y(), other.z())) {
+                    scanOpenClickTarget = other;
+                    lastOpenInteractionTick = -1;
+                    return true;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // A stale partner identity is not evidence of a usable click face.
+        }
+        return false;
+    }
+
+    private boolean selectUnverifiedReachableChestHalf(ContainerLocation target, int priorAttempts) {
+        var player = CACHE.getPlayerCache();
+        BlockPos primary = new BlockPos(target.x(), target.y(), target.z());
+        Optional<BlockPos> partner = Optional.empty();
+        try {
+            partner = ScanChestOpenFallback.partner(
+                    DoubleChestIdentity.resolve(target.x(), target.y(), target.z(), true),
+                    primary);
+        } catch (RuntimeException ignored) {
+            // Unknown partner identity leaves only the primary half available.
+        }
+        var selected = ScanChestOpenFallback.unverifiedProbe(
+                primary, partner, priorAttempts, scanOpenClickTarget != null,
+                candidate -> ContainerApproach.isWithinVanillaReach(
+                        player.getX(), player.getY(), player.getZ(),
+                        candidate.x(), candidate.y(), candidate.z()));
+        if (selected.isEmpty()) return false;
+        scanOpenClickTarget = selected.get().equals(primary) ? null : selected.get();
+        return true;
+    }
+
+    private void reapproachScannerChest(ContainerLocation target, String reason) {
+        var player = CACHE.getPlayerCache();
+        long key = target.posKey();
+        Set<Long> rejected = rejectedScanStances.computeIfAbsent(key, ignored -> new HashSet<>());
+        rejected.add(ContainerOpenReach.stanceKey(player.getX(), player.getY(), player.getZ()));
+        if (scanAlternateGoal != null) {
+            rejected.add(ContainerOpenReach.stanceKey(
+                    scanAlternateGoal.x() + 0.5, scanAlternateGoal.y(), scanAlternateGoal.z() + 0.5));
+        }
+        stopOwnedBaritoneProcess();
+        scanAlternateGoal = null;
+        scanAlternateProgress.reset();
+
+        List<BlockPos> candidates = new ArrayList<>(ContainerAccessPlanner.alternateStances(
+                player.getX(), player.getY(), player.getZ(),
+                target.x(), target.y(), target.z(), rejected));
+        try {
+            var partner = ScanChestOpenFallback.partner(
+                    DoubleChestIdentity.resolve(target.x(), target.y(), target.z(), true),
+                    new BlockPos(target.x(), target.y(), target.z()));
+            partner.ifPresent(other -> candidates.addAll(ContainerAccessPlanner.alternateStances(
+                    player.getX(), player.getY(), player.getZ(),
+                    other.x(), other.y(), other.z(), rejected)));
+        } catch (RuntimeException ignored) {
+            // A single chest still has its primary candidates.
+        }
+        candidates.sort((a, b) -> Double.compare(
+                scanStanceDistanceSquared(player.getX(), player.getY(), player.getZ(), a),
+                scanStanceDistanceSquared(player.getX(), player.getY(), player.getZ(), b)));
+        int attempted = scanAlternateAttempts.getOrDefault(key, 0);
+        if (candidates.isEmpty() || attempted >= MAX_SCAN_ALTERNATE_STANCES) {
+            recordPoseTrace("scan_chest_access_exhausted", "target=" + currentContainerPos()
+                    + ", reason=" + reason + ", alternate_attempts=" + attempted);
+            retryCurrentContainerAtTail("container_no_visible_approach", Map.of(
+                    "container", currentContainerPos(), "reason", reason,
+                    "alternate_attempts", attempted, "rejected_stances", rejected.size(),
+                    "interaction_attempts", openInteractionAttempts));
+            state = ScanState.CLOSING;
+            tickCounter = 0;
+            return;
+        }
+        scanAlternateGoal = candidates.getFirst();
+        scanAlternateAttempts.put(key, attempted + 1);
+        scanOpenClickTarget = null;
+        state = ScanState.APPROACHING;
+        debugRecorder.record("scan_chest_reapproach",
+                "container=" + currentContainerPos() + ", reason=" + reason
+                        + ", stance=" + scanAlternateGoal + ", attempt=" + (attempted + 1)
+                        + ", candidates=" + candidates.size());
+        ownCustomGoal(BARITONE.pathTo(new GoalBlock(scanAlternateGoal)));
+    }
+
+    private static double scanStanceDistanceSquared(double x, double y, double z, BlockPos stance) {
+        double dx = x - (stance.x() + 0.5);
+        double dy = y - stance.y();
+        double dz = z - (stance.z() + 0.5);
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private void tickReading() {
@@ -2412,6 +8336,7 @@ public class StashManagerModule extends Module {
 
         if (success) {
             containersIndexed++;
+            settledContainerKeys.add(loc.posKey());
             markCurrentContainerRecovered();
         } else {
             warn("Failed to read container at {}", currentContainerPos());
@@ -2665,6 +8590,8 @@ public class StashManagerModule extends Module {
         // global BARITONE.stop() here would cancel the very task we are yielding to.
         stopOwnedBaritoneProcess();
         resetScanDoorOpening();
+        scanAlternateGoal = null;
+        scanAlternateProgress.reset();
         clearOwnedAutomation();
         releaseBaritoneBreakingForYield();
         scannerPreemptionGate.yield();
@@ -2730,9 +8657,13 @@ public class StashManagerModule extends Module {
         openTimeoutCounter = 0;
         openInteractionAttempts = 0;
         lastOpenInteractionTick = -1;
+        scanOpenClickTarget = null;
+        scanAlternateGoal = null;
+        scanAlternateProgress.reset();
         containerDataReceived = false;
         walkRetryCount = 0;
         walkingTickCount = 0;
+        scanWalkProgress.reset();
         resetScanDoorOpening();
         if (isAtContainerAccessPosition(target)) {
             containerOpenGate.reset();
@@ -2790,13 +8721,34 @@ public class StashManagerModule extends Module {
     }
 
     // Helpers
+    private int[] scanPos1() {
+        return activeScanPos1 != null ? activeScanPos1 : config.pos1;
+    }
+
+    private int[] scanPos2() {
+        return activeScanPos2 != null ? activeScanPos2 : config.pos2;
+    }
+
     private boolean isBotOutsideScanEnvelope() {
         var playerCache = CACHE.getPlayerCache();
-        return ScanNavigationPolicy.isOutsideRegionEnvelope(
+        if (organizer != null && organizer.isActive()
+                && organizer.isWithinPinnedRouteTransitEnvelope(
+                        playerCache.getX(), playerCache.getY(), playerCache.getZ(),
+                        SCAN_HORIZONTAL_RECOVERY_MARGIN, SCAN_VERTICAL_RECOVERY_MARGIN)) {
+            return false;
+        }
+        boolean outside = ScanNavigationPolicy.isOutsideRegionEnvelope(
                 playerCache.getX(), playerCache.getY(), playerCache.getZ(),
-                config.pos1, config.pos2,
+                scanPos1(), scanPos2(),
                 SCAN_HORIZONTAL_RECOVERY_MARGIN,
                 SCAN_VERTICAL_RECOVERY_MARGIN);
+        if (!outside && scanTransitActive) scanTransitActive = false;
+        if (!outside || !scanTransitActive) return outside;
+        return ScanNavigationPolicy.isOutsideTransitEnvelope(
+                playerCache.getX(), playerCache.getY(), playerCache.getZ(),
+                scanTransitX, scanTransitY, scanTransitZ,
+                scanPos1(), scanPos2(),
+                SCAN_HORIZONTAL_RECOVERY_MARGIN, SCAN_VERTICAL_RECOVERY_MARGIN);
     }
 
     private boolean beginScanPositionRecoveryIfNeeded(
@@ -2855,16 +8807,27 @@ public class StashManagerModule extends Module {
             finishScan();
         } else {
             state = ScanState.DONE;
+            activeScanPos1 = null;
+            activeScanPos2 = null;
+            activeScanRegionName = null;
+            scanTransitActive = false;
         }
     }
 
     private void advanceToNextContainer() {
+        scanOpenClickTarget = null;
+        scanAlternateGoal = null;
+        scanAlternateProgress.reset();
+        scanWalkProgress.reset();
         currentContainerIndex++;
 
         if (currentContainerIndex >= pendingContainers.size()) {
             // Walk toward unscanned chunks
-            var unscanned = regionScanner.getUnscannedChunks(config.pos1, config.pos2);
+            var unscanned = regionScanner.getUnscannedChunks(scanPos1(), scanPos2());
             if (!unscanned.isEmpty() && containersFound < config.maxContainers) {
+                // The next zone pass appends targets, then advances once. Park just
+                // before the first appended entry so it cannot be skipped.
+                currentContainerIndex = ScanQueueCursor.beforeAppendedTargets(pendingContainers.size());
                 startWalkingToUnscannedChunk(unscanned.get(0));
                 return;
             }
@@ -2874,11 +8837,19 @@ public class StashManagerModule extends Module {
             int unresolved = ScanCompletionPolicy.unresolvedContainers(
                     containersFound, containersIndexed, containersFailed);
             if (unresolved > 0) {
+                List<String> unsettled = pendingContainers.stream()
+                        .filter(loc -> discoveredContainerKeys.contains(loc.posKey())
+                                && !settledContainerKeys.contains(loc.posKey()))
+                        .map(loc -> loc.x() + "," + loc.y() + "," + loc.z())
+                        .distinct().limit(10).toList();
+                warn("Scan has {} unresolved target(s); unsettled identities={}",
+                        unresolved, unsettled);
                 containersFailed = (int) Math.min(
                         Integer.MAX_VALUE,
                         (long) containersFailed + unresolved);
                 debugRecorder.record("scan_unresolved_targets_counted",
                         "unresolved=" + unresolved
+                                + ", unsettled_identities=" + unsettled
                                 + ", disposition=counted_as_terminal_failures"
                                 + ", found=" + containersFound
                                 + ", indexed=" + containersIndexed
@@ -2886,11 +8857,13 @@ public class StashManagerModule extends Module {
             }
             ScanCompletionPolicy.Assessment completion = ScanCompletionPolicy.assess(
                     containersFound, containersIndexed, containersFailed);
-            boolean unhealthySnapshot = !completion.accepted();
+            boolean containerLimitReached = containersFound >= config.maxContainers;
+            boolean unhealthySnapshot = !completion.accepted() || containerLimitReached;
             if (unhealthySnapshot) {
-                abortScanAfterReturnReason = completion.rejectionReason();
+                abortScanAfterReturnReason = containerLimitReached
+                        ? "scan_container_limit_reached" : completion.rejectionReason();
                 debugRecorder.record("scan_completion_rejected",
-                        "reason=" + completion.rejectionReason()
+                        "reason=" + abortScanAfterReturnReason
                                 + ", found=" + containersFound
                                 + ", indexed=" + containersIndexed
                                 + ", failed=" + containersFailed
@@ -2990,8 +8963,8 @@ public class StashManagerModule extends Module {
         int targetY = ScanNavigationPolicy.waypointY(
                 startY,
                 CACHE.getPlayerCache().getY(),
-                config.pos1,
-                config.pos2);
+                scanPos1(),
+                scanPos2());
         info("Walking toward unscanned chunk via level-aware waypoint at {}, {}, {}",
                 targetX, targetY, targetZ);
         debugRecorder.record("scan_zone_waypoint_started",
@@ -3045,10 +9018,16 @@ public class StashManagerModule extends Module {
             }
             stopOwnedBaritoneProcess();
         }
-        // Right-click the container block at exact coordinates
+        BlockPos clickTarget = scanOpenClickTarget != null
+                ? scanOpenClickTarget : new BlockPos(loc.x(), loc.y(), loc.z());
         openInteractionAttempts++;
         lastOpenInteractionTick = openTimeoutCounter;
-        ownInteraction(BARITONE.rightClickBlock(loc.x(), loc.y(), loc.z()));
+        recordPoseTrace("scan_open_attempt", "target=" + currentContainerPos()
+                + ", click_target=" + clickTarget
+                + ", attempt=" + openInteractionAttempts
+                + ", open_wait_ticks=" + openTimeoutCounter);
+        ownInteraction(BARITONE.rightClickBlock(
+                clickTarget.x(), clickTarget.y(), clickTarget.z()));
     }
 
     private boolean prepareStandingContainerInteraction() {
@@ -3062,7 +9041,10 @@ public class StashManagerModule extends Module {
     }
 
     private void pathToContainer(ContainerLocation loc) {
-        ownCustomGoal(BARITONE.pathTo(new GoalGetToBlock(new BlockPos(loc.x(), loc.y(), loc.z()))));
+        lastContainerPathRequestTick = walkingTickCount;
+        scanWalkProgress.reset();
+        ownCustomGoal(BARITONE.pathTo(new GoalGetToBlock(
+                new BlockPos(loc.x(), loc.y(), loc.z()))));
     }
 
     private void closeCurrentContainer() {
@@ -3098,6 +9080,9 @@ public class StashManagerModule extends Module {
             pendingContainers.add(target);
         } else {
             containersFailed++;
+            settledContainerKeys.add(key);
+            rejectedScanStances.remove(key);
+            scanAlternateAttempts.remove(key);
         }
 
         Map<String, Object> payload = new HashMap<>(details);
@@ -3106,6 +9091,27 @@ public class StashManagerModule extends Module {
         payload.put("disposition", retryQueued ? "retry_tail" : "terminal_failure");
         payload.put("unique_total", containersFound);
         payload.put("queue_entries", Math.max(0, pendingContainers.size() - currentContainerIndex - 1));
+        if (!retryQueued && isChestTarget(target)) {
+            String overhead = WorldGeometrySnapshot.chestOverhead(
+                    target.x(), target.y(), target.z());
+            payload.put("chest_overhead", overhead);
+            warn("Chest at {} could not be scanned; overhead: {}", currentContainerPos(), overhead);
+        }
+        try {
+            var player = CACHE.getPlayerCache();
+            int[] clicked = scanOpenClickTarget == null ? null : new int[]{
+                    scanOpenClickTarget.x(), scanOpenClickTarget.y(), scanOpenClickTarget.z()};
+            geometryRecorder.record(event,
+                    "attempt=" + attempt + ", disposition=" + payload.get("disposition")
+                            + "; " + WorldGeometrySnapshot.capture(
+                                    target.x(), target.y(), target.z(), clicked,
+                                    player.getX(), player.getY(), player.getZ(),
+                                    player.getYaw(), player.getPitch()));
+        } catch (RuntimeException e) {
+            geometryRecorder.record(event,
+                    "target=" + target.x() + "," + target.y() + "," + target.z()
+                            + "; geometry_unavailable=" + e.getClass().getSimpleName());
+        }
         recordAndFireScanFailure(event, payload);
     }
 
@@ -3124,6 +9130,7 @@ public class StashManagerModule extends Module {
 
     private void recordAndFireScanFailure(String event, Map<String, Object> payload) {
         debugRecorder.record(event, formatPayloadDetail(payload));
+        recordPoseTrace(event, formatPayloadDetail(payload));
         fireWebhookEvent(event, payload);
     }
 
@@ -3150,33 +9157,52 @@ public class StashManagerModule extends Module {
         scannerPreemptionGate = newScannerPreemptionGate();
         clearOwnedAutomation();
 
-        // A scan is a snapshot of the configured region, not an append-only observation log.
-        // Remove entries no longer discovered, including obsolete double-chest partner rows.
-        // Failed targets remain in discoveredContainerKeys and therefore retain any prior data.
-        try {
-            int pruned = index.pruneRegionExcept(config.pos1, config.pos2, discoveredContainerKeys);
-            if (pruned > 0) {
-                info("Pruned {} stale container record(s) from the scanned region.", pruned);
-                debugRecorder.record("scan_stale_entries_pruned", "count=" + pruned);
-            }
-        } catch (Exception e) {
-            warn("Failed to prune stale scan rows: {}", e.getMessage());
-            debugRecorder.record("scan_stale_prune_failed", "Failed to prune stale scan rows", e);
-        }
-
-        // Record scan completion in DB
+        boolean trustedSnapshot = ScanCompletionPolicy.trustedSnapshot(
+                containersFound, containersIndexed, containersFailed)
+                && containersFound < config.maxContainers;
+        // Preserve partial coverage in the database; older rows still exist but are stale.
         if (database != null && database.isInitialized() && currentScanId >= 0) {
             try {
-                database.recordScanComplete(currentScanId, containersFound, containersIndexed, containersFailed);
+                if (trustedSnapshot) {
+                    database.recordScanComplete(currentScanId, containersFound, containersIndexed, containersFailed);
+                } else {
+                    database.recordScanPartial(currentScanId, containersFound, containersIndexed, containersFailed);
+                }
             } catch (Exception e) {
                 warn("Failed to record scan completion in database: {}", e.getMessage());
                 debugRecorder.record("scan_complete_db_error", "Failed to record scan completion", e);
+                trustedSnapshot = false;
             }
         }
-        latestScanTrusted = true;
+        // A partial scan may miss still-present containers. Only a complete, persisted
+        // snapshot is allowed to remove rows that were not rediscovered.
+        if (trustedSnapshot) {
+            try {
+                int pruned = index.pruneRegionExcept(scanPos1(), scanPos2(), discoveredContainerKeys);
+                if (pruned > 0) {
+                    info("Pruned {} stale container record(s) from the scanned region.", pruned);
+                    debugRecorder.record("scan_stale_entries_pruned", "count=" + pruned);
+                }
+            } catch (Exception e) {
+                warn("Failed to prune stale scan rows: {}", e.getMessage());
+                debugRecorder.record("scan_stale_prune_failed", "Failed to prune stale scan rows", e);
+            }
+        } else {
+            debugRecorder.record("scan_stale_prune_skipped",
+                    "reason=untrusted_snapshot, found=" + containersFound
+                            + ", indexed=" + containersIndexed
+                            + ", failed=" + containersFailed);
+        }
+        boolean configuredRegionScanned = Arrays.equals(scanPos1(), config.pos1)
+                && Arrays.equals(scanPos2(), config.pos2);
+        if (database != null && database.isInitialized()) {
+            refreshLatestScanTrust();
+        } else {
+            latestScanTrusted = trustedSnapshot && configuredRegionScanned;
+        }
 
         // Fire webhook notification
-        fireWebhookEvent("scan_complete");
+        fireWebhookEvent(trustedSnapshot ? "scan_complete" : "scan_partial");
         notifications.sendScanFinished(containersFound, containersIndexed, containersFailed);
 
         int fifoLanes = index.detectFifoLanes().size();
@@ -3185,13 +9211,14 @@ public class StashManagerModule extends Module {
         }
 
         if (organizer != null) {
-            LaneCapacityReport capacity = organizer.calculateLaneCapacity();
-            info("Lane capacity: status={}, detected={}, assignable={}, required={}, spare={}, shortfall={}, protected={}",
-                    capacity.status(), capacity.detectedLanes(), capacity.assignableLanes(),
+            LaneCapacityReport capacity = getLaneCapacityReport();
+            String capacityRegion = Objects.toString(getLaneCapacityRegionName(), "configured bounds");
+            info("Lane capacity for {}: status={}, detected={}, assignable={}, required={}, spare={}, shortfall={}, protected={}",
+                    capacityRegion, capacity.status(), capacity.detectedLanes(), capacity.assignableLanes(),
                     capacity.requiredStorageClasses(), capacity.spareLanes(), capacity.laneShortfall(),
                     capacity.protectedLanes());
             debugRecorder.record("lane_capacity_calculated",
-                    "status=" + capacity.status()
+                    "region=" + capacityRegion + ", status=" + capacity.status()
                             + ", detected_lanes=" + capacity.detectedLanes()
                             + ", assignable_lanes=" + capacity.assignableLanes()
                             + ", required_storage_classes=" + capacity.requiredStorageClasses()
@@ -3222,15 +9249,54 @@ public class StashManagerModule extends Module {
         }
 
         state = ScanState.DONE;
-        info("Scan complete. Found={}, Indexed={}, Failed={}",
+        info("Scan {}. Found={}, Indexed={}, Failed={}", trustedSnapshot ? "complete" : "partial",
             containersFound, containersIndexed, containersFailed);
-        debugRecorder.record("scan_completed",
-            "found=" + containersFound
+        debugRecorder.record(trustedSnapshot ? "scan_completed" : "scan_partial",
+            "region=" + activeScanRegionName
+                + ", found=" + containersFound
                 + ", indexed=" + containersIndexed
                 + ", failed=" + containersFailed);
         clearProxyControlCheckpoint(JobContinuanceManager.Job.SCAN, "scan_completed");
-        inGameAlert("<green>Scan complete.</green> <gray>Found=" + containersFound
+        inGameAlert((trustedSnapshot ? "<green>Scan complete.</green>" : "<yellow>Scan partial.</yellow>")
+            + " <gray>Found=" + containersFound
             + ", Indexed=" + containersIndexed + ", Failed=" + containersFailed + "</gray>");
+        currentScanId = -1;
+        activeScanPos1 = null;
+        activeScanPos2 = null;
+        activeScanRegionName = null;
+        scanTransitActive = false;
+        if (trustedSnapshot && !pendingScanRegions.isEmpty()) {
+            // A return-path or inventory request can still be active on this tick.
+            // Start the next region from a later tick only after the shared gate is quiet.
+            scanRegionHandoffWaitTicks = 0;
+            info("Waiting for shared automation to settle before scanning region {}",
+                    pendingScanRegions.getFirst().name());
+        } else if (!trustedSnapshot) {
+            pendingScanRegions.clear();
+            scanRegionHandoffWaitTicks = 0;
+        }
+    }
+
+    private void tickPendingScanRegion() {
+        var next = pendingScanRegions.getFirst();
+        String blocker = getScanStartBlocker(next.pos1(), next.pos2(), true);
+        if (blocker != null) {
+            scanRegionHandoffWaitTicks++;
+            if (scanRegionHandoffWaitTicks == 1 || scanRegionHandoffWaitTicks % 1200 == 0) {
+                warn("Waiting to scan region {}: {} (wait_ticks={})",
+                        next.name(), blocker, scanRegionHandoffWaitTicks);
+            }
+            return;
+        }
+        scanRegionHandoffWaitTicks = 0;
+        if (startScanRegion(next, true)) {
+            pendingScanRegions.removeFirst();
+            return;
+        }
+        pendingScanRegions.clear();
+        warn("Multi-region scan stopped before region {} after a failed handoff", next.name());
+        inGameAlert("<yellow>Multi-region scan stopped.</yellow> <gray>Could not start "
+                + next.name() + "; check the console, then scan that region explicitly.</gray>");
     }
 
     public void fireWebhookEvent(String event) {
@@ -3244,7 +9310,7 @@ public class StashManagerModule extends Module {
         else if (isSuccessEvent(event)) embed.successColor();
         else embed.primaryColor();
 
-        if (extraFields != null) {
+        if (config.webhookIncludeDetailedPayload && extraFields != null) {
             for (var entry : extraFields.entrySet()) {
                 embed.addField(formatEventTitle(entry.getKey()), String.valueOf(entry.getValue()), true);
             }
@@ -3255,7 +9321,8 @@ public class StashManagerModule extends Module {
     private static boolean isFailureEvent(String event) {
         return event.endsWith("_failed") || event.endsWith("_blocked") || event.endsWith("_error")
             || event.endsWith("_timeout") || event.endsWith("_miss") || event.endsWith("_rejected")
-            || event.endsWith("_aborted") || event.contains("unreachable");
+            || event.endsWith("_aborted") || event.endsWith("_partial")
+            || event.contains("unreachable");
     }
 
     private static boolean isSuccessEvent(String event) {
@@ -3289,12 +9356,18 @@ public class StashManagerModule extends Module {
         regionScanner.reset();
         pendingContainers.clear();
         discoveredContainerKeys.clear();
+        settledContainerKeys.clear();
+        rejectedScanStances.clear();
+        scanAlternateAttempts.clear();
         containerRetries.clear();
         currentContainerIndex = -1;
         tickCounter = 0;
         openTimeoutCounter = 0;
         openInteractionAttempts = 0;
         lastOpenInteractionTick = -1;
+        scanOpenClickTarget = null;
+        scanAlternateGoal = null;
+        scanAlternateProgress.reset();
         containerDataReceived = false;
         containersFound = 0;
         containersIndexed = 0;
@@ -3308,6 +9381,8 @@ public class StashManagerModule extends Module {
         returnPathAttempts = 0;
         walkRetryCount = 0;
         walkingTickCount = 0;
+        lastContainerPathRequestTick = 0;
+        scanWalkProgress.reset();
         resetScanDoorOpening();
         scannerPreemptionGate = newScannerPreemptionGate();
         clearOwnedAutomation();
@@ -3332,7 +9407,7 @@ public class StashManagerModule extends Module {
         try {
             latestScanTrusted = database.getLatestScanSummary(config.pos1, config.pos2)
                     .map(summary -> summary.completed()
-                            && !ScanCompletionPolicy.shouldAbort(
+                            && ScanCompletionPolicy.trustedSnapshot(
                                     summary.found(), summary.indexed(), summary.failed()))
                     .orElse(false);
             if (!latestScanTrusted && index.size() > 0) {
@@ -3357,18 +9432,95 @@ public class StashManagerModule extends Module {
                 SCAN_PREEMPTION_QUIET_TICKS);
     }
 
+    private void recordOrganizerGeometry(String event, Map<String, Object> payload) {
+        int[] target = parseDebugPosition(payload.get("walk_target"));
+        if (target == null) return;
+        try {
+            var player = CACHE.getPlayerCache();
+            geometryRecorder.record(event,
+                    "state=" + stringValue(payload, "organizer_state")
+                            + ", reason=" + stringValue(payload, "reason")
+                            + "; " + WorldGeometrySnapshot.capture(
+                                    target[0], target[1], target[2], null,
+                                    player.getX(), player.getY(), player.getZ(),
+                                    player.getYaw(), player.getPitch()));
+        } catch (RuntimeException e) {
+            geometryRecorder.record(event,
+                    "target=" + target[0] + "," + target[1] + "," + target[2]
+                            + "; geometry_unavailable=" + e.getClass().getSimpleName());
+        }
+    }
+
+    private void recordKitRetrievalGeometry(String event, Map<String, Object> payload) {
+        int[] target = parseDebugPosition(payload.get("target_position"));
+        if (target == null) return;
+        int[] clicked = parseDebugPosition(payload.get("opening_click_target"));
+        if (clicked == null) clicked = parseDebugPosition(payload.get("partner_position"));
+        try {
+            var player = CACHE.getPlayerCache();
+            geometryRecorder.record(event,
+                    "request=" + stringValue(payload, "request_name")
+                            + ", reason=" + (payload.containsKey("failure_reason")
+                                    ? stringValue(payload, "failure_reason")
+                                    : stringValue(payload, "reason"))
+                            + "; " + WorldGeometrySnapshot.capture(
+                                    target[0], target[1], target[2], clicked,
+                                    player.getX(), player.getY(), player.getZ(),
+                                    player.getYaw(), player.getPitch()));
+        } catch (RuntimeException e) {
+            geometryRecorder.record(event,
+                    "target=" + Arrays.toString(target)
+                            + "; geometry_unavailable=" + e.getClass().getSimpleName());
+        }
+    }
+
+    private static @Nullable int[] parseDebugPosition(@Nullable Object value) {
+        if (!(value instanceof String text)) return null;
+        String[] parts = text.split(",");
+        if (parts.length != 3) return null;
+        try {
+            return new int[]{Integer.parseInt(parts[0].trim()),
+                    Integer.parseInt(parts[1].trim()), Integer.parseInt(parts[2].trim())};
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
     private void handleAutomationEvent(String event, Map<String, Object> payload) {
+        kitFulfillment.onRetrievalEvent(event, payload);
+        if ("organize_failed".equals(event) && poseTraceRecorder.isEnabled()) {
+            recordPoseTrace(event, formatPayloadDetail(payload));
+            try {
+                poseTraceRecorder.saveSnapshot(Path.of("plugins", "config",
+                        "stash-manager-pose-trace-last-failure.log"));
+            } catch (IOException e) {
+                debugRecorder.record("pose_trace_snapshot_failed", e.getClass().getSimpleName());
+            }
+        }
+        if (("organize_target_failed".equals(event) || "organize_failed".equals(event))
+                && ("WALKING".equals(stringValue(payload, "organizer_state"))
+                        || "OPENING".equals(stringValue(payload, "organizer_state")))) {
+            recordOrganizerGeometry(event, payload);
+        }
         boolean foodContingencyEvent = FOOD_CONTINGENCY_REQUEST.equals(
                 stringValue(payload, "request_name"));
+        String requestName = stringValue(payload, "request_name");
+        boolean kitRetrievalEvent = requestName != null
+                && requestName.startsWith("kit_fulfillment:");
+        if (kitRetrievalEvent && ("retrieve_target_failed".equals(event)
+                || "retrieve_partner_half_retry".equals(event))) {
+            recordKitRetrievalGeometry(event, payload);
+        }
         // Every transition remains in console/debug. Discord receives only job starts and
         // actionable blockers here; completion/failure use the richer dedicated embeds below.
-        if (!foodContingencyEvent
+        if (!foodContingencyEvent && !kitRetrievalEvent
                 && AutomationNotificationPolicy.sendGenericDiscord(event, payload)) {
             fireWebhookEvent(event, payload);
         }
         // Keep successful transitions too. Long headless jobs need a usable baseline even when
         // nothing has failed yet, especially before a pause/resume handoff.
         debugRecorder.record(event, formatPayloadDetail(payload));
+        if (kitRetrievalEvent) return;
         if (reequipActive && reequipRequestName.equals(stringValue(payload, "request_name"))) {
             if ("retrieve_completed".equals(event) || "retrieve_incomplete".equals(event)) {
                 reequipRetrievalDone = true;
@@ -3418,8 +9570,20 @@ public class StashManagerModule extends Module {
                     intValue(payload, "overflow_types"),
                     intValue(payload, "staged_shulkers"),
                     intValue(payload, "staged_storage_classes"),
-                    intValue(payload, "permanent_lane_gaps")
+                    intValue(payload, "permanent_lane_gaps"),
+                    intValue(payload, "scan_failed_targets"),
+                    booleanValue(payload, "partial_consolidation_candidates_remaining")
                 );
+            }
+            case "organize_inventory_reconciliation_completed" -> {
+                organizerPreemptionGate.reset();
+                organizerPickupRecoveryDeferred = false;
+                clearProxyControlCheckpoint(JobContinuanceManager.Job.ORGANIZE,
+                        "organize_inventory_reconciliation_completed");
+                notifications.sendKitInventoryReconciliationFinished(
+                        intValue(payload, "completed_tasks"),
+                        intValue(payload, "total_tasks"),
+                        intValue(payload, "staged_shulkers"));
             }
             case "organize_failed" -> {
                 if (!booleanValue(payload, "terminal")) break;

@@ -4,7 +4,6 @@ bin/
 out/
 *.class
 /test/
-/src/test/
 
 # Gradle
 .gradle/
@@ -18,8 +17,15 @@ gradle-local.properties
 *.jks
 *.keystore
 *.p12
+*.p8
+*.pfx
+*.kdbx
 *.pem
 *.key
+id_rsa
+id_ecdsa
+id_ed25519
+id_dsa
 
 # Editors
 .idea/
@@ -32,20 +38,30 @@ gradle-local.properties
 *~
 
 # Runtime and diagnostics
+/log/
 *.log
 *.log.zip
 *.pid
 hs_err_pid*
 replay_pid*
 /versions/*/log/
-/plugins/config/stash-manager-organizer-plan.json
-/plugins/config/stash-manager-organizer-checkpoint.json
+# Runtime config, journals, and provenance can contain secrets or stash locations.
+/plugins/config/
+/versions/*/plugins/config/
+/cases/
+
+# Local investigation harness and its documentation
+/tools/*
+/docs/*
+!/docs/SECURE_DEVELOPMENT.md
 
 # Temporary files
 *.bak
 *.tmp
 *.temp
 .cache/
+__pycache__/
+*.pyc
 
 # Operating systems
 .DS_Store

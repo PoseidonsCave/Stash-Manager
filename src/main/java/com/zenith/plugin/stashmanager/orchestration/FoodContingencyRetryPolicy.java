@@ -19,4 +19,18 @@ public final class FoodContingencyRetryPolicy {
         return transientFailure && blockedTicks >= RETRY_DELAY_TICKS
                 && retries < MAX_RETRIES && nearStash && botAvailable && automationQuiet;
     }
+
+    /** Only an exact packed-box attestation may clear the food gate it was itself blocking. */
+    public static boolean allowsAttestedPackedBoxResume(int expectedBoxCount,
+                                                         String resumeBlocker,
+                                                         boolean foodBlocked,
+                                                         String foodFailureReason,
+                                                         int blockedRetries) {
+        return expectedBoxCount > 0 && expectedBoxCount <= 27 * 64
+                && foodBlocked && blockedRetries < MAX_RETRIES
+                && "organizer_temporary_shulker_unresolved".equals(foodFailureReason)
+                && "food refill is blocked (organizer_temporary_shulker_unresolved); "
+                        .concat("it will retry when the bot is back near the stash")
+                        .equals(resumeBlocker);
+    }
 }
